@@ -1,0 +1,20 @@
+comment: "Config for LeNet Large"
+
+ckks_params: 
+  LogN: 14
+  LogQ: [45, 35, 35, 35, 35, 35, 35, 35]
+  LogP: [45, 45]
+  LogScale: 35
+  RingType: ConjugateInvariant
+
+orion:
+  batch_size: 1
+  margin: 2 # >= 1
+  packing_method: advanced # [beginner, intermediate, advanced]
+  embedding_method: hybrid # [hybrid, square]
+  
+  diags_path: "../data/diagonals.h5" # "path/to/diags" | ""
+  evks_path: "../data/keys.h5" # "path/to/keys" | ""
+  io_mode: "none" # "load" | "save" | "none"
+
+    

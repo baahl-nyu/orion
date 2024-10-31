@@ -1,0 +1,21 @@
+comment: "Config for LoLA from Figure 3 of https://arxiv.org/pdf/1812.10659"
+
+ckks_params: 
+  LogN: 13
+  LogQ: [29, 26, 26, 26, 26, 26]
+  LogP: [29, 29]
+  LogScale: 26
+  H: 8192
+  RingType: ConjugateInvariant
+
+orion:
+  batch_size: 1
+  margin: 2 # >= 1
+  packing_method: advanced # [beginner, intermediate, advanced]
+  embedding_method: hybrid # [hybrid, square]
+
+  diags_path: "../data/diagonals.h5" # "path/to/diags" | ""
+  evks_path: "../data/keys.h5" # "path/to/keys" | ""
+  io_mode: "none" # "load" | "save" | "none"
+
+    
