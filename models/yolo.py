@@ -18,7 +18,7 @@ class YOLOv1(on.Module):
         self.conv_layers = self._make_conv_layers()
         self.fc_layers = self._make_fc_layers()
 
-        # Set ba
+        # Remove last layers of backbone
         self.backbone.avgpool = nn.Identity()
         self.backbone.flatten = nn.Identity()
         self.backbone.linear = nn.Identity()
@@ -47,7 +47,6 @@ class YOLOv1(on.Module):
 
     def _make_fc_layers(self):
         S, B, C = self.feature_size, self.num_bboxes, self.num_classes
-
         net = nn.Sequential(
             on.Flatten(),
             on.Linear(7 * 7 * 512, 4096),
