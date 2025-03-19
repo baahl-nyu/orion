@@ -15,7 +15,7 @@ def test_mlp():
     torch.manual_seed(42) # set seed
 
     # Initialize the Orion scheme and model
-    orion.init_scheme("mlp.yml")
+    orion.init_scheme(get_config_path("mlp.yml"))
     trainloader, testloader = get_mnist_datasets(data_dir="./data", batch_size=1)
     net = models.MLP()
 
