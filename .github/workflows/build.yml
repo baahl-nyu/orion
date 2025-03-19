@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9"] #, "3.10", "3.11", "3.12"]
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
@@ -43,10 +43,10 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - {os: windows-latest, arch: "x64"}
-          - {os: macos-latest, arch: "x64"}
+          # - {os: windows-latest, arch: "x64"}
+          # - {os: macos-latest, arch: "x64"}
           - {os: macos-latest, arch: "arm64"}
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9"] #, "3.10", "3.11", "3.12"]
     
     steps:
       - name: checkout orion repository
@@ -92,10 +92,10 @@ jobs:
       matrix:
         config:
           - {os: ubuntu-latest, arch: "x64"}
-          - {os: windows-latest, arch: "x64"}
-          - {os: macos-latest, arch: "x64"}
+          # - {os: windows-latest, arch: "x64"}
+          # - {os: macos-latest, arch: "x64"}
           - {os: macos-latest, arch: "arm64"}
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9"] #, "3.10", "3.11", "3.12"]
     
     steps:
       - name: checkout orion repository
@@ -150,5 +150,6 @@ jobs:
       - name: publish to pypi
         run: |
           pip install poetry
-          poetry config pypi-token.pypi ${{ secrets.PYPI_API_TOKEN }}
-          poetry publish --skip-existing
+          poetry config repositories.testpypi https://test.pypi.org/legacy/
+          poetry config pypi-token.testpypi ${{ secrets.TEST_PYPI_API_TOKEN }}
+          poetry publish --repository testpypi --skip-existing
