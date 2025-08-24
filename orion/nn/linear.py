@@ -143,7 +143,6 @@ class Linear(LinearTransform):
                     f"2 dimensions (N, in_features), but got {x.dim()} " 
                     f"dimension(s): {x.shape}." + extra
         )
-            
             # If we're not in FHE inference mode, then we'll just return
             # the default PyTorch result.
             return torch.nn.functional.linear(x, self.weight, self.bias)

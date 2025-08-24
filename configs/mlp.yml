@@ -2,11 +2,11 @@ comment: Config for MLP from https://eprint.iacr.org/2017/396.pdf
 
 ckks_params:
   LogN: 13
-  LogQ: [29, 26, 26, 26, 26, 26]
-  LogP: [29, 29]
+  LogQ: [29, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26]
+  LogP: [29, 29, 29, 29, 29, 29]
   LogScale: 26
   H: 8192
-  RingType: ConjugateInvariant
+  RingType: Standard
 
 orion:
   margin: 2 # >= 1
@@ -18,4 +18,4 @@ orion:
 
   diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
   keys_path: ../data/keys.h5 # "path/to/keys" | ""
-  io_mode: none # "load" | "save" | "none"
+  io_mode: load # "load" | "save" | "none"

@@ -17,10 +17,6 @@ scheme = orion.init_scheme("../configs/resnet.yml")
 trainloader, testloader = get_cifar_datasets(data_dir="../data", batch_size=1)
 net = models.ResNet20()
 
-# Train model (optional)
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# train_on_cifar(net, data_dir="../data", epochs=1, device=device)
-
 # Get a test batch to pass through our network
 inp, _ = next(iter(testloader))
 
@@ -28,10 +24,6 @@ inp, _ = next(iter(testloader))
 net.eval()
 out_clear = net(inp)
 
-# Prepare for FHE inference. 
-# Some polynomial activation functions require knowing the range of possible 
-# input values. We'll estimate these ranges using training set statistics, 
-# adjusted to be wider by a tolerance factor (= margin).
 orion.fit(net, inp)
 input_level = orion.compile(net)
 

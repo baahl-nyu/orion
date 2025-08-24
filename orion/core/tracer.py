@@ -1,3 +1,5 @@
+import sys
+import logging
 import warnings
 
 import torch
@@ -8,6 +10,8 @@ import orion.nn as on
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 from orion.nn.normalization import BatchNormNd
+
+logger = logging.getLogger("orion")
 
 
 class OrionTracer(fx.Tracer):
@@ -32,7 +36,7 @@ class OrionTracer(fx.Tracer):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return fx.GraphModule(model, super().trace(model))
-
+        
 
 class ModuleWrapper(on.Module):
     """Wrapper for leaf modules to make them traceable."""

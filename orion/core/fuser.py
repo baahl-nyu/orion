@@ -1,10 +1,12 @@
 import torch
+import logging
 import networkx as nx
 
 from orion.nn.activation import Chebyshev
 from orion.nn.linear import Linear, Conv2d
 from orion.nn.normalization import BatchNorm1d, BatchNorm2d
 
+logger = logging.getLogger("orion")
 
 class Fuser:
     def __init__(self, network_dag: nx.DiGraph):
@@ -27,7 +29,7 @@ class Fuser:
             bn.on_bias = torch.ones(bn.num_features) * cheb.constant
 
         cheb.fused = True
-        cheb.depth -= 1
+        cheb.depth -= 1 # The prescale no longer consumes a level
 
     def _fuse_linear_bn(self, linear, bn):
         on_inv_running_std = 1 / torch.sqrt(bn.on_running_var + bn.eps) 
@@ -62,8 +64,16 @@ class Fuser:
             if isinstance(child_module, child_class):
                 parent_modules = get_parent_modules(node)
 
-                for parent_module in parent_modules:
-                    fusing_function(parent_module, child_module)
+                if len(parent_modules) == 0:
+                    logger.info(
+                        f"Skipping fusion of {node} since it has no " + \
+                        f"fusable parent modules.")
+                elif len(parent_modules) > 1:
+                    logger.info(
+                        f"Skipping fusion of {node} since it has more " + \
+                        f"than one fusable parent modules.")
+                else: # only a single parent, index directly
+                    fusing_function(parent_modules[0], child_module)
 
     def fuse_linear_chebyshev(self):
         self.fuse_two_layers((Linear, Conv2d), Chebyshev, 
@@ -78,6 +88,8 @@ class Fuser:
         self.fuse_two_layers(Conv2d, BatchNorm2d, self._fuse_linear_bn)
 
     def fuse_modules(self):
+        # Order matters here. E.g., we first fuse Chebyshev prescal into
+        # BatchNorm, which can then be further fused with linear/conv layers.
         self.fuse_linear_chebyshev()
         self.fuse_bn_chebyshev()
         self.fuse_linear_bn()

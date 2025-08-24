@@ -21,7 +21,7 @@ from orion.backend.python import (
     bootstrapper
 )
 
-from .tracer import StatsTracker, OrionTracer 
+from .tracer import OrionTracer, StatsTracker 
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
@@ -118,62 +118,107 @@ class Scheme:
     
     def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
-
+        
         net.set_scheme(self)
         net.set_margin(self.params.get_margin())
-        
+
         tracer = OrionTracer()
         traced = tracer.trace_model(net)
-        self.traced = traced 
+        self.traced = traced
 
         stats_tracker = StatsTracker(traced)
-
-        #-----------------------------------------#
-        #   Populate layers with useful metadata  #
-        #-----------------------------------------# 
-
-        # Send input_data to the same device as the model.
+        
+        # Get device from model
         param = next(iter(net.parameters()), None)
         device = param.device if param is not None else torch.device("cpu")
-
-        print("\n{1} Finding per-layer input/output ranges and shapes...", 
-              flush=True)
+        
+        print("\n{1} Finding per-layer input/output ranges and shapes...", flush=True)
         start = time.time()
-        if isinstance(input_data, DataLoader):
-            # Users often specify small batch sizes for FHE operations.
-            # However, fitting statistics with large datasets would take 
-            # unnecessarily long with small batches. To speed this up, we'll 
-            # temporarily increase the batch size during the statistics-fitting 
-            # step, and then restore the original batch size afterward.
-            user_batch_size = input_data.batch_size
-            if batch_size > user_batch_size:
-                dataset = input_data.dataset
-                shuffle = input_data.sampler is None or isinstance(input_data.sampler, RandomSampler)
+        
+        # Check if we have multiple inputs
+        is_multi_input = isinstance(input_data, list)
+        
+        if is_multi_input:
+            # Handle multiple inputs [inp1, inp2, ...]
+            if isinstance(input_data[0], DataLoader):
+                # Multiple DataLoaders
+                # Assume all DataLoaders have same length and iterate together
                 
-                input_data = DataLoader(
-                    dataset=dataset,
-                    batch_size=batch_size,
-                    shuffle=shuffle,
-                    num_workers=input_data.num_workers,
-                    pin_memory=input_data.pin_memory,
-                    drop_last=input_data.drop_last
+                # Adjust batch size for all dataloaders if needed
+                dataloaders = []
+                user_batch_sizes = []
+                
+                for dl in input_data:
+                    user_batch_sizes.append(dl.batch_size)
+                    if batch_size > dl.batch_size:
+                        dataset = dl.dataset
+                        shuffle = dl.sampler is None or isinstance(dl.sampler, RandomSampler)
+                        
+                        new_dl = DataLoader(
+                            dataset=dataset,
+                            batch_size=batch_size,
+                            shuffle=shuffle,
+                            num_workers=dl.num_workers,
+                            pin_memory=dl.pin_memory,
+                            drop_last=dl.drop_last
+                        )
+                        dataloaders.append(new_dl)
+                    else:
+                        dataloaders.append(dl)
+                
+                # Iterate through all dataloaders together
+                for batches in tqdm(zip(*dataloaders), desc="Processing input data",
+                                unit="batch", leave=True):
+                    # batches is a tuple of batches from each dataloader
+                    inputs = [batch[0].to(device) for batch in batches]
+                    stats_tracker.propagate(*inputs)  # Unpack multiple inputs
+                
+                # Reset batch sizes
+                for user_batch_size in user_batch_sizes:
+                    stats_tracker.update_batch_size(user_batch_size)
+                    
+            elif isinstance(input_data[0], torch.Tensor):
+                # Multiple tensors [tensor1, tensor2, ...]
+                inputs = [inp.to(device) for inp in input_data]
+                stats_tracker.propagate(*inputs)  # Unpack multiple inputs
+                
+            else:
+                raise ValueError(
+                    "For multiple inputs, each must be a torch.Tensor or DataLoader, but "
+                    f"received {[type(inp) for inp in input_data]}."
                 )
-
-            # Use this (potentially new) dataloader
-            for batch in tqdm(input_data, desc="Processing input data",
-                    unit="batch", leave=True):
-                stats_tracker.propagate(batch[0].to(device))
-
-            # Now we'll reset the batch size back to what the user specified.
-            stats_tracker.update_batch_size(user_batch_size)
-
-        elif isinstance(input_data, torch.Tensor):
-            stats_tracker.propagate(input_data.to(device)) 
+        
         else:
-            raise ValueError(
-                "Input data must be a torch.Tensor or DataLoader, but "
-                f"received {type(input_data)}."
-            )
+            # Single input
+            if isinstance(input_data, DataLoader):
+                user_batch_size = input_data.batch_size
+                if batch_size > user_batch_size:
+                    dataset = input_data.dataset
+                    shuffle = input_data.sampler is None or isinstance(input_data.sampler, RandomSampler)
+                    
+                    input_data = DataLoader(
+                        dataset=dataset,
+                        batch_size=batch_size,
+                        shuffle=shuffle,
+                        num_workers=input_data.num_workers,
+                        pin_memory=input_data.pin_memory,
+                        drop_last=input_data.drop_last
+                    )
+                
+                for batch in tqdm(input_data, desc="Processing input data",
+                                unit="batch", leave=True):
+                    stats_tracker.propagate(batch[0].to(device))
+                
+                stats_tracker.update_batch_size(user_batch_size)
+                
+            elif isinstance(input_data, torch.Tensor):
+                stats_tracker.propagate(input_data.to(device))
+                
+            else:
+                raise ValueError(
+                    "Input data must be a torch.Tensor or DataLoader, but "
+                    f"received {type(input_data)}."
+                )
 
         #-------------------------------------#
         #      Fit polynomial activations     #
@@ -267,7 +312,7 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
-        #(save_path="network.png", figsize=(8,30)) # optional plot
+        network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
 
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()
@@ -278,9 +323,9 @@ class Scheme:
         print(f"├── Network requires {num_bootstraps} bootstrap "
             f"{'operation' if num_bootstraps == 1 else 'operations'}.")
 
-        #btp_solver.plot_shortest_path(
-        #    save_path="network-with-levels.png", figsize=(8,30) # optional plot
-        #)
+        btp_solver.plot_shortest_path(
+           save_path="network-with-levels.png", figsize=(8,30) # optional plot
+        )
 
         if bootstrapper_slots:
             start = time.time()

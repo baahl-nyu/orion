@@ -286,3 +286,65 @@ class ReLU(Module):
         x = self.mult2(x, self.sign(x))
         x *= self.postscale # integer mult, no level consumed
         return x
+
+
+class Cleanse(Module):
+    def __init__(self, iter=3):
+        super().__init__()
+        self.polys = nn.Sequential(*[Activation(coeffs=[-2, 3, 0, 0]) for _ in range(iter)])
+
+    def forward(self, x):
+        for poly in self.polys:
+            x = poly(x)
+        return x
+
+
+class SqMethod1(Module):
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+        self.poly = Activation(coeffs=[-2/self.p**2, 0, 1])
+
+    def forward(self, x):
+        return self.poly(x)
+
+
+class SqMethod2(Module):
+    def __init__(self, r):
+        super().__init__()
+        self.r = r
+        self.quad = nn.Sequential(*[Quad() for _ in range(self.r)])
+
+    def forward(self, x):
+        for quad in self.quad:
+            x = quad(x)
+        return x
+
+
+class SqMethod(Module):
+    def __init__(self, p, r):
+        super().__init__()
+        self.p = p
+        self.r = r
+        self.sq1 = SqMethod1(p)
+        self.sq2 = SqMethod2(r)
+
+    def forward(self, x):
+        x = self.sq1(x)
+        x = self.sq2(x)
+        return x
+
+
+class EIF(Module):
+    def __init__(self, p, r, iter):
+        super().__init__()
+        self.p = p
+        self.r = r
+        self.iter = iter
+        self.cleanse = Cleanse(iter)
+        self.sq = SqMethod(p, r)
+
+    def forward(self, x):
+        x = self.sq(x)
+        x = self.cleanse(x)
+        return x
