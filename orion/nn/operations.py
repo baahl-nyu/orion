@@ -8,6 +8,13 @@ class Add(Module):
         super().__init__()
         self.set_depth(0)
 
+    def compute_fhe_output_shape(self, **kwargs):
+        fhe_input_shape = kwargs["fhe_input_shape"]
+
+        if isinstance(fhe_input_shape, list):
+            return fhe_input_shape[0]
+        return fhe_input_shape
+
     def forward(self, x, y):
         return x + y
     
@@ -16,6 +23,13 @@ class Mult(Module):
     def __init__(self):
         super().__init__()
         self.set_depth(1)
+
+    def compute_fhe_output_shape(self, **kwargs):
+        fhe_input_shape = kwargs["fhe_input_shape"]
+
+        if isinstance(fhe_input_shape, list):
+            return fhe_input_shape[0]
+        return fhe_input_shape
 
     def forward(self, x, y):
         return x * y

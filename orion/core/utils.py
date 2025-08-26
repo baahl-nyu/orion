@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 
-def get_mnist_datasets(data_dir, batch_size, test_samples=10000, seed=None):
+def get_mnist_datasets(data_dir, batch_size=128, test_samples=10000, seed=None):
     """
     Loads MNIST datasets and returns training and test DataLoaders.
     
@@ -82,7 +82,7 @@ def get_mnist_datasets(data_dir, batch_size, test_samples=10000, seed=None):
         ssl._create_default_https_context = old_context
 
 
-def get_cifar_datasets(data_dir, batch_size, test_samples=10000, seed=None):
+def get_cifar_datasets(data_dir, batch_size=128, test_samples=10000, seed=None):
     """
     Loads CIFAR-10 datasets and returns training and test DataLoaders.
     
@@ -241,7 +241,7 @@ def download_and_prepare_tinyimagenet(data_dir='./data'):
             ssl._create_default_https_context = old_context
 
 
-def get_tiny_datasets(data_dir, batch_size, test_samples=10000, seed=None):
+def get_tiny_datasets(data_dir, batch_size=128, test_samples=10000, seed=None):
     """
     Loads Tiny-ImageNet datasets and returns training and test DataLoaders.
     

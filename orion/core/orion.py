@@ -50,7 +50,7 @@ class Scheme:
     
     def __init__(self):
         self.backend = None
-        self.traced = None
+        self.trace = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
         """Initializes the scheme."""
@@ -116,127 +116,52 @@ class Scheme:
         self._check_initialization()
         return self.encryptor.decrypt(ctxt)
     
-    def fit(self, net, input_data, batch_size=128):
+    def fit(self, net, input_data):
         self._check_initialization()
         
         net.set_scheme(self)
         net.set_margin(self.params.get_margin())
 
+        # First we'll generate an FX symbolic trace of the network. This lets
+        # us mimic a forward pass through the network while tracking useful
+        # statistics below (shapes, ranges, etc) using the StatsTracker.
         tracer = OrionTracer()
-        traced = tracer.trace_model(net)
-        self.traced = traced
+        trace = tracer.trace_model(net)
+        self.trace = trace
 
-        stats_tracker = StatsTracker(traced)
+        batch_size = self.params.get_batch_size()
+        stats_tracker = StatsTracker(trace, batch_size)
         
-        # Get device from model
+        # Get the location of the model (cpu, gpu, etc.) so that the data 
+        # propagated below is sent to the correct device.
         param = next(iter(net.parameters()), None)
         device = param.device if param is not None else torch.device("cpu")
         
         print("\n{1} Finding per-layer input/output ranges and shapes...", flush=True)
-        start = time.time()
+
+        #-------------------------------------#
+        #     Generate input/output ranges    #
+        #-------------------------------------#
         
-        # Check if we have multiple inputs
-        is_multi_input = isinstance(input_data, list)
-        
-        if is_multi_input:
-            # Handle multiple inputs [inp1, inp2, ...]
-            if isinstance(input_data[0], DataLoader):
-                # Multiple DataLoaders
-                # Assume all DataLoaders have same length and iterate together
-                
-                # Adjust batch size for all dataloaders if needed
-                dataloaders = []
-                user_batch_sizes = []
-                
-                for dl in input_data:
-                    user_batch_sizes.append(dl.batch_size)
-                    if batch_size > dl.batch_size:
-                        dataset = dl.dataset
-                        shuffle = dl.sampler is None or isinstance(dl.sampler, RandomSampler)
-                        
-                        new_dl = DataLoader(
-                            dataset=dataset,
-                            batch_size=batch_size,
-                            shuffle=shuffle,
-                            num_workers=dl.num_workers,
-                            pin_memory=dl.pin_memory,
-                            drop_last=dl.drop_last
-                        )
-                        dataloaders.append(new_dl)
-                    else:
-                        dataloaders.append(dl)
-                
-                # Iterate through all dataloaders together
-                for batches in tqdm(zip(*dataloaders), desc="Processing input data",
-                                unit="batch", leave=True):
-                    # batches is a tuple of batches from each dataloader
-                    inputs = [batch[0].to(device) for batch in batches]
-                    stats_tracker.propagate(*inputs)  # Unpack multiple inputs
-                
-                # Reset batch sizes
-                for user_batch_size in user_batch_sizes:
-                    stats_tracker.update_batch_size(user_batch_size)
-                    
-            elif isinstance(input_data[0], torch.Tensor):
-                # Multiple tensors [tensor1, tensor2, ...]
-                inputs = [inp.to(device) for inp in input_data]
-                stats_tracker.propagate(*inputs)  # Unpack multiple inputs
-                
-            else:
-                raise ValueError(
-                    "For multiple inputs, each must be a torch.Tensor or DataLoader, but "
-                    f"received {[type(inp) for inp in input_data]}."
-                )
-        
-        else:
-            # Single input
-            if isinstance(input_data, DataLoader):
-                user_batch_size = input_data.batch_size
-                if batch_size > user_batch_size:
-                    dataset = input_data.dataset
-                    shuffle = input_data.sampler is None or isinstance(input_data.sampler, RandomSampler)
-                    
-                    input_data = DataLoader(
-                        dataset=dataset,
-                        batch_size=batch_size,
-                        shuffle=shuffle,
-                        num_workers=input_data.num_workers,
-                        pin_memory=input_data.pin_memory,
-                        drop_last=input_data.drop_last
-                    )
-                
-                for batch in tqdm(input_data, desc="Processing input data",
-                                unit="batch", leave=True):
-                    stats_tracker.propagate(batch[0].to(device))
-                
-                stats_tracker.update_batch_size(user_batch_size)
-                
-            elif isinstance(input_data, torch.Tensor):
-                stats_tracker.propagate(input_data.to(device))
-                
-            else:
-                raise ValueError(
-                    "Input data must be a torch.Tensor or DataLoader, but "
-                    f"received {type(input_data)}."
-                )
+        # Now pass the input data (tensor, list of tensors, dataloader, 
+        # list of dataloaders) to through the model while tracking stats.
+        stats_tracker.propagate_all(input_data, device, show_progress=True)
 
         #-------------------------------------#
         #      Fit polynomial activations     #
         #-------------------------------------#
 
-        # Now we can use the statistics we just obtained above to fit
-        # all polynomial activation functions.
-        print("\n{2} Fitting polynomials... ", end="", flush=True)
-        start = time.time()
+        # Now we can use the ranges we just obtained above to fit all
+        # Chebyshev polynomial activation functions.
+        print("\n{2} Fitting polynomials... ", flush=True)
         for module in net.modules():
             if hasattr(module, "fit") and callable(module.fit):
                 module.fit()
-        print(f"done! [{time.time()-start:.3f} secs.]")
-
+        
     def compile(self, net):
         self._check_initialization()
 
-        if self.traced is None:
+        if self.trace is None:
             raise ValueError(
                 "Network has not been fit yet! Before running orion.compile(net) "
                 "you must run orion.fit(net, input_data)."
@@ -246,7 +171,7 @@ class Scheme:
         #   Build DAG representation of neural network   #
         #------------------------------------------------#
 
-        network_dag = NetworkDAG(self.traced)
+        network_dag = NetworkDAG(self.trace)
         network_dag.build_dag()
 
         # Before fusing, we'll instantiate our own Orion parameters (e.g. 

@@ -8,6 +8,8 @@ from orion.core.utils import (
     mae, 
 )
 
+orion.set_log_level('DEBUG')
+
 class MLP(on.Module):
     def __init__(self, num_classes=10):
         super().__init__()
@@ -34,7 +36,7 @@ torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
 scheme = orion.init_scheme("../configs/mlp.yml")
-trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
+trainloader, testloader = get_mnist_datasets(data_dir="../data")
 net = MLP()
 
 inp = torch.randn(1, 784)
@@ -45,10 +47,7 @@ out_clear = net(inp)
 
 
 # Prepare for FHE inference. 
-# Certain polynomial activation functions require us to know the precise range
-# of possible input values. We'll determine these ranges by aggregating
-# statistics from the training set and applying a tolerance factor = margin.
-orion.fit(net, inp, batch_size=1)
+orion.fit(net, inp)
 input_level = orion.compile(net)
 
 # Encode and encrypt the input vector 

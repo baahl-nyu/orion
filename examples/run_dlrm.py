@@ -2,86 +2,92 @@ import time
 import math
 
 import torch
-import torch.nn as nn
+import torch.nn as nn 
+import torch.nn.functional as F
 
 import orion
 import orion.nn as on
 from orion.core.utils import mae
 
+orion.set_log_level('DEBUG')
 
-class ToyDLRM(on.Module):
-    def __init__(self, num_dense, num_sparse):
+
+class DLRM(on.Module):
+    def __init__(self, dense_size, vocab_sizes, hidden_dim):
         super().__init__()
-
-        self.num_dense = num_dense
-        self.num_sparse = num_sparse
-        self.hidden_dim = 2
-        self.vocab_size = [num_sparse]
-
+        
+        self.dense_size = dense_size
+        self.vocab_sizes = vocab_sizes
+        self.hidden_dim = hidden_dim
+        self.num_sparse = len(vocab_sizes)  
+        
         # Bottom MLP - Process dense features
         self.bot_l = nn.Sequential(
-            on.Linear(self.num_dense, 3),
+            on.Linear(self.dense_size, 128),
             on.ReLU(),
-            on.Linear(3, 2),
+            on.Linear(128, self.hidden_dim),
             on.ReLU(),
         )
-
+        
         # Embedding tables - Process sparse features
-        self.emb_l = on.Embedding(self.vocab_size[0], self.hidden_dim)
-
-        # Interaction layer (simple addition here)
-        self.add = on.Add()
+        self.emb_l = nn.ModuleList()
+        for vocab_size in self.vocab_sizes:
+            self.emb_l.append(on.Embedding(vocab_size, self.hidden_dim))
         
         # Top MLP - Process interactions
         self.top_l = nn.Sequential(
-            on.Linear(2, 4),
+            on.Linear(self.hidden_dim, 128),
             on.ReLU(),
-            on.Linear(4, 2),
+            on.Linear(128, 128),
             on.ReLU(),
-            on.Linear(2, 1),
+            on.Linear(128, 1),
         )
+    
+    def forward(self, x, sparse_inputs):  
+        bot = self.bot_l(x)  
 
-    def forward(self, dense_x, sparse_x):
-        dense_out = self.bot_l(dense_x)
-        sparse_out = self.emb_l(sparse_x)
-
-        sparse_out = sparse_out.roll(-self.num_dense)
-        interact_out = self.add(dense_out, sparse_out)
-
-        return self.top_l(interact_out)
+        emb = 0
+        for i in range(self.num_sparse):
+            emb += self.emb_l[i](sparse_inputs[i])  
+       
+        interact = emb + bot
+        return self.top_l(interact)
 
 
-def main():
-    # Set seed for reproducibility
-    torch.manual_seed(42)
+if __name__ == "__main__":
+    torch.manual_seed(0)
+   
+    dense_size  = 128
+    vocab_sizes = [128, 128, 128]
+    hidden_dim  = 128
 
-    # Initialize the Orion scheme, model, and data
-    orion.init_scheme("../configs/resnet.yml")
-    net = ToyDLRM(num_dense=5, num_sparse=4)
+    dlrm = DLRM(dense_size, vocab_sizes, hidden_dim)
+    dlrm.eval()
 
-    dense_x  = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
-    sparse_x = torch.tensor([[0.0, 0.0, 1.0, 0.0]])
+    # Create example dense and sparse features
+    dense = torch.randn(1, dense_size)
+    sparse_idxs = [torch.randint(0, size, (1,)) for size in vocab_sizes]
+    sparse = [F.one_hot(idx, size).float() for idx, size in zip(sparse_idxs, vocab_sizes)]
 
-    # Run cleartext inference
-    net.eval()
-    out_clear = net(dense_x, sparse_x)
+    # Initialize Orion
+    scheme = orion.init_scheme("../configs/resnet.yml")
 
-    # Fit data to generate input & output ranges/shapes.
-    orion.fit(net, [dense_x, sparse_x], batch_size=1)
+    # Forward pass in the clear
+    out_clear = dlrm(dense, sparse)
 
-    # Compile everything    
-    input_level = orion.compile(net)
+    orion.fit(dlrm, input_data=[dense, sparse])
+    input_level = orion.compile(dlrm)
 
     # Encode and encrypt the input vector 
-    dense_ctxt  = orion.encrypt(orion.encode(dense_x, input_level))
-    sparse_ctxt = orion.encrypt(orion.encode(sparse_x, input_level))
+    dense_ctxt = orion.encrypt(orion.encode(dense, input_level))
+    sparse_ctxts = [orion.encrypt(orion.encode(s, input_level)) for s in sparse]
 
-    net.he()  # Switch to FHE mode
+    dlrm.he()  # Switch to FHE mode
 
     # Run FHE inference
     print("\nStarting FHE inference", flush=True)
     start = time.time()
-    out_ctxt = net(dense_ctxt, sparse_ctxt)
+    out_ctxt = dlrm(dense_ctxt, sparse_ctxts)
     end = time.time()
 
     # Get the FHE results and decrypt + decode.
@@ -94,12 +100,6 @@ def main():
     print(out_fhe)
 
     dist = mae(out_clear, out_fhe)
-    prec = math.inf if dist == 0 else -math.log2(dist)
-
     print(f"\nMAE: {dist:.4f}")
-    print(f"Precision: {'∞' if prec == math.inf else f'{prec:.4f}'}")
+    print(f"Precision: {-math.log2(dist):.4f}")
     print(f"Runtime: {end-start:.4f} secs.\n")
-
-
-if __name__ == "__main__":
-    main()

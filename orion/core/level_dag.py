@@ -241,17 +241,23 @@ class LevelDAG(nx.DiGraph):
             # from a profiler, but the search space here is quite massive.
             a, b, c = 3.41, 0.18, 4.81
             t_boot = a * math.exp(b * self.l_eff) + c
-            num_boots_required = self.get_num_input_cts(prev_module)
+            num_boots_required = self.get_num_output_cts(prev_module)
             
             return (t_boot * num_boots_required, num_boots_required)
 
         # Case 4: No bootstrap required
         return (0, 0)
 
-    def get_num_input_cts(self, module):
+    def get_num_output_cts(self, module):
         num_slots = module.scheme.params.get_slots()
-        num_elements = module.fhe_input_shape.numel()
-        return int(math.ceil(num_elements / num_slots))
+        
+        # This node may have multiple outgoing edges
+        if isinstance(module.fhe_output_shape, list):
+            num_elements = [shape.numel() for shape in module.fhe_output_shape]
+            return sum([math.ceil(e / num_slots) for e in num_elements])
+        
+        num_elements = module.fhe_output_shape.numel()
+        return math.ceil(num_elements / num_slots)
 
     def shortest_path(self, source, target):
         """Relaxation stage of topological sort."""

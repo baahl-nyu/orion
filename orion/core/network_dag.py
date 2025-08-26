@@ -213,11 +213,12 @@ class NetworkDAG(nx.DiGraph):
     
     def _unique_name(self, base):
         """Generate unique node name with counter suffix if needed"""
-        name, counter = base, 1
-        while name in self.nodes:
-            name = f"{base}_{counter}"
+        if base not in self.nodes:
+            return base
+        counter = 1
+        while f"{base}_{counter}" in self.nodes:
             counter += 1
-        return name
+        return f"{base}_{counter}"
     
     def extract_residual_subgraph(self, fork):
         """Extract subgraph between a fork and its corresponding join"""
