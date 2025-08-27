@@ -116,7 +116,7 @@ class Scheme:
         self._check_initialization()
         return self.encryptor.decrypt(ctxt)
     
-    def fit(self, net, input_data):
+    def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
         
         net.set_scheme(self)
@@ -129,7 +129,6 @@ class Scheme:
         trace = tracer.trace_model(net)
         self.trace = trace
 
-        batch_size = self.params.get_batch_size()
         stats_tracker = StatsTracker(trace, batch_size)
         
         # Get the location of the model (cpu, gpu, etc.) so that the data 
@@ -237,7 +236,7 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
-        network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
+        # network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
 
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.fx as fx
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import orion.nn as on
 from orion.nn.module import Module
@@ -54,8 +55,8 @@ def tensors_min_max(tensors):
         if t.numel() == 0:
             continue
         x = t.detach()
-        mn = min(mn, x.amin())
-        mx = max(mx, x.amax())
+        mn = min(mn, x.amin().item())
+        mx = max(mx, x.amax().item())
     return mn, mx
 
 
@@ -76,7 +77,6 @@ class OrionTracer(fx.Tracer):
     def trace_model(self, model):
         logger.info(f"Starting trace of model: {model.__class__.__name__}")
 
-        # Wrap single-leaf models for consistent tracing
         if self.is_leaf_module(model, ""):
             logger.debug(
                 f"Wrapping leaf module {model.__class__.__name__} for tracing"
@@ -118,6 +118,7 @@ class StatsTracker(fx.Interpreter):
         self._init_node_attributes()
 
     def _init_node_attributes(self):
+        """Initialize tracking attributes for all nodes."""
         attrs = dict(
             input_min=float("inf"),
             input_max=float("-inf"),
@@ -135,6 +136,7 @@ class StatsTracker(fx.Interpreter):
                 setattr(node, k, v)
 
     def run_node(self, node):
+        """Execute a node and track its statistics."""
         parents = [p.name for p in node.all_input_nodes]
         if parents:
             logger.debug(
@@ -157,20 +159,22 @@ class StatsTracker(fx.Interpreter):
 
         if node.op == "call_module":
             mod = self.module.get_submodule(node.target)
-            self._sync_module_attributes(node, mod)
+            if isinstance(mod, Module):
+                self._sync_module_attributes(node, mod)
 
         return result
 
     def _validate_node(self, node):
+        """Validate FHE compatibility constraints."""
         parents = node.all_input_nodes
+        
         if parents:
-            gaps = [p.output_gap for p in parents if hasattr(p, "output_gap")]
+            gaps = [p.output_gap for p in parents]
             if len(set(gaps)) > 1:
                 msg = f"Inconsistent input gaps for {node.name}: {set(gaps)}"
                 logger.error(f"  ✗ {msg}")
                 raise ValueError(msg)
-            if gaps:
-                logger.debug(f"  ✓ Gap check passed (gap={gaps[0]})")
+            logger.debug(f"  ✓ Gap check passed (gap={gaps[0]})")
 
         if node.op == "call_module":
             sub = self.module.get_submodule(node.target)
@@ -184,7 +188,7 @@ class StatsTracker(fx.Interpreter):
                 logger.error(f"  ✗ {msg}")
                 raise ValueError(msg)
 
-            if isinstance(sub, BatchNormNd) and len(node.all_input_nodes) > 1:
+            if isinstance(sub, BatchNormNd) and len(parents) > 1:
                 msg = (
                     f"BatchNorm node {node} has multiple parents which "
                     "prevents fusion"
@@ -193,86 +197,60 @@ class StatsTracker(fx.Interpreter):
                 raise ValueError(msg)
 
     def _update_input_stats(self, node, args, kwargs):
+        """Update node's input statistics."""
         tensors = list(iter_tensors((args, kwargs)))
         mn, mx = tensors_min_max(tensors)
         node.input_min = min(node.input_min, mn)
         node.input_max = max(node.input_max, mx)
 
-        # Fast path: binary pointwise call_function with shared FHE shape
-        if node.op == "call_function" and len(node.all_input_nodes) == 2:
-            p0, p1 = node.all_input_nodes
-            if p0.fhe_output_shape != p1.fhe_output_shape:
-                msg = (
-                    f"call_function {node.name} expects equal FHE shapes: "
-                    f"{p0.fhe_output_shape} vs {p1.fhe_output_shape}"
+        parents = node.all_input_nodes
+        if parents:
+            if len(parents) == 1:
+                p = parents[0]
+                node.input_shape = p.output_shape
+                node.input_gap = p.output_gap
+                node.fhe_input_shape = p.fhe_output_shape
+                logger.debug(
+                    f"  ← Inherited from {p.name}: "
+                    f"shape={node.input_shape}, gap={node.input_gap}"
                 )
-                logger.error(f"  ✗ {msg}")
-                raise ValueError(msg)
-
-            node.input_shape = p0.output_shape
-            node.fhe_input_shape = p0.fhe_output_shape
-            node.input_gap = p0.output_gap
-            logger.debug(
-                "  ← call_function unified FHE shape: "
-                f"{node.fhe_input_shape}"
-            )
-
-        else:
-            if node.all_input_nodes:
-                if len(node.all_input_nodes) == 1:
-                    p = node.all_input_nodes[0]
-                    node.input_shape = p.output_shape
-                    node.input_gap = p.output_gap
-                    node.fhe_input_shape = p.fhe_output_shape
+                if node.fhe_input_shape != node.input_shape:
                     logger.debug(
-                        f"  ← Inherited from {p.name}: "
-                        f"shape={node.input_shape}, gap={node.input_gap}"
-                    )
-                    if node.fhe_input_shape != node.input_shape:
-                        logger.debug(
-                            "  ← FHE shape from "
-                            f"{p.name}: {node.fhe_input_shape}"
-                        )
-                else:
-                    node.input_shape = [
-                        p.output_shape for p in node.all_input_nodes
-                    ]
-                    node.input_gap = node.all_input_nodes[0].output_gap
-                    node.fhe_input_shape = [
-                        p.fhe_output_shape for p in node.all_input_nodes
-                    ]
-                    names = [p.name for p in node.all_input_nodes]
-                    logger.debug(
-                        f"  ← Multiple inputs from {names}: "
-                        f"shapes={node.input_shape}, gap={node.input_gap}"
+                        f"  ← FHE shape from {p.name}: {node.fhe_input_shape}"
                     )
             else:
-                node.input_shape = shape_tree(args)
-                node.fhe_input_shape = node.input_shape
+                node.input_shape = [p.output_shape for p in parents]
+                node.input_gap = parents[0].output_gap
+                node.fhe_input_shape = [p.fhe_output_shape for p in parents]
+                names = [p.name for p in parents]
                 logger.debug(
-                    "  ← Input placeholder: "
-                    f"shape={node.input_shape}, "
-                    f"fhe_shape={node.fhe_input_shape}"
+                    f"  ← Multiple inputs from {names}: "
+                    f"shapes={node.input_shape}, gap={node.input_gap}"
                 )
+        else:
+            node.input_shape = shape_tree(args)
+            node.fhe_input_shape = node.input_shape
+            logger.debug(
+                f"  ← Input placeholder: "
+                f"shape={node.input_shape}, fhe_shape={node.fhe_input_shape}"
+            )
 
         logger.debug(
             f"  📊 Input stats: [{node.input_min:.4f}, {node.input_max:.4f}]"
         )
 
     def _update_output_stats(self, node, result):
+        """Update node's output statistics."""
         tensors = list(iter_tensors(result))
         mn, mx = tensors_min_max(tensors)
         node.output_min = min(node.output_min, mn)
         node.output_max = max(node.output_max, mx)
 
         result_shapes = shape_tree(result)
-        node.output_shape = self.compute_clear_output_shape(
-            node, result_shapes
-        )
-        node.fhe_output_shape = self.compute_fhe_output_shape(node)
-        node.output_gap = self.compute_fhe_output_gap(node)
+        node.output_shape = self._compute_clear_shape(node, result_shapes)
+        node.fhe_output_shape = self._compute_fhe_shape(node)
+        node.output_gap = self._compute_output_gap(node)
 
-        # Preserve FHE shape for getitem when parent exposes a list
         if (
             node.op == "call_function"
             and hasattr(node.target, "__name__")
@@ -282,13 +260,11 @@ class StatsTracker(fx.Interpreter):
             if parent and isinstance(parent.fhe_output_shape, list):
                 if len(node.args) > 1:
                     idx = node.args[1]
-                    if isinstance(idx, int) and idx < len(
-                        parent.fhe_output_shape
-                    ):
+                    if isinstance(idx, int) and idx < len(parent.fhe_output_shape):
                         node.fhe_output_shape = parent.fhe_output_shape[idx]
                         logger.debug(
-                            "  → getitem extracted FHE shape at index "
-                            f"{idx}: {node.fhe_output_shape}"
+                            f"  → getitem extracted FHE shape at index {idx}: "
+                            f"{node.fhe_output_shape}"
                         )
 
         logger.debug(
@@ -297,44 +273,34 @@ class StatsTracker(fx.Interpreter):
         if node.fhe_output_shape != node.output_shape:
             logger.debug(f"  → FHE shape: {node.fhe_output_shape}")
         logger.debug(
-            f"  📊 Output stats: [{node.output_min:.4f}, "
-            f"{node.output_max:.4f}]"
+            f"  📊 Output stats: [{node.output_min:.4f}, {node.output_max:.4f}]"
         )
 
-    def compute_clear_output_shape(self, node, result_shapes):
+    def _compute_clear_shape(self, node, result_shapes):
+        """
+        Compute clear output shape.
+        Only LinearTransform changes clear shape.
+        """
         if node.op == "call_module":
             mod = self.module.get_submodule(node.target)
             if isinstance(mod, LinearTransform):
-                in_shape = (
-                    node.input_shape[0]
-                    if isinstance(node.input_shape, list)
-                    else node.input_shape
-                )
                 logger.debug(
                     f"  🔄 LinearTransform shape change: "
-                    f"{in_shape} → {result_shapes}"
+                    f"{node.input_shape} → {result_shapes}"
                 )
                 return result_shapes
-        return result_shapes if result_shapes is not None else node.input_shape
+        
+        return node.input_shape if node.input_shape else result_shapes
 
-    def compute_fhe_output_gap(self, node):
+    def _compute_output_gap(self, node):
+        """Compute output gap."""
         if node.op == "call_module":
             mod = self.module.get_submodule(node.target)
             if isinstance(mod, LinearTransform):
-                in_shape = (
-                    node.input_shape[0]
-                    if isinstance(node.input_shape, list)
-                    else node.input_shape
-                )
-                out_shape = (
-                    node.output_shape[0]
-                    if isinstance(node.output_shape, list)
-                    else node.output_shape
-                )
                 new_gap = mod.compute_fhe_output_gap(
                     input_gap=node.input_gap,
-                    input_shape=in_shape,
-                    output_shape=out_shape,
+                    input_shape=node.input_shape,
+                    output_shape=node.output_shape,
                 )
                 logger.debug(
                     f"  🔄 FHE gap change: {node.input_gap} → {new_gap}"
@@ -342,15 +308,15 @@ class StatsTracker(fx.Interpreter):
                 return new_gap
         return node.input_gap
 
-    def compute_fhe_output_shape(self, node):
-        # Placeholders won't have input_shape yet; carry clear output.
+    def _compute_fhe_shape(self, node):
+        """Compute FHE output shape."""
         if not node.input_shape:
             return node.output_shape
 
         if node.op == "call_module":
             mod = self.module.get_submodule(node.target)
             if isinstance(mod, (LinearTransform, Add, Mult)):
-                fhe_shape = mod.compute_fhe_output_shape(
+                fhe_output_shape = mod.compute_fhe_output_shape(
                     input_gap=node.input_gap,
                     input_shape=node.input_shape,
                     output_shape=node.output_shape,
@@ -359,25 +325,15 @@ class StatsTracker(fx.Interpreter):
                     clear_output_shape=node.output_shape,
                 )
                 logger.debug(
-                    "  🔄 FHE shape transformation: "
-                    f"{node.fhe_input_shape} → {fhe_shape}"
+                    f"  🔄 FHE shape transformation: {node.fhe_input_shape} → "
+                    f"{fhe_output_shape}"
                 )
-                return fhe_shape
+                return fhe_output_shape
 
         return node.fhe_input_shape
 
     def _sync_module_attributes(self, node, module):
-        logger.debug(
-            "  Module type check: %s, is Module: %s",
-            type(module).__name__, isinstance(module, Module)
-        )
-        if not isinstance(module, Module):
-            logger.debug(
-                "  ⊘ Skipping sync for PyTorch module: %s",
-                type(module).__name__,
-            )
-            return
-
+        """Sync node statistics to Orion module."""
         module.name = node.name
 
         module.input_min = node.input_min
@@ -407,6 +363,7 @@ class StatsTracker(fx.Interpreter):
         )
 
     def _update_shape_batch_size(self, shape):
+        """Update batch dimension in a shape structure."""
         if shape is None:
             return None
         if isinstance(shape, torch.Size):
@@ -417,6 +374,7 @@ class StatsTracker(fx.Interpreter):
         return shape
 
     def update_batch_size(self):
+        """Update batch size for all Orion modules."""
         logger.info(
             f"\nUpdating batch size to {self.batch_size} for all "
             "Orion modules..."
@@ -445,21 +403,52 @@ class StatsTracker(fx.Interpreter):
         logger.info(f"✓ Updated batch size for {updated} Orion modules\n")
 
     def propagate(self, *args):
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Starting propagation with {len(args)} input(s)")
-        logger.info(f"{'='*60}")
+        """Run propagation with logging."""
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"Starting propagation with {len(args)} input(s)")
+        logger.debug(f"{'='*60}")
         self.run(*args)
-        logger.info(f"\n{'='*60}")
-        logger.info("✓ Propagation completed successfully")
-        logger.info(f"{'='*60}")
+        logger.debug(f"\n{'='*60}")
+        logger.debug("✓ Propagation completed successfully")
+        logger.debug(f"{'='*60}")
+
+    def _process_dataloader(self, dl):
+        """Create a temporary DataLoader with larger batch size if needed."""
+        if self.batch_size > dl.batch_size:
+            from torch.utils.data.sampler import RandomSampler
+            shuffle = dl.sampler is None or isinstance(dl.sampler, RandomSampler)
+            
+            logger.info(
+                f"Temporarily increased batch size from {dl.batch_size} "
+                f"to {self.batch_size} for faster statistics collection"
+            )
+            
+            return DataLoader(
+                dataset=dl.dataset,
+                batch_size=self.batch_size,
+                shuffle=shuffle,
+                num_workers=dl.num_workers,
+                pin_memory=dl.pin_memory,
+                drop_last=dl.drop_last
+            ), dl.batch_size
+        return dl, dl.batch_size
+
+    def _extract_batch_input(self, batch, device):
+        """Extract and prepare input tensor(s) from a batch."""
+        x = batch[0] if isinstance(batch, (list, tuple)) and len(batch) > 0 else batch
+        if isinstance(x, torch.Tensor):
+            return x.to(device)
+        elif isinstance(x, (list, tuple)):
+            return [t.to(device) for t in x]
+        else:
+            raise TypeError(f"Unsupported batch element type: {type(x).__name__}")
 
     def propagate_all(self, input_data, device='cpu', show_progress=True):
-        """Run on tensors (or lists of tensors). DataLoader support deferred."""
+        """Run on tensors or DataLoader(s); then refresh batch size."""
         if not isinstance(input_data, list):
             input_data = [input_data]
 
-        all_tensors = all(isinstance(x, (torch.Tensor, list))
-                          for x in input_data)
+        all_tensors = all(isinstance(x, (torch.Tensor, list)) for x in input_data)
         all_loaders = all(isinstance(x, DataLoader) for x in input_data)
 
         if all_tensors:
@@ -467,7 +456,7 @@ class StatsTracker(fx.Interpreter):
                 "Propagating input data structure: " +
                 str([
                     ("List[{0}]".format(len(x)) if isinstance(x, list)
-                     else type(x).__name__)
+                    else type(x).__name__)
                     for x in input_data
                 ])
             )
@@ -480,10 +469,44 @@ class StatsTracker(fx.Interpreter):
             self.propagate(*inputs)
 
         elif all_loaders:
-            logger.info("Propagating through DataLoader(s)")
-            raise NotImplementedError(
-                "DataLoader support needs updating for new structure"
-            )
+            logger.info(f"Propagating through {len(input_data)} DataLoader(s)")
+            
+            # Process dataloaders with temporary batch size increase if needed
+            temp_loaders = []
+            user_batch_sizes = []
+            for dl in input_data:
+                temp_dl, orig_batch_size = self._process_dataloader(dl)
+                temp_loaders.append(temp_dl)
+                user_batch_sizes.append(orig_batch_size)
+            
+            # Iterate through batches
+            iterator = zip(*temp_loaders)
+            if show_progress:
+                try:
+                    total = min(len(dl) for dl in temp_loaders)
+                except TypeError:
+                    total = None
+                iterator = tqdm(
+                    iterator,
+                    desc="Processing batches",
+                    unit="batch",
+                    total=total,
+                    leave=True,
+                )
+            
+            for batches in iterator:
+                inputs = [self._extract_batch_input(b, device) for b in batches]
+                self.propagate(*inputs)
+            
+            # Reset to original user batch size
+            original_batch_size = user_batch_sizes[0]
+            if len(set(user_batch_sizes)) > 1:
+                logger.warning(
+                    f"Multiple DataLoaders with different batch sizes detected: "
+                    f"{user_batch_sizes}. Using first batch size: {original_batch_size}"
+                )
+            self.batch_size = original_batch_size
+
         else:
             types = [type(x).__name__ for x in input_data]
             raise ValueError(

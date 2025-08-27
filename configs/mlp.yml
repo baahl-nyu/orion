@@ -19,4 +19,4 @@ orion:
 
   diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
   keys_path: ../data/keys.h5 # "path/to/keys" | ""
-  io_mode: load # "load" | "save" | "none"
+  io_mode: none # "load" | "save" | "none"

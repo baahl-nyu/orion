@@ -9,12 +9,16 @@ from orion.core.utils import (
     train_on_mnist
 )
 
+orion.set_log_level('INFO')
+
 # Set seed for reproducibility
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
 scheme = orion.init_scheme("../configs/lola.yml")
-trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
+
+batch_size = scheme.params.get_batch_size()
+trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=batch_size)
 net = models.LoLA()
 
 # Train model (optional)
@@ -22,16 +26,13 @@ net = models.LoLA()
 # train_on_mnist(net, data_dir="../data", epochs=1, device=device)
 
 # Get a test batch to pass through our network
-inp, _ = next(iter(testloader))
+inp, _ = next(iter(trainloader))
 
 # Run cleartext inference
 net.eval()
 out_clear = net(inp)
 
 # Prepare for FHE inference. 
-# Certain polynomial activation functions require us to know the precise range
-# of possible input values. We'll determine these ranges by aggregating
-# statistics from the training set and applying a tolerance factor = margin.
 orion.fit(net, trainloader)
 input_level = orion.compile(net)
 

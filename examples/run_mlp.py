@@ -39,7 +39,9 @@ scheme = orion.init_scheme("../configs/mlp.yml")
 trainloader, testloader = get_mnist_datasets(data_dir="../data")
 net = MLP()
 
-inp = torch.randn(1, 784)
+#inp = torch.randn(1, 784)
+inp, _ = next(iter(trainloader))
+inp = inp[0].unsqueeze(0)
 
 # Run cleartext inference
 net.eval()

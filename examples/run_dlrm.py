@@ -58,7 +58,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
    
     dense_size  = 128
-    vocab_sizes = [128, 128, 128]
+    vocab_sizes = [128, 128, 128, 128, 128]
     hidden_dim  = 128
 
     dlrm = DLRM(dense_size, vocab_sizes, hidden_dim)
