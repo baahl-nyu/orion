@@ -108,7 +108,7 @@ class BootstrapSolver:
                     next_level_dag = LevelDAG(
                         self.l_eff, self.network_dag, node_dag
                     )
-                    visited.update(node)
+                    visited.add(node)
    
                 self.full_level_dag.append(next_level_dag)
 

@@ -16,6 +16,7 @@ class Module(nn.Module, ABC):
         self.depth = None
         self.fused = False
         self.he_mode = False
+        self.trace_internals = False
         self.preserve_input_shape = False
 
     @staticmethod
@@ -55,6 +56,9 @@ class Module(nn.Module, ABC):
 
     def set_level(self, level):
         self.level = level
+
+    def trace_internal_ops(self, enabled=True):
+        self.trace_internals = enabled
 
     def compute_fhe_output_shape(self, **kwargs):
         """Compute FHE output shape. Default: preserve FHE input shape."""

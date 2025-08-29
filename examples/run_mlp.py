@@ -32,7 +32,7 @@ out_clear = net(inp)
 # Certain polynomial activation functions require us to know the precise range
 # of possible input values. We'll determine these ranges by aggregating
 # statistics from the training set and applying a tolerance factor = margin.
-orion.fit(net, inp, batch_size=128)
+orion.fit(net, inp)
 input_level = orion.compile(net)
 
 # Encode and encrypt the input vector 

@@ -173,7 +173,7 @@ class Node:
         """Log input statistics."""
         logger.debug(f"  → Input: shape={self.input_shape}")
         logger.debug(f"  → FHE shape: {self.fhe_input_shape}, gap={self.input_gap}")
-        logger.debug(f"  📊 Output stats: [{self.input_min:.4f}, {self.input_max:.4f}]")
+        logger.debug(f"  📊 Input stats: [{self.input_min:.4f}, {self.input_max:.4f}]")
 
     def log_output_stats(self):
         """Log output statistics."""
@@ -204,6 +204,12 @@ class OrionTracer(fx.Tracer):
         # Non-modules (functions, methods) become call_function nodes
         if not isinstance(m, nn.Module):
             return False
+        
+        # User has modified the default on.Module behavior to no longer 
+        # treat their module as a black box. Can now trace within this
+        # module's forward pass, optimizing bootstrap placement there too. 
+        if isinstance(m, Module) and m.trace_internals:
+            return False  # Trace inside
        
         # Containers must be traced into to see their contents
         if isinstance(m, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
