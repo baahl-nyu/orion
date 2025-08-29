@@ -152,7 +152,6 @@ class LevelDAG(nx.DiGraph):
     def build_layer(self, node: str):
         """Builds the next layer of nodes in the level DAG and estimates
            their latency, eventually used in shortest path."""
-
         level_dag_nodes = [f"{node}@l={i}" for i in range(self.l_eff+1)]
         self.add_nodes_from(level_dag_nodes)
 
@@ -226,6 +225,10 @@ class LevelDAG(nx.DiGraph):
             depth = 1 if "mul" in prev_path_node else 0 
             if curr_level > prev_level - depth:
                 return (float("inf"), 0)
+            elif prev_level - depth <= 0:
+                return (float("inf"), 0)
+            else:
+                return (0,0)
 
         # Case 1: Previous module is None or Identity
         if prev_module is None or isinstance(prev_module, nn.Identity):
