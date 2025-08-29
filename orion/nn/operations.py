@@ -52,8 +52,8 @@ class Bootstrap(Module):
     def fit(self):
         center = (self.input_min + self.input_max) / 2 
         half_range = (self.input_max - self.input_min) / 2
-        self.low = (center - (self.margin * half_range)).item()
-        self.high = (center + (self.margin * half_range)).item()
+        self.low = (center - (self.margin * half_range))
+        self.high = (center + (self.margin * half_range))
 
         # We'll want to scale from [A, B] into [-1, 1] using a value of the
         # form 1 / integer, so that way our multiplication back to the range

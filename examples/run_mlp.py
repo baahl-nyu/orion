@@ -2,54 +2,37 @@ import time
 import math
 import torch
 import orion
-import orion.nn as on
+import orion.models as models
 from orion.core.utils import (
     get_mnist_datasets,
     mae, 
+    train_on_mnist
 )
-
-orion.set_log_level('DEBUG')
-
-class MLP(on.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.flatten = on.Flatten()
-        
-        self.fc1 = on.Linear(784, 128)
-        self.bn1 = on.BatchNorm1d(128)
-        self.act1 = on.Quad()
-        
-        self.fc2 = on.Linear(128, 128)
-        self.bn2 = on.BatchNorm1d(128)
-        self.act2 = on.Quad() 
-        
-        self.fc3 = on.Linear(128, num_classes)
-
-    def forward(self, x): 
-        x = self.flatten(x)
-        x = self.act1(self.bn1(self.fc1(x)))
-        x = self.act2(self.bn2(self.fc2(x)))
-        return self.fc3(x)
 
 # Set seed for reproducibility
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
-scheme = orion.init_scheme("../configs/mlp.yml")
-trainloader, testloader = get_mnist_datasets(data_dir="../data")
-net = MLP()
+scheme = orion.init_scheme("../configs/resnet.yml")
+trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
+net = models.MLP()
 
-#inp = torch.randn(1, 784)
-inp, _ = next(iter(trainloader))
-inp = inp[0].unsqueeze(0)
+# Train model (optional)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+train_on_mnist(net, data_dir="../data", epochs=1, device=device)
+
+# Get a test batch to pass through our network
+inp, _ = next(iter(testloader))
 
 # Run cleartext inference
 net.eval()
 out_clear = net(inp)
 
-
 # Prepare for FHE inference. 
-orion.fit(net, inp)
+# Certain polynomial activation functions require us to know the precise range
+# of possible input values. We'll determine these ranges by aggregating
+# statistics from the training set and applying a tolerance factor = margin.
+orion.fit(net, inp, batch_size=128)
 input_level = orion.compile(net)
 
 # Encode and encrypt the input vector 

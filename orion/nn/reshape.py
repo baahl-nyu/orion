@@ -6,6 +6,7 @@ class Flatten(Module):
     def __init__(self):
         super().__init__()
         self.set_depth(0)
+        self.preserve_input_shape = True
 
     def extra_repr(self):
         return super().extra_repr() + ", start_dim=1"

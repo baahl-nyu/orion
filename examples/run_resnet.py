@@ -30,7 +30,7 @@ input_level = orion.compile(net)
 # Encode and encrypt the input vector 
 vec_ptxt = orion.encode(inp, input_level)
 vec_ctxt = orion.encrypt(vec_ptxt)
-net.he()  # Switch to FHE mode
+net.he() # Switch to FHE mode
 
 # Run FHE inference
 print("\nStarting FHE inference", flush=True)

@@ -73,8 +73,8 @@ class Chebyshev(Module):
         if not self.within_composite:
             center = (self.input_min + self.input_max) / 2 
             half_range = (self.input_max - self.input_min) / 2
-            self.low = (center - (self.margin * half_range)).item()
-            self.high = (center + (self.margin * half_range)).item()
+            self.low = (center - (self.margin * half_range))
+            self.high = (center + (self.margin * half_range))
 
             nodes = np.polynomial.chebyshev.chebpts1(self.degree + 1)
             if self.low < -1 or self.high > 1:

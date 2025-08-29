@@ -129,7 +129,13 @@ class Scheme:
         trace = tracer.trace_model(net)
         self.trace = trace
 
-        stats_tracker = StatsTracker(trace, batch_size)
+        # An additional batch size parameter can be passed here to speed up
+        # the process of fitting data. Any tracked batch dimensions are reset 
+        # to what the user specified in the YAML file immediately afterwards.
+        temp_batch_size = batch_size
+        user_batch_size = self.params.get_batch_size()
+
+        stats_tracker = StatsTracker(trace, temp_batch_size, user_batch_size)
         
         # Get the location of the model (cpu, gpu, etc.) so that the data 
         # propagated below is sent to the correct device.
@@ -236,7 +242,7 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
-        # network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
+        network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
 
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()

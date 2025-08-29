@@ -9,7 +9,7 @@ from orion.core.utils import (
     train_on_mnist
 )
 
-orion.set_log_level('INFO')
+orion.set_log_level('DEBUG')
 
 # Set seed for reproducibility
 torch.manual_seed(42)
@@ -21,11 +21,7 @@ batch_size = scheme.params.get_batch_size()
 trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=batch_size)
 net = models.LoLA()
 
-# Train model (optional)
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# train_on_mnist(net, data_dir="../data", epochs=1, device=device)
-
-# Get a test batch to pass through our network
+# Get a train batch to pass through our network
 inp, _ = next(iter(trainloader))
 
 # Run cleartext inference
@@ -33,7 +29,7 @@ net.eval()
 out_clear = net(inp)
 
 # Prepare for FHE inference. 
-orion.fit(net, trainloader)
+orion.fit(net, inp)
 input_level = orion.compile(net)
 
 # Encode and encrypt the input vector 

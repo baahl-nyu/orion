@@ -16,6 +16,7 @@ class Module(nn.Module, ABC):
         self.depth = None
         self.fused = False
         self.he_mode = False
+        self.preserve_input_shape = False
 
     @staticmethod
     def set_scheme(scheme):
@@ -54,6 +55,10 @@ class Module(nn.Module, ABC):
 
     def set_level(self, level):
         self.level = level
+
+    def compute_fhe_output_shape(self, **kwargs):
+        """Compute FHE output shape. Default: preserve FHE input shape."""
+        return kwargs["fhe_input_shape"]
 
     @abstractmethod
     def forward(self, x):

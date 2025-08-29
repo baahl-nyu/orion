@@ -19,7 +19,7 @@ class NetworkDAG(nx.DiGraph):
         self.residuals = {}  # Maps fork nodes to their corresponding join nodes
     
     def build_dag(self):
-        """Extract computational graph from PyTorch model using FX"""
+        """Extract computational graph from PyTorch model using torch.fx"""
         
         # Only keep nn.Modules, on.Modules, and basic arithmetic operations
         # in the final network graph we pass onward.
@@ -271,7 +271,7 @@ class NetworkDAG(nx.DiGraph):
     def topological_sort(self):
         return nx.topological_sort(self)
     
-    def plot(self, figsize=(12, 10), save_path=None):
+    def plot(self, figsize=(15, 7.5), save_path=None):
         """Visualize the DAG with color-coded node types"""
         color_map = {
             'placeholder': 'lightgreen',
@@ -293,12 +293,9 @@ class NetworkDAG(nx.DiGraph):
         
         plt.figure(figsize=figsize)
         nx.draw(self, pos, labels=labels, node_color=node_colors,
-                node_size=2000, font_size=8, arrows=True, 
+                node_size=1000, font_size=8, arrows=True, 
                 edge_color='gray', arrowsize=15)
-        
-        plt.title("Network DAG with Binary Structure")
-        plt.tight_layout()
-        
+                
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.show()
