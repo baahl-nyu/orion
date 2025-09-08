@@ -6,6 +6,7 @@ import operator
 
 from orion.nn.normalization import BatchNormNd
 
+
 class NetworkDAG(nx.DiGraph):
     """
     Represents a neural network as a directed acyclic graph (DAG) using 
@@ -125,27 +126,26 @@ class NetworkDAG(nx.DiGraph):
         changed = True
         while changed:
             changed = False
-            for node in list(self.nodes):
-                # Skip already processed auxiliary nodes
-                if self.nodes[node].get('op') in ['fork', 'join', 'merge']:
+
+            # Deterministic topo order: by generations, then by name in each gen
+            layers = list(nx.topological_generations(self))
+            order = [n for layer in layers for n in sorted(layer)]
+
+            for node in order:
+                # Skip synthetic helpers
+                if self.nodes[node].get('op') in ['fork', 'join']:
                     continue
-                
+
                 successors = list(self.successors(node))
                 predecessors = list(self.predecessors(node))
-                
-                # Handle diverging paths (may be residual connections)
+
+                # Divergence -> try to bracket a residual
                 if len(successors) >= 2:
                     convergence = self._find_convergence(node, successors)
                     if convergence:
                         self._process_residual(node, convergence)
                         changed = True
                         break
-                
-                # Handle nodes with too many inputs
-                if len(predecessors) > 2:
-                    self._merge_inputs(node)
-                    changed = True
-                    break
     
     def _find_convergence(self, node, successors):
         """Find where diverging paths reconverge (residual pattern)"""
@@ -198,18 +198,6 @@ class NetworkDAG(nx.DiGraph):
         self.add_edge(join, convergence)
         
         self.residuals[fork] = join
-    
-    def _merge_inputs(self, node):
-        """Create merge node to binarize multiple inputs"""
-        predecessors = list(self.predecessors(node))
-        merge = self._unique_name(f"{node}_merge")
-        self.add_node(merge, op="merge", module=None, label=f"{merge}\n(merge)")
-        
-        # Keep first input direct, route others through merge
-        for pred in predecessors[1:]:
-            self.remove_edge(pred, node)
-            self.add_edge(pred, merge)
-        self.add_edge(merge, node)
     
     def _unique_name(self, base):
         """Generate unique node name with counter suffix if needed"""

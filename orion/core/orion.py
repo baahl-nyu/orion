@@ -6,6 +6,7 @@ import yaml
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, RandomSampler
+import logging
 
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
@@ -25,6 +26,7 @@ from .tracer import OrionTracer, StatsTracker
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
+from .logger import logger as ORION_LOGGER
 
 
 class Scheme:
@@ -230,11 +232,13 @@ class Scheme:
                 break
 
         # Now we can generate the diagonals 
-        print("\n{3} Generating matrix diagonals...", flush=True)
+        if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+            print("\n{3} Generating matrix diagonals...", flush=True)
         for node in topo_sort:
             module = network_dag.nodes[node]["module"]
             if isinstance(module, LinearTransform):
-                print(f"\nPacking {node}:")
+                if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+                    print(f"\nPacking {node}:")
                 module.generate_diagonals(last=(node == last_linear))
 
         #------------------------------#

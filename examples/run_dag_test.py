@@ -9,53 +9,33 @@ orion.set_log_level('DEBUG')
 torch.manual_seed(42)
 
 
-class Layer(on.Module):
+class Layer1(on.Module):
     def __init__(self):
         super().__init__()
-        #self.set_depth(0)
-        self.trace_internal_ops(True)
+        self.set_depth(0)
+        self.trace_internal_ops(False)
     
-    def forward(self, x):
-        return x, 5.5*x
+    def forward(self, a, b, c):
+        return a + b + c
 
-
-class Concat(on.Module):
-    def __init__(self):
-        super().__init__()
-        #self.set_depth(0)
-        self.trace_internal_ops(True)
-    
-    def forward(self, x, y, z):
-        return x + y + z
 
 
 class DAG_TEST(on.Module):
     def __init__(self, num_classes=10):
         super().__init__()
-        self.flatten = on.Flatten()
-        self.splitter = on.Linear(784, 128)
+        self.fc1 = on.Linear(784, 128)
+        self.fc2 = on.Linear(784, 128)
+        self.fc3 = on.Linear(784, 128)
+        self.fc4 = on.Linear(784, 128)
 
-        # self.fc1 = on.Linear(128, 128)
-        # self.fc2 = on.Linear(128, 128)
-        # self.fc3 = on.Linear(128, 128)
+        self.layer1 = Layer1()
 
-        self.layer1 = Layer()
-        self.layer2 = Layer()
-        self.layer3 = Concat()
+    def forward(self, x, y, z): 
+        a = self.fc1(x)
+        b = self.fc2(y)
+        c = self.fc3(z)
 
-    def forward(self, x): 
-        x = self.flatten(x)
-        x = self.splitter(x)
-
-        # a = self.fc1(x)
-        # b = self.fc2(x)
-        # c = self.fc3(x)
-
-        a, b = self.layer1(x)
-        c, d = self.layer2(a)
-        e = self.layer3(b, c, d)
-
-        return e
+        return self.layer1(a, b, c)
 
 
 def main():
@@ -65,21 +45,25 @@ def main():
     trainloader, _ = get_mnist_datasets(data_dir="../data", batch_size=batch_size)
     net = DAG_TEST()
 
-    inp, _ = next(iter(trainloader))
+    inp1 = torch.randn(1, 784)
+    inp2 = torch.randn(1, 784)
+    inp3 = torch.randn(1, 784)
 
     # Run cleartext inference
     net.eval()
-    out_clear = net(inp)
+    out_clear = net(inp1, inp2, inp3)
 
     # Prepare for FHE inference. 
-    orion.fit(net, inp)
+    orion.fit(net, [inp1, inp2, inp3])
     input_level = orion.compile(net)
 
     # Encode and encrypt the input vector 
-    vec_ctxt = orion.encrypt(orion.encode(inp, input_level))
+    vec1_ctxt = orion.encrypt(orion.encode(inp1, input_level))
+    vec2_ctxt = orion.encrypt(orion.encode(inp2, input_level))
+    vec3_ctxt = orion.encrypt(orion.encode(inp3, input_level))
     net.he()  # Switch to FHE mode
 
-    out_ctxt = net(vec_ctxt)
+    out_ctxt = net(vec1_ctxt, vec2_ctxt, vec3_ctxt)
 
     # Get the FHE results and decrypt + decode.
     out_fhe = out_ctxt.decrypt().decode()

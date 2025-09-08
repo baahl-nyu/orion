@@ -17,7 +17,7 @@ class Module(nn.Module, ABC):
         self.fused = False
         self.he_mode = False
         self.trace_internals = False
-        self.preserve_input_shape = False
+        self.preserve_input_shapes = False
 
     @staticmethod
     def set_scheme(scheme):
@@ -63,6 +63,10 @@ class Module(nn.Module, ABC):
     def compute_fhe_output_shape(self, **kwargs):
         """Compute FHE output shape. Default: preserve FHE input shape."""
         return kwargs["fhe_input_shape"]
+    
+    def compute_fhe_output_gap(self, **kwargs):
+        """Compute FHE output gap. Default: preserve FHE input gap."""
+        return kwargs["input_gap"]
 
     @abstractmethod
     def forward(self, x):
@@ -88,6 +92,7 @@ def timer(func):
             # Print input statistics
             print(f"Clear input min/max: {self.input_min:.3f} / {self.input_max:.3f}")
             print(f"FHE input min/max: {args[0].min():.3f} / {args[0].max():.3f}")
+            print(f"FHE input level: {args[0].level()}")
             
             start = time.time() # start timer that ends after module finishes
         
@@ -105,7 +110,8 @@ def timer(func):
             elapsed = time.time() - start
                 
             print(f"Clear output min/max: {output_min:.3f} / {output_max:.3f}")
-            print(f"FHE output min/max: {result.min():.3f} / {result.max():.3f}")            
+            print(f"FHE output min/max: {result.min():.3f} / {result.max():.3f}") 
+            print(f"FHE output level: {result.level()}")
             print(f"done! [{elapsed:.3f} secs.]")
         
         return result

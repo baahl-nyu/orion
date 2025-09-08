@@ -103,10 +103,10 @@ class NewEvaluator:
             layer.create_dataset("on_bias", data=on_bias.numpy())
             layer.create_dataset("input_shape", data=list(input_shape))
             layer.create_dataset("output_shape", data=list(output_shape))
-            layer.create_dataset("input_min", data=input_min.item())
-            layer.create_dataset("input_max", data=input_max.item())
-            layer.create_dataset("output_min", data=output_min.item())
-            layer.create_dataset("output_max", data=output_max.item())
+            layer.create_dataset("input_min", data=input_min)
+            layer.create_dataset("input_max", data=input_max)
+            layer.create_dataset("output_min", data=output_min)
+            layer.create_dataset("output_max", data=output_max)
 
             diags_group = layer.require_group("diagonals")
             for (row, col), diags in diagonals.items():

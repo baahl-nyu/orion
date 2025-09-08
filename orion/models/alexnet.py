@@ -47,8 +47,7 @@ class AlexNet(on.Module):
             elif x == 'A':
                 layers += [on.AdaptiveAvgPool2d((2, 2))]
             else:
-                layers += [ConvBlock(in_channels, x, kernel_size=3, 
-                                     stride=1, padding=1)]
+                layers += [ConvBlock(in_channels, x, kernel_size=3, stride=1, padding=1)]
                 in_channels = x
         return nn.Sequential(*layers)
 

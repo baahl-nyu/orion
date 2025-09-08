@@ -1,7 +1,8 @@
 import os
 import logging
 from typing import Literal, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from pprint import pformat
 
 logger = logging.getLogger("orion")
 
@@ -130,9 +131,8 @@ class OrionParameters:
             logger.error(error_msg)
             raise ValueError(error_msg)
         
-        logger.debug(f"Initialized Orion parameters: batch_size={self.batch_size}, "
-                    f"margin={self.margin}, backend={self.backend}, "
-                    f"embedding={self.embedding_method}, io_mode={self.io_mode}")
+        # pretty-print the dataclass as a dict
+        logger.debug("Initialized Orion parameters:\n%s", pformat(asdict(self), sort_dicts=False))
 
     def __str__(self) -> str:
         output = [
@@ -172,10 +172,10 @@ class NewParameters:
         boot_params = self._normalize_params(params.get("boot_params", {}))
         orion_params = self._normalize_params(params.get("orion", {}))
         
-        # Log the configuration being loaded
-        logger.debug(f"CKKS params: {ckks_params}")
-        logger.debug(f"Boot params: {boot_params}")
-        logger.debug(f"Orion params: {orion_params}")
+        # Log the configuration being loaded (pretty-printed)
+        logger.debug("CKKS params:\n%s", pformat(ckks_params, sort_dicts=False))
+        logger.debug("Boot params:\n%s", pformat(boot_params, sort_dicts=False))
+        logger.debug("Orion params:\n%s", pformat(orion_params, sort_dicts=False))
 
         # Initialize sub-parameters
         try:

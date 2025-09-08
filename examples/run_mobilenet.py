@@ -4,9 +4,8 @@ import torch
 import orion
 import orion.models as models
 from orion.core.utils import (
-    get_cifar_datasets,
+    get_tiny_datasets,
     mae, 
-    train_on_cifar
 )
 
 orion.set_log_level('INFO')
@@ -16,8 +15,8 @@ torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
 scheme = orion.init_scheme("../configs/resnet.yml")
-trainloader, testloader = get_cifar_datasets(data_dir="../data", batch_size=1)
-net = models.ResNet20()
+trainloader, testloader = get_tiny_datasets(data_dir="../data/", batch_size=1)
+net = models.MobileNet()
 
 # Get a test batch to pass through our network
 inp, _ = next(iter(testloader))
