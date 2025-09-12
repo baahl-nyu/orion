@@ -47,8 +47,16 @@ class LinearTransform(Module):
         pass
 
     @abstractmethod
-    def generate_diagonals(self, last: bool):
-        pass
+    def generate_diagonals(self, last):
+        # Here, we'll apply our packing strategies to return the diagonals
+        # of our linear layer. When using the "hybrid" method of packing, this
+        # may also require several output rotations and summations.
+
+        # When ``io_mode`` is set to "load", the diagonals were already saved
+        # to disk in a previous compilation. In that case, skip regeneration
+        # here and allow ``compile()`` to load them directly from disk.
+        if self.get_io_mode() == "load":
+            return
 
     def get_io_mode(self):
         return self.scheme.params.get_io_mode()
