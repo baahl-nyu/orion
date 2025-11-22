@@ -134,9 +134,11 @@ jobs:
       - name: install packages
         shell: bash
         run: |
-          # Allow PyPI for test dependencies but force orion-fhe from our built wheels
+          # Install test deps and runtime deps from PyPI (PyTorch from CPU index), then our wheel only from artifacts
           pip install pytest pytest-cov
-          pip install --no-index --find-links=merged-wheels orion-fhe
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            PyYAML torch torchvision tqdm numpy scipy matplotlib h5py certifi
+          pip install --no-index --find-links=merged-wheels --no-deps orion-fhe
 
       - name: run pytest
         shell: bash 
