@@ -108,6 +108,13 @@ func GetModuliChain() (*C.ulong, C.ulong) {
 	return arrPtr, length
 }
 
+//export GetAuxModuliChain
+func GetAuxModuliChain() (*C.ulong, C.ulong) {
+	moduli := scheme.Params.P()
+	arrPtr, length := SliceToCArray(moduli, convertULongtoCULong)
+	return arrPtr, length
+}
+
 //export GetLivePlaintexts
 func GetLivePlaintexts() (*C.int, C.ulong) {
 	ids := ptHeap.GetLiveKeys()

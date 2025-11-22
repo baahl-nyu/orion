@@ -5,7 +5,7 @@ class NewEncoder:
     def __init__(self, scheme):
         self.scheme = scheme
         self.params = scheme.params
-        self.backend = scheme.backend 
+        self.backend = scheme.backend
         self.setup_encoder()
 
     def setup_encoder(self):
@@ -42,7 +42,7 @@ class NewEncoder:
         return PlainTensor(self.scheme, plaintext_ids, values.shape)
 
     def decode(self, plaintensor: PlainTensor):
-        values = [] 
+        values = []
         for plaintext_id in plaintensor.ids:
             values.extend(self.backend.Decode(plaintext_id))
 
@@ -51,3 +51,6 @@ class NewEncoder:
 
     def get_moduli_chain(self):
         return self.backend.GetModuliChain()
+
+    def get_aux_moduli_chain(self):
+        return self.backend.GetAuxModuliChain()

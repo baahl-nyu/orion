@@ -257,6 +257,12 @@ class LattigoLibrary:
             restype=ArrayResultUInt64,
         )
 
+        self.GetAuxModuliChain = LattigoFunction(
+            self.lib.GetAuxModuliChain,
+            argtypes=None,
+            restype=ArrayResultUInt64,
+        )
+
         self.GetLivePlaintexts = LattigoFunction(
             self.lib.GetLivePlaintexts,
             argtypes=None,
