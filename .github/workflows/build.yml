@@ -112,11 +112,18 @@ jobs:
           pattern: wheels-*
           path: dist/
           merge-multiple: true
+
+      - name: gather wheels into single directory
+        shell: bash
+        run: |
+          mkdir -p merged-wheels
+          find dist -name "*.whl" -exec cp {} merged-wheels/ \;
+          ls -l merged-wheels
             
       - name: install packages
         shell: bash
         run: |
-          pip install --find-links=dist orion-fhe pytest pytest-cov
+          pip install --no-index --find-links=merged-wheels orion-fhe pytest pytest-cov
 
       - name: run pytest
         shell: bash 
