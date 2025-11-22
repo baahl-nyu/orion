@@ -123,7 +123,9 @@ jobs:
       - name: install packages
         shell: bash
         run: |
-          pip install --no-index --find-links=merged-wheels orion-fhe pytest pytest-cov
+          # Allow PyPI for test dependencies but force orion-fhe from our built wheels
+          pip install pytest pytest-cov
+          pip install --no-index --find-links=merged-wheels orion-fhe
 
       - name: run pytest
         shell: bash 
