@@ -106,12 +106,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: select wheel artifact for this runner
+        shell: bash
+        run: |
+          if [[ "${{ matrix.config.os }}" == "ubuntu-latest" ]]; then
+            echo "WHEEL_ARTIFACT=wheels-manylinux2014-py${{ matrix.python-version }}-x64" >> $GITHUB_ENV
+          elif [[ "${{ matrix.config.os }}" == "windows-latest" ]]; then
+            echo "WHEEL_ARTIFACT=wheels-windows-latest-py${{ matrix.python-version }}-${{ matrix.config.arch }}" >> $GITHUB_ENV
+          else
+            echo "WHEEL_ARTIFACT=wheels-macos-latest-py${{ matrix.python-version }}-${{ matrix.config.arch }}" >> $GITHUB_ENV
+          fi
+
       - name: download artifact wheels
         uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          name: ${{ env.WHEEL_ARTIFACT }}
           path: dist/
-          merge-multiple: true
+          if-no-files-found: error
 
       - name: gather wheels into single directory
         shell: bash
