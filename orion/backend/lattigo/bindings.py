@@ -42,6 +42,8 @@ class LattigoFunction:
             return ctypes.c_int(arg)
         elif isinstance(arg, int) and typ == ctypes.c_ulong:
             return ctypes.c_ulong(arg)
+        elif isinstance(arg, int) and typ == ctypes.c_ulonglong:
+            return ctypes.c_ulonglong(arg)
         elif isinstance(arg, float):
             return ctypes.c_float(arg)
         elif isinstance(arg, str):
@@ -58,6 +60,8 @@ class LattigoFunction:
                 return ((ctypes.c_float * len(arg))(*arg), len(arg))
             elif typ == ctypes.POINTER(ctypes.c_ulong):
                 return ((ctypes.c_ulong * len(arg))(*arg), len(arg))
+            elif typ == ctypes.POINTER(ctypes.c_ulonglong):
+                return ((ctypes.c_ulonglong * len(arg))(*arg), len(arg))
             elif typ == ctypes.POINTER(ctypes.c_ubyte):
                 return ((ctypes.c_ubyte * len(arg))(*arg), len(arg))
             else:
@@ -71,16 +75,20 @@ class LattigoFunction:
         elif type(res) == ctypes.c_float:
             return float(res)
         elif type(res) == ArrayResultFloat:
-            return [float(res.Data[i]) for i in range(res.Length)]
+            length = int(res.Length)
+            return [float(res.Data[i]) for i in range(length)]
         elif type(res) in (ArrayResultInt, ArrayResultUInt64):
-            return [int(res.Data[i]) for i in range(res.Length)]
+            length = int(res.Length)
+            return [int(res.Data[i]) for i in range(length)]
         elif type(res) == ArrayResultDouble:
-            return [float(res.Data[i]) for i in range(res.Length)]
+            length = int(res.Length)
+            return [float(res.Data[i]) for i in range(length)]
         elif type(res) == ArrayResultByte:
+            length = int(res.Length)
             # Create numpy array directly from the C buffer
             buffer = ctypes.cast(
                 res.Data, 
-                ctypes.POINTER(ctypes.c_ubyte * res.Length)
+                ctypes.POINTER(ctypes.c_ubyte * length)
             ).contents
             array = np.frombuffer(buffer, dtype=np.uint8)
             return array, res.Data
@@ -762,7 +770,10 @@ class ArrayResultDouble(ctypes.Structure):
     _fields_ = [("Data", ctypes.POINTER(ctypes.c_double)), ("Length", ctypes.c_ulong)]
 
 class ArrayResultUInt64(ctypes.Structure):
-    _fields_ = [("Data", ctypes.POINTER(ctypes.c_ulong)), ("Length", ctypes.c_ulong)]
+    _fields_ = [
+        ("Data", ctypes.POINTER(ctypes.c_ulonglong)),
+        ("Length", ctypes.c_ulonglong),
+    ]
 
 class ArrayResultByte(ctypes.Structure):
     _fields_ = [("Data", ctypes.POINTER(ctypes.c_char)), ("Length", ctypes.c_ulong)]

@@ -37,6 +37,10 @@ func convertULongtoCULong(v uint64) C.ulong {
 	return C.ulong(v)
 }
 
+func convertUint64ToCULonglong(v uint64) C.ulonglong {
+	return C.ulonglong(v)
+}
+
 func convertULongtoInt(v uint64) C.int {
 	return C.int(v)
 }

@@ -102,17 +102,17 @@ func GetCiphertextDegree(ciphertextID int) C.int {
 }
 
 //export GetModuliChain
-func GetModuliChain() (*C.ulong, C.ulong) {
+func GetModuliChain() (*C.ulonglong, C.ulonglong) {
 	moduli := scheme.Params.Q()
-	arrPtr, length := SliceToCArray(moduli, convertULongtoCULong)
-	return arrPtr, length
+	arrPtr, length := SliceToCArray(moduli, convertUint64ToCULonglong)
+	return arrPtr, C.ulonglong(length)
 }
 
 //export GetAuxModuliChain
-func GetAuxModuliChain() (*C.ulong, C.ulong) {
+func GetAuxModuliChain() (*C.ulonglong, C.ulonglong) {
 	moduli := scheme.Params.P()
-	arrPtr, length := SliceToCArray(moduli, convertULongtoCULong)
-	return arrPtr, length
+	arrPtr, length := SliceToCArray(moduli, convertUint64ToCULonglong)
+	return arrPtr, C.ulonglong(length)
 }
 
 //export GetLivePlaintexts
