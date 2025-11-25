@@ -49,7 +49,9 @@ class LevelDAG(nx.DiGraph):
 
         # Instantiate a new instance that black-boxes the intermediate
         # nodes of both level DAGs we're adding
-        aggregate_level_dag = LevelDAG(self.l_eff, self.network_dag, path=None)
+        aggregate_level_dag = LevelDAG(
+            l_eff=self.l_eff, network_dag=self.network_dag, path=None
+        )
         aggregate_level_dag.add_nodes_from(
             (node, {"weight": 0}) for node in source_nodes)
         aggregate_level_dag.add_nodes_from(

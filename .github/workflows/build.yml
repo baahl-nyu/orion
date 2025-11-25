@@ -115,7 +115,7 @@ jobs:
           elif [[ "${{ matrix.config.os }}" == "windows-latest" ]]; then
             echo "WHEEL_ARTIFACT=wheels-windows-latest-py${{ matrix.python-version }}-${{ matrix.config.arch }}" >> $GITHUB_ENV
           else
-            echo "WHEEL_ARTIFACT=wheels-macos-latest-py${{ matrix.python-version }}-${{ matrix.config.arch }}" >> $GITHUB_ENV
+            echo "WHEEL_ARTIFACT=wheels-${{ matrix.config.os }}-py${{ matrix.python-version }}-${{ matrix.config.arch }}" >> $GITHUB_ENV
           fi
 
       - name: download artifact wheels
@@ -123,7 +123,6 @@ jobs:
         with:
           name: ${{ env.WHEEL_ARTIFACT }}
           path: dist/
-          if-no-files-found: error
 
       - name: gather wheels into single directory
         shell: bash

@@ -11,7 +11,7 @@ class BootstrapSolver:
         self.net = net 
         self.network_dag = network_dag 
         self.l_eff = l_eff
-        self.full_level_dag = LevelDAG(l_eff, network_dag)
+        self.full_level_dag = LevelDAG(l_eff=l_eff, network_dag=network_dag)
 
     def extract_all_residual_subgraphs(self):
         all_residual_subgraphs = []
@@ -59,7 +59,9 @@ class BootstrapSolver:
         self.network_dag.solved_residual_level_dags = {}
         
         for (fork, _, paths) in sorted_residual_subgraphs:
-            aggregate_level_dag = LevelDAG(self.l_eff, self.network_dag, path=None)
+            aggregate_level_dag = LevelDAG(
+                l_eff=self.l_eff, network_dag=self.network_dag, path=None
+            )
             for path in paths:
                 path_dag = nx.DiGraph()
 
@@ -79,7 +81,7 @@ class BootstrapSolver:
 
                 # And create the level DAG based on the path.
                 aggregate_level_dag += LevelDAG(
-                    self.l_eff, self.network_dag, path_dag
+                    l_eff=self.l_eff, network_dag=self.network_dag, path=path_dag
                 )
 
             self.network_dag.solved_residual_level_dags[fork] = aggregate_level_dag
@@ -106,7 +108,7 @@ class BootstrapSolver:
                     node_dag = nx.DiGraph()
                     node_dag.add_nodes_from([(node, self.network_dag.nodes[node])])  
                     next_level_dag = LevelDAG(
-                        self.l_eff, self.network_dag, node_dag
+                        l_eff=self.l_eff, network_dag=self.network_dag, path=node_dag
                     )
                     visited.update(node)
    
@@ -190,7 +192,9 @@ class BootstrapSolver:
 
         # We'll use this empty level DAG to query the number of
         # bootstraps per layer of the network dag.
-        query = LevelDAG(self.l_eff, self.network_dag, path=None)  
+        query = LevelDAG(
+            l_eff=self.l_eff, network_dag=self.network_dag, path=None
+        )
         
         total_bootstraps = 0
         bootstrapper_slots = []
