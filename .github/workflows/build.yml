@@ -44,7 +44,6 @@ jobs:
       matrix:
         config:
           - {os: windows-latest, arch: "x64"}
-          - {os: macos-13, arch: "x64"}    # Intel runner for x64 wheels
           - {os: macos-latest, arch: "arm64"}
         python-version: ["3.9", "3.10", "3.11", "3.12"]
     
@@ -93,7 +92,6 @@ jobs:
         config:
           - {os: ubuntu-latest, arch: "x64"}
           - {os: windows-latest, arch: "x64"}
-          - {os: macos-13, arch: "x64"}    # Intel runner for x64 tests
           - {os: macos-latest, arch: "arm64"}
         python-version: ["3.9", "3.10", "3.11", "3.12"]
     
