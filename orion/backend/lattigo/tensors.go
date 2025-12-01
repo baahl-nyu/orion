@@ -128,3 +128,67 @@ func GetLiveCiphertexts() (*C.int, C.ulong) {
 	arrPtr, length := SliceToCArray(ids, convertIntToCInt)
 	return arrPtr, length
 }
+
+//export SerializeCiphertext
+func SerializeCiphertext(ciphertextID C.int) (*C.char, C.ulong) {
+	ciphertext := RetrieveCiphertext(int(ciphertextID))
+	data, err := ciphertext.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	arrPtr, length := SliceToCArray(data, convertByteToCChar)
+	return arrPtr, length
+}
+
+//export LoadCiphertext
+func LoadCiphertext(dataPtr *C.char, lenData C.ulong) C.int {
+	ctSerial := CCharArrayToByteSlice(dataPtr, lenData)
+
+	ct := &rlwe.Ciphertext{}
+	if err := ct.UnmarshalBinary(ctSerial); err != nil {
+		panic(err)
+	}
+
+	// Validate parameters match current scheme
+	if scheme.Params != nil {
+		if ct.LogN() != scheme.Params.LogN() || ct.Level() > scheme.Params.MaxLevel() {
+			panic("LoadCiphertext: incompatible parameters")
+		}
+	}
+
+	idx := PushCiphertext(ct)
+	return C.int(idx)
+}
+
+//export SerializePlaintext
+func SerializePlaintext(plaintextID C.int) (*C.char, C.ulong) {
+	plaintext := RetrievePlaintext(int(plaintextID))
+	data, err := plaintext.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	arrPtr, length := SliceToCArray(data, convertByteToCChar)
+	return arrPtr, length
+}
+
+//export LoadPlaintext
+func LoadPlaintext(dataPtr *C.char, lenData C.ulong) C.int {
+	ptSerial := CCharArrayToByteSlice(dataPtr, lenData)
+
+	pt := &rlwe.Plaintext{}
+	if err := pt.UnmarshalBinary(ptSerial); err != nil {
+		panic(err)
+	}
+
+	// Validate parameters match current scheme
+	if scheme.Params != nil {
+		if pt.LogN() != scheme.Params.LogN() || pt.Level() > scheme.Params.MaxLevel() {
+			panic("LoadPlaintext: incompatible parameters")
+		}
+	}
+
+	idx := PushPlaintext(pt)
+	return C.int(idx)
+}
