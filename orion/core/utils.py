@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader, random_split
 
 from tqdm import tqdm
 
+from .mlflow_logger import get_logger
+
 
 def get_mnist_datasets(data_dir, batch_size, test_samples=10000, seed=None):
     """
@@ -372,13 +374,39 @@ def train(
         optimizer, T_max=epochs)
 
     best_acc = 0.0
-    
+    logger = get_logger()
+
+    # Log training hyperparameters
+    logger.log_params({
+        "train.learning_rate": lr,
+        "train.momentum": momentum,
+        "train.weight_decay": weight_decay,
+        "train.epochs": epochs,
+        "train.batch_size": train_loader.batch_size,
+        "train.optimizer": "SGD",
+        "train.scheduler": "CosineAnnealingLR",
+    })
+
     for epoch in range(epochs):
-        train_epoch(epoch, model, train_loader, criterion, optimizer, device)
-        test_acc = test_epoch(model, test_loader, criterion, device)
+        train_loss, train_acc = train_epoch(epoch, model, train_loader, criterion, optimizer, device)
+        test_loss, test_acc = test_epoch(model, test_loader, criterion, device)
+
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Log metrics to MLflow
+        logger.log_metrics({
+            "01_metrics/train/loss": train_loss,
+            "01_metrics/train/accuracy": train_acc,
+            "01_metrics/test/loss": test_loss,
+            "01_metrics/test/accuracy": test_acc,
+            "01_metrics/train/learning_rate": current_lr,
+        }, step=epoch)
 
         # Save the model if the test accuracy improves
         if save_path and test_acc > best_acc:
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
             print(f"Saving model with accuracy: {test_acc:.3f}")
             best_acc = test_acc
             state = {
@@ -387,6 +415,8 @@ def train(
                 "epoch": epoch,
             }
             torch.save(state, save_path)
+            logger.log_metric("01_metrics/train/best_accuracy", best_acc)
+            logger.log_artifact(save_path, artifact_path="models")
 
         scheduler.step()
 
@@ -427,6 +457,10 @@ def train_epoch(epoch, model, train_loader, criterion, optimizer, device):
             "Acc": f"{100. * correct / total:.3f}% ({correct}/{total})"
         })
 
+    avg_loss = train_loss / len(train_loader)
+    accuracy = 100. * correct / total
+    return avg_loss, accuracy
+
 
 def test_epoch(model, test_loader, criterion, device):
     """
@@ -458,7 +492,9 @@ def test_epoch(model, test_loader, criterion, device):
                 "Acc": f"{100. * correct / total:.3f}% ({correct}/{total})"
             })
 
-    return 100. * correct / total
+    avg_loss = test_loss / len(test_loader)
+    accuracy = 100. * correct / total
+    return avg_loss, accuracy
 
 def mae(tensor1, tensor2):
     if tensor1.shape != tensor2.shape:
