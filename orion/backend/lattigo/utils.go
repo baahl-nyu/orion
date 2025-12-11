@@ -21,6 +21,10 @@ func CArrayToByteSlice(dataPtr unsafe.Pointer, length uint64) []byte {
 	return unsafe.Slice((*byte)(dataPtr), length)
 }
 
+func CCharArrayToByteSlice(dataPtr *C.char, length C.ulong) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(dataPtr)), int(length))
+}
+
 func convertFloatToCFloat(v float64) C.float {
 	return C.float(v)
 }
