@@ -32,6 +32,6 @@ pip install -e .
 ### Run the examples!
 
 ```
-cd examples/
-python3 run_lola.py
+uv sync
+uv run examples/run_lola.py
 ```

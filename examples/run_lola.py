@@ -3,18 +3,14 @@ import math
 import torch
 import orion
 import orion.models as models
-from orion.core.utils import (
-    get_mnist_datasets,
-    mae, 
-    train_on_mnist
-)
+from orion.core.utils import get_mnist_datasets, mae, train_on_mnist
 
 # Set seed for reproducibility
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
-scheme = orion.init_scheme("../configs/lola.yml")
-trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
+scheme = orion.init_scheme("./configs/lola.yml")
+trainloader, testloader = get_mnist_datasets(data_dir="./data", batch_size=1)
 net = models.LoLA()
 
 # Train model (optional)
@@ -28,14 +24,14 @@ inp, _ = next(iter(testloader))
 net.eval()
 out_clear = net(inp)
 
-# Prepare for FHE inference. 
+# Prepare for FHE inference.
 # Certain polynomial activation functions require us to know the precise range
 # of possible input values. We'll determine these ranges by aggregating
 # statistics from the training set and applying a tolerance factor = margin.
 orion.fit(net, trainloader)
 input_level = orion.compile(net)
 
-# Encode and encrypt the input vector 
+# Encode and encrypt the input vector
 vec_ptxt = orion.encode(inp, input_level)
 vec_ctxt = orion.encrypt(vec_ptxt)
 net.he()  # Switch to FHE mode
@@ -58,4 +54,4 @@ print(out_fhe)
 dist = mae(out_clear, out_fhe)
 print(f"\nMAE: {dist:.4f}")
 print(f"Precision: {-math.log2(dist):.4f}")
-print(f"Runtime: {end-start:.4f} secs.\n")
+print(f"Runtime: {end - start:.4f} secs.\n")
