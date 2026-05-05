@@ -20,7 +20,7 @@ class NewEncryptor:
             ciphertext_ids.append(ciphertext_id)
 
         return CipherTensor(
-            self.scheme, ciphertext_ids, plaintensor.shape, plaintensor.on_shape)
+            self.scheme, ciphertext_ids, plaintensor.shape, plaintensor.on_shape, plaintensor.start, plaintensor.stride, plaintensor.stop)
     
     def decrypt(self, ciphertensor):
         plaintext_ids = []
@@ -29,5 +29,5 @@ class NewEncryptor:
             plaintext_ids.append(plaintext_id)
 
         return PlainTensor(
-           self.scheme,  plaintext_ids, ciphertensor.shape, ciphertensor.on_shape
+           self.scheme,  plaintext_ids, ciphertensor.shape, ciphertensor.on_shape, ciphertensor.start, ciphertensor.stride, ciphertensor.stop
         )

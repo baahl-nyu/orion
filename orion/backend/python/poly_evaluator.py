@@ -31,7 +31,7 @@ class NewEvaluator:
             cts_out.append(ct_out)
 
         return CipherTensor(
-            self.scheme, cts_out, ciphertensor.shape, ciphertensor.on_shape)
+            self.scheme, cts_out, ciphertensor.shape, ciphertensor.on_shape, ciphertensor.start, ciphertensor.stride, ciphertensor.stop)
     
     def generate_minimax_sign_coeffs(self, degrees, prec=128, logalpha=12, 
                                      logerr=12, debug=False):

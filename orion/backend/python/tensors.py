@@ -2,7 +2,7 @@ import sys
 import math
 
 class PlainTensor:
-    def __init__(self, scheme, ptxt_ids, shape, on_shape=None):
+    def __init__(self, scheme, ptxt_ids, shape, on_shape=None, start=None, stride=None, stop=None):
         self.scheme = scheme
         self.backend = scheme.backend
         self.encoder = scheme.encoder
@@ -10,14 +10,17 @@ class PlainTensor:
         self.ids = [ptxt_ids] if isinstance(ptxt_ids, int) else ptxt_ids
         self.shape = shape 
         self.on_shape = on_shape or shape
+        self.start = start
+        self.stride = stride
+        self.stop = stop
 
-    def __del__(self):
-        if 'sys' in globals() and sys.modules and self.scheme:
-            try:
-                for idx in self.ids:
-                    self.backend.DeletePlaintext(idx)
-            except Exception: 
-                pass # avoids errors for GC at program termination
+    #def __del__(self):
+    #    if 'sys' in globals() and sys.modules and self.scheme:
+    #        try:
+    #            for idx in self.ids:
+    #                self.backend.DeletePlaintext(idx)
+    #        except Exception: 
+    #            pass # avoids errors for GC at program termination
 
     def __len__(self):
         return len(self.ids)
@@ -38,7 +41,7 @@ class PlainTensor:
 
         if in_place:
             return other
-        return CipherTensor(self.scheme, mul_ids, self.shape, self.on_shape) 
+        return CipherTensor(self.scheme, mul_ids, self.shape, self.on_shape, self.start, self.stride, self.stop) 
 
     def __mul__(self, other):
         return self.mul(other, in_place=False)     
@@ -79,7 +82,7 @@ class PlainTensor:
     
 
 class CipherTensor:
-    def __init__(self, scheme, ctxt_ids, shape, on_shape=None):
+    def __init__(self, scheme, ctxt_ids, shape, on_shape=None, start=None, stride=None, stop=None):
         self.scheme = scheme
         self.backend = scheme.backend 
         self.encryptor = scheme.encryptor
@@ -89,14 +92,17 @@ class CipherTensor:
         self.ids = [ctxt_ids] if isinstance(ctxt_ids, int) else ctxt_ids 
         self.shape = shape 
         self.on_shape = on_shape or shape
+        self.start = start
+        self.stride = stride
+        self.stop = stop
 
-    def __del__(self):
-        if 'sys' in globals() and sys.modules and self.scheme:
-            try:
-                for idx in self.ids:
-                    self.backend.DeleteCiphertext(idx)
-            except Exception: 
-                pass # avoids errors for GC at program termination
+    #def __del__(self):
+    #    if 'sys' in globals() and sys.modules and self.scheme:
+    #        try:
+    #            for idx in self.ids:
+    #                self.backend.DeleteCiphertext(idx)
+    #        except Exception: 
+    #            pass # avoids errors for GC at program termination
 
     def __len__(self):
         return len(self.ids)
@@ -115,7 +121,7 @@ class CipherTensor:
             neg_id = self.evaluator.negate(ctxt)
             neg_ids.append(neg_id)
 
-        return CipherTensor(self.scheme, neg_ids, self.shape, self.on_shape)
+        return CipherTensor(self.scheme, neg_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
     
     def add(self, other, in_place=False):
         self._check_valid(other)
@@ -139,7 +145,7 @@ class CipherTensor:
 
         if in_place:
             return self
-        return CipherTensor(self.scheme, add_ids, self.shape, self.on_shape)
+        return CipherTensor(self.scheme, add_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
     
     def __add__(self, other):
         return self.add(other, in_place=False)
@@ -169,7 +175,7 @@ class CipherTensor:
 
         if in_place:
             return self
-        return CipherTensor(self.scheme, sub_ids, self.shape, self.on_shape)
+        return CipherTensor(self.scheme, sub_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
     
     def __sub__(self, other):
         return self.sub(other, in_place=False)
@@ -199,7 +205,7 @@ class CipherTensor:
 
         if in_place:
             return self
-        return CipherTensor(self.scheme, mul_ids, self.shape, self.on_shape) 
+        return CipherTensor(self.scheme, mul_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
     
     def __mul__(self, other):
         return self.mul(other, in_place=False)     
@@ -213,7 +219,7 @@ class CipherTensor:
             rot_id = self.evaluator.rotate(ctxt, amount, in_place)
             rot_ids.append(rot_id)
 
-        return CipherTensor(self.scheme, rot_ids, self.shape, self.on_shape)
+        return CipherTensor(self.scheme, rot_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
     
     def _check_valid(self, other):
         return
@@ -257,7 +263,7 @@ class CipherTensor:
             btp_id = self.bootstrapper.bootstrap(ctxt, slots)
             btp_ids.append(btp_id)
 
-        return CipherTensor(self.scheme, btp_ids, self.shape, self.on_shape)
+        return CipherTensor(self.scheme, btp_ids, self.shape, self.on_shape, self.start, self.stride, self.stop)
         
     def decrypt(self):
         return self.encryptor.decrypt(self)

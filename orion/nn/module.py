@@ -77,8 +77,8 @@ def timer(func):
             print(f"\n{layer_name}:")
             
             # Print input statistics
-            print(f"Clear input min/max: {self.input_min:.3f} / {self.input_max:.3f}")
-            print(f"FHE input min/max: {args[0].min():.3f} / {args[0].max():.3f}")
+            # print(f"Clear input min/max: {self.input_min:.3f} / {self.input_max:.3f}")
+            # print(f"FHE input min/max: {args[0].min():.3f} / {args[0].max():.3f}")
             
             start = time.time() # start timer that ends after module finishes
         
@@ -86,17 +86,17 @@ def timer(func):
                 
         # Finish timing and print output stats if in debug mode
         if debug_enabled:
-            if hasattr(self, "output_min"):
-                output_min = self.output_min
-                output_max = self.output_max
-            else: # for bootstrap
-                output_min = self.input_min
-                output_max = self.input_max
+            # if hasattr(self, "output_min"):
+            #     output_min = self.output_min
+            #     output_max = self.output_max
+            # else: # for bootstrap
+            #     output_min = self.input_min
+            #     output_max = self.input_max
 
             elapsed = time.time() - start
                 
-            print(f"Clear output min/max: {output_min:.3f} / {output_max:.3f}")
-            print(f"FHE output min/max: {result.min():.3f} / {result.max():.3f}")            
+            # print(f"Clear output min/max: {output_min:.3f} / {output_max:.3f}")
+            # print(f"FHE output min/max: {result.min():.3f} / {result.max():.3f}")            
             print(f"done! [{elapsed:.3f} secs.]")
         
         return result

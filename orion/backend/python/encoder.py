@@ -5,7 +5,7 @@ class NewEncoder:
     def __init__(self, scheme):
         self.scheme = scheme
         self.params = scheme.params
-        self.backend = scheme.backend
+        self.backend = scheme.backend 
         self.setup_encoder()
 
     def setup_encoder(self):
@@ -42,15 +42,17 @@ class NewEncoder:
         return PlainTensor(self.scheme, plaintext_ids, values.shape)
 
     def decode(self, plaintensor: PlainTensor):
-        values = []
+        values = [] 
         for plaintext_id in plaintensor.ids:
             values.extend(self.backend.Decode(plaintext_id))
 
-        values = torch.tensor(values)[:plaintensor.on_shape.numel()]
-        return values.reshape(plaintensor.on_shape)
+        values = torch.tensor(values)
+        if plaintensor.start is not None:
+            values = values[plaintensor.start:plaintensor.stop:plaintensor.stride]
+            return values
+        else:
+            values = values[:plaintensor.on_shape.numel()]
+            return values.reshape(plaintensor.on_shape)
 
     def get_moduli_chain(self):
         return self.backend.GetModuliChain()
-
-    def get_aux_moduli_chain(self):
-        return self.backend.GetAuxModuliChain()
