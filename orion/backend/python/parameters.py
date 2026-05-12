@@ -74,6 +74,7 @@ class OrionParameters:
     debug: bool = True
     embedding_method: Literal["hybrid", "square"] = "hybrid"
     backend: Literal["lattigo", "openfhe", "heaan"] = "lattigo"
+    device: Literal["cpu", "gpu"] = "cpu"
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""
@@ -85,7 +86,8 @@ class OrionParameters:
             f"  Margin: {self.margin}",
             f"  Embedding Method: {self.embedding_method}",
             f"  Fuse Modules: {self.fuse_modules}",
-            f"  Debug Mode: {self.debug}"
+            f"  Debug Mode: {self.debug}",
+            f"  Device: {self.device}"
         ]
         
         output.append(f"  I/O Mode: {self.io_mode}")
@@ -141,6 +143,9 @@ class NewParameters:
 
     def get_backend(self):
         return self.orion_params.backend.lower()
+
+    def get_device(self):
+        return self.orion_params.device.lower()
     
     def get_logq(self):
         return self.ckks_params.logq

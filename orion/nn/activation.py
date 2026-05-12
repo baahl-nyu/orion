@@ -26,6 +26,7 @@ class Activation(Module):
         self.output_scale = output_scale
 
     def compile(self):
+        self.set_depth()  # recompute now that backend info is available
         self.poly = self.scheme.poly_evaluator.generate_monomial(self.coeffs)
 
     @timer

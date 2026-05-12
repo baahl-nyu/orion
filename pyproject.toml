@@ -23,6 +23,10 @@ dependencies = [
     "certifi>=2024.2.2",
 ]
 
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (bootstrap, large params)"]
+addopts = "-m 'not slow'"
+
 [tool.poetry]
 packages = [{include = "orion"}]
 

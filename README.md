@@ -34,4 +34,17 @@ pip install -e .
 ```
 uv sync
 uv run examples/run_lola.py
+uv run examples/run_mlp.py
+uv run examples/run_resnet.py
+```
+
+#### Running oracle tests
+
+```
+uv run pytest tests/oracle/ -v -s
+```
+
+Bootstrap tests are skipped by default. To include them:
+```
+uv run pytest tests/oracle/ -v -s -m ""
 ```
