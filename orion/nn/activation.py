@@ -21,11 +21,17 @@ class Activation(Module):
     
     def set_depth(self):
         self.depth = int(math.ceil(math.log2(len(self.coeffs))))
+        # DeSiLo poly evaluation consumes 1 extra level for degree > 2
+        if (self.scheme is not None
+                and self.scheme.params.get_backend() == "desilo"
+                and len(self.coeffs) > 3):
+            self.depth += 1
 
     def set_output_scale(self, output_scale):
         self.output_scale = output_scale
 
     def compile(self):
+        self.set_depth()  # recompute now that backend info is available
         self.poly = self.scheme.poly_evaluator.generate_monomial(self.coeffs)
 
     @timer
@@ -95,6 +101,11 @@ class Chebyshev(Module):
     def set_depth(self):
         self.depth = int(math.ceil(math.log2(self.degree+1)))
         if self.prescale != 1: # additional level needed
+            self.depth += 1
+        # DeSiLo poly evaluation consumes 1 extra level for degree > 2
+        if (self.scheme is not None
+                and self.scheme.params.get_backend() == "desilo"
+                and self.degree > 2):
             self.depth += 1
 
     def set_output_scale(self, output_scale):
