@@ -3,6 +3,7 @@ package main
 import (
 	"C"
 	"math"
+	"runtime"
 	"unsafe"
 
 	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/lintrans"
@@ -198,6 +199,8 @@ func RemovePlaintextDiagonals(transformID C.int) {
 	for diag := range linTransf.Vec {
 		linTransf.Vec[diag] = ringqp.Poly{}
 	}
+	// This is a good time to let Go GC know to reduce memory
+	runtime.GC()
 }
 
 //export RemoveRotationKeys

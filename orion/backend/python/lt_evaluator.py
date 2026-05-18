@@ -49,6 +49,7 @@ class NewEvaluator:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
+                self.remove_plaintext_diagonals(lintransf_id)
 
         return lintransf_ids
     
