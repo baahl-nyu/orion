@@ -70,6 +70,8 @@ fhe/result.json
 
 ## Example Result
 
+One end-to-end run on a trained Criteo sample produced:
+
 | Clear | FHE | Precision | Runtime |
 | ---: | ---: | ---: | ---: |
 | -1.0446 | -1.0448 | 12.49 bits | 204.50 s |
