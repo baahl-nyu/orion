@@ -67,3 +67,9 @@ fhe/result.json
 
 `fhe/result.json` contains `clear`, `fhe`, `mae`, `precision`, and
 `runtime_seconds`.
+
+## Example Result
+
+| Clear | FHE | Precision | Runtime |
+| ---: | ---: | ---: | ---: |
+| -1.0446 | -1.0448 | 12.49 bits | 204.50 s |
