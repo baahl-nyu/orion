@@ -206,3 +206,8 @@ go.work.sum
 
 # env file
 .env
+
+examples/criteo/processed/
+examples/criteo/raw/
+examples/criteo/model/
+examples/criteo/fhe/

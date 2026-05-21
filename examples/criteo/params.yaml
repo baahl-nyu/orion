@@ -1,0 +1,24 @@
+comment: "DLRM Parameter Set"
+
+ckks_params:
+  LogN: 16
+  LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+  LogP: [61, 61, 61]
+  LogScale: 40
+  H: 192
+  RingType: standard
+
+boot_params:
+  LogP: [61, 61, 61, 61, 61, 61, 61, 61]
+
+orion:
+  margin: 2 # >= 1
+  embedding_method: hybrid # [hybrid, square]
+  backend: lattigo # [lattigo]
+
+  fuse_modules: true
+  debug: true
+
+  diags_path: ""
+  keys_path: ""
+  io_mode: none # "load" | "save" | "none"
