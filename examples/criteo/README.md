@@ -1,7 +1,7 @@
-# Criteo HELRM
+# Criteo HE-LRM
 
 This example trains the Criteo DLRM, exports the trained weights into the
-example-local HELRM model, and runs one Lattigo FHE inference. `run_orion.py`
+example-local HE-LRM model, and runs one Lattigo FHE inference. `run_orion.py`
 compares the cleartext HELRM logit with the decrypted FHE logit.
 
 ## Data
