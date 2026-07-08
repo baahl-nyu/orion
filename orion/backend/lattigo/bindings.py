@@ -348,6 +348,21 @@ class LattigoLibrary:
             restype=ArrayResultFloat,
         )
 
+        self.EncodeComplex = LattigoFunction(
+            self.lib.EncodeComplex,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_ulong,
+            ],
+            restype=ctypes.c_int
+        )
+        self.DecodeComplex = LattigoFunction(
+            self.lib.DecodeComplex,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultFloat,
+        )
+
     def setup_encryptor(self):
         self.NewEncryptor = LattigoFunction(
             self.lib.NewEncryptor,
