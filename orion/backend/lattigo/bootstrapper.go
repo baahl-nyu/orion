@@ -14,6 +14,7 @@ import (
 // Map to store bootstrapping.Evaluators by their slot count
 // Initialize the map at package level
 var bootstrapperMap = make(map[int]*bootstrapping.Evaluator)
+var pendingParamsMap = make(map[int]bootstrapping.Parameters)
 
 //export NewBootstrapper
 func NewBootstrapper(
@@ -24,6 +25,9 @@ func NewBootstrapper(
 	slots := int(numSlots)
 
 	if _, exists := bootstrapperMap[slots]; exists {
+		return
+	}
+	if _, exists := pendingParamsMap[slots]; exists {
 		return
 	}
 
@@ -43,18 +47,8 @@ func NewBootstrapper(
 		panic(err)
 	}
 
-	btpKeys, _, err := btpParams.GenEvaluationKeys(scheme.SecretKey)
-	if err != nil {
-		panic(err)
-	}
-
-	var btpEval *bootstrapping.Evaluator
-	if btpEval, err = bootstrapping.NewEvaluator(btpParams, btpKeys); err != nil {
-		panic(err)
-	}
-
-	// Store the new evaluator in the map
-	bootstrapperMap[slots] = btpEval
+	// Store the parameters for lazy bootstrap
+	pendingParamsMap[slots] = btpParams
 }
 
 //export Bootstrap
@@ -80,14 +74,32 @@ func Bootstrap(ciphertextID, numSlots C.int) C.int {
 }
 
 func GetBootstrapper(numSlots int) *bootstrapping.Evaluator {
-	bootstrapper, exists := bootstrapperMap[numSlots]
+	if bootstrapper, exists := bootstrapperMap[numSlots]; exists {
+		return bootstrapper
+	}
+
+	btpParams, exists := pendingParamsMap[numSlots]
 	if !exists {
 		panic(fmt.Errorf("no bootstrapper found for slot count: %d", numSlots))
 	}
-	return bootstrapper
+
+	btpKeys, _, err := btpParams.GenEvaluationKeys(scheme.SecretKey)
+	if err != nil {
+		panic(err)
+	}
+
+	btpEval, err := bootstrapping.NewEvaluator(btpParams, btpKeys)
+	if err != nil {
+		panic(err)
+	}
+
+	bootstrapperMap[numSlots] = btpEval
+	delete(pendingParamsMap, numSlots)
+	return btpEval
 }
 
 //export DeleteBootstrappers
 func DeleteBootstrappers() {
 	bootstrapperMap = make(map[int]*bootstrapping.Evaluator)
+	pendingParamsMap = make(map[int]bootstrapping.Parameters)
 }
