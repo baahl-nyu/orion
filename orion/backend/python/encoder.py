@@ -19,6 +19,8 @@ class NewEncoder:
                 f"Expected 'values' passed to encode() to be a either a list "
                 f"or a torch.Tensor, but got {type(values)}.")
 
+        is_complex = torch.is_complex(values)
+
         if not level:
             level = self.params.get_max_level()
         if not scale:
@@ -29,24 +31,37 @@ class NewEncoder:
 
         values = values.cpu()
         pad_length = (-num_elements) % num_slots
-        vector = torch.zeros(num_elements + pad_length)
+        dtype = torch.complex128 if is_complex else torch.float64
+        vector = torch.zeros(num_elements + pad_length, dtype=dtype)
         vector[:num_elements] = values.flatten()
         num_plaintexts = len(vector) // num_slots
 
         plaintext_ids = []
         for i in range(num_plaintexts):
-            to_encode = vector[i*num_slots:(i+1)*num_slots].tolist()
-            plaintext_id = self.backend.Encode(to_encode, level, scale)
+            chunk = vector[i*num_slots:(i+1)*num_slots]
+            if is_complex:
+                # Interleave as [re0, im0, re1, im1, ...] to fill both lanes.
+                interleaved = torch.view_as_real(chunk).flatten().tolist()
+                plaintext_id = self.backend.EncodeComplex(interleaved, level, scale)
+            else:
+                plaintext_id = self.backend.Encode(chunk.tolist(), level, scale)
             plaintext_ids.append(plaintext_id)
 
-        return PlainTensor(self.scheme, plaintext_ids, values.shape)
+        return PlainTensor(
+            self.scheme, plaintext_ids, values.shape, is_complex=is_complex)
 
     def decode(self, plaintensor: PlainTensor):
-        values = [] 
+        is_complex = getattr(plaintensor, "is_complex", False)
+        values = []
         for plaintext_id in plaintensor.ids:
-            values.extend(self.backend.Decode(plaintext_id))
+            if is_complex:
+                interleaved = torch.tensor(self.backend.DecodeComplex(plaintext_id))
+                values.extend(torch.view_as_complex(
+                    interleaved.view(-1, 2).contiguous()).tolist())
+            else:
+                values.extend(self.backend.Decode(plaintext_id))
 
-        values = torch.tensor(values)
+        values = torch.tensor(values, dtype=torch.complex128 if is_complex else torch.float64)
         if plaintensor.start is not None:
             values = values[plaintensor.start:plaintensor.stop:plaintensor.stride]
             return values
