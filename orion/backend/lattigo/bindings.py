@@ -199,6 +199,30 @@ class LattigoLibrary:
             restype=None
         )
 
+        self.SerializeCiphertext = LattigoFunction(
+            self.lib.SerializeCiphertext,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultByte
+        )
+
+        self.LoadCiphertext = LattigoFunction(
+            self.lib.LoadCiphertext,
+            argtypes=[ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong],
+            restype=ctypes.c_int
+        )
+
+        self.SerializePlaintext = LattigoFunction(
+            self.lib.SerializePlaintext,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultByte
+        )
+
+        self.LoadPlaintext = LattigoFunction(
+            self.lib.LoadPlaintext,
+            argtypes=[ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong],
+            restype=ctypes.c_int
+        )
+
         self.GetPlaintextScale = LattigoFunction(
             self.lib.GetPlaintextScale,
             argtypes=[ctypes.c_int],
