@@ -487,6 +487,81 @@ int SubPlaintext(int ct_id, int pt_id) {
 }
 
 // ---------------------------------------------------------------------------
+// ct - scalar arithmetic
+// ---------------------------------------------------------------------------
+// Add/Sub encode the constant at the ciphertext's own scale (Mult's result
+// scale is ct.scale * const.scale, so this keeps Add/Sub scale-neutral, no
+// rescale needed -- matching evaluator.py, which never rescales after
+// add_scalar/sub_scalar). MulScalarFloat encodes at the ciphertext's scale
+// too, so the product's scale is squared and needs one Rescale (evaluator.py
+// always rescales after the float path). MulScalarInt encodes the constant
+// at scale=1.0 instead, so the product keeps the ciphertext's original
+// scale unchanged -- matching evaluator.py, which does NOT rescale after
+// the int path.
+
+cheddar::Constant<word> encode_const(double number, int level, double scale) {
+    cheddar::Constant<word> c;
+    g_state.context->encoder_.EncodeConstant(c, level, scale, number);
+    return c;
+}
+
+int AddScalarNew(int ct_id, double scalar) {
+    ensure_setup();
+    const Ct& c = g_state.ct(ct_id);
+    auto k = encode_const(scalar, level_of(c), c.GetScale());
+    auto out = std::make_unique<Ct>();
+    g_state.context->Add(*out, c, k);
+    return g_state.put_ct(std::move(out));
+}
+
+int AddScalar(int ct_id, double scalar) {
+    replace_ct(ct_id, AddScalarNew(ct_id, scalar));
+    return ct_id;
+}
+
+int SubScalarNew(int ct_id, double scalar) {
+    ensure_setup();
+    const Ct& c = g_state.ct(ct_id);
+    auto k = encode_const(scalar, level_of(c), c.GetScale());
+    auto out = std::make_unique<Ct>();
+    g_state.context->Sub(*out, c, k);
+    return g_state.put_ct(std::move(out));
+}
+
+int SubScalar(int ct_id, double scalar) {
+    replace_ct(ct_id, SubScalarNew(ct_id, scalar));
+    return ct_id;
+}
+
+int MulScalarFloatNew(int ct_id, double scalar) {
+    ensure_setup();
+    const Ct& c = g_state.ct(ct_id);
+    auto k = encode_const(scalar, level_of(c), c.GetScale());
+    auto out = std::make_unique<Ct>();
+    g_state.context->Mult(*out, c, k);
+    return g_state.put_ct(std::move(out));
+}
+
+int MulScalarFloat(int ct_id, double scalar) {
+    replace_ct(ct_id, MulScalarFloatNew(ct_id, scalar));
+    return ct_id;
+}
+
+int MulScalarIntNew(int ct_id, int scalar) {
+    ensure_setup();
+    const Ct& c = g_state.ct(ct_id);
+    auto k = encode_const(static_cast<double>(scalar), level_of(c), 1.0);
+    auto out = std::make_unique<Ct>();
+    g_state.context->Mult(*out, c, k);
+    return g_state.put_ct(std::move(out));
+}
+
+int MulScalarInt(int ct_id, int scalar) {
+    replace_ct(ct_id, MulScalarIntNew(ct_id, scalar));
+    return ct_id;
+}
+
+// ---------------------------------------------------------------------------
 // Negate
 // ---------------------------------------------------------------------------
 
@@ -782,6 +857,19 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("AddPlaintext", &AddPlaintext);
     m.def("SubPlaintextNew", &SubPlaintextNew);
     m.def("SubPlaintext", &SubPlaintext);
+
+    // ct - scalar
+    m.def("AddScalarNew", &AddScalarNew, py::arg("ct_id"), py::arg("scalar"));
+    m.def("AddScalar", &AddScalar, py::arg("ct_id"), py::arg("scalar"));
+    m.def("SubScalarNew", &SubScalarNew, py::arg("ct_id"), py::arg("scalar"));
+    m.def("SubScalar", &SubScalar, py::arg("ct_id"), py::arg("scalar"));
+    m.def("MulScalarFloatNew", &MulScalarFloatNew, py::arg("ct_id"),
+          py::arg("scalar"));
+    m.def("MulScalarFloat", &MulScalarFloat, py::arg("ct_id"),
+          py::arg("scalar"));
+    m.def("MulScalarIntNew", &MulScalarIntNew, py::arg("ct_id"),
+          py::arg("scalar"));
+    m.def("MulScalarInt", &MulScalarInt, py::arg("ct_id"), py::arg("scalar"));
 
     // Negate
     m.def("Negate", &Negate, py::arg("ct_id"));
