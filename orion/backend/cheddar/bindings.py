@@ -350,6 +350,34 @@ class CheddarLibrary:
         return _native.SubPlaintext(int(ct_id), int(pt_id))
 
     # ------------------------------------------------------------------
+    # ct - scalar arithmetic
+    # ------------------------------------------------------------------
+
+    def AddScalarNew(self, ct_id: int, scalar) -> int:
+        return _native.AddScalarNew(int(ct_id), float(scalar))
+
+    def AddScalar(self, ct_id: int, scalar) -> int:
+        return _native.AddScalar(int(ct_id), float(scalar))
+
+    def SubScalarNew(self, ct_id: int, scalar) -> int:
+        return _native.SubScalarNew(int(ct_id), float(scalar))
+
+    def SubScalar(self, ct_id: int, scalar) -> int:
+        return _native.SubScalar(int(ct_id), float(scalar))
+
+    def MulScalarFloatNew(self, ct_id: int, scalar) -> int:
+        return _native.MulScalarFloatNew(int(ct_id), float(scalar))
+
+    def MulScalarFloat(self, ct_id: int, scalar) -> int:
+        return _native.MulScalarFloat(int(ct_id), float(scalar))
+
+    def MulScalarIntNew(self, ct_id: int, scalar) -> int:
+        return _native.MulScalarIntNew(int(ct_id), int(scalar))
+
+    def MulScalarInt(self, ct_id: int, scalar) -> int:
+        return _native.MulScalarInt(int(ct_id), int(scalar))
+
+    # ------------------------------------------------------------------
     # Rescale
     # ------------------------------------------------------------------
 
