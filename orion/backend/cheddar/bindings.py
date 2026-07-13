@@ -5,12 +5,13 @@ that orion/backend/python/ keeps working unchanged. All actual FHE work
 goes through the native ``_cheddar_native`` pybind11 module built from
 ``orion/backend/cheddar/ext/``.
 
-Not yet implemented: polynomial evaluator and bootstrap -- attempting to
-use them raises NotImplementedError. Extending these is the path to
-running this backend against the full test suite and the run_lola/
-run_mlp/run_resnet examples. Linear transform is implemented entirely
-at this layer (rotate + ct-pt multiply + add, optionally BSGS-batched)
-rather than via a native LT object -- see GenerateLinearTransform.
+Not yet implemented: bootstrap -- attempting to use it raises
+NotImplementedError. Extending it is the path to running run_resnet on
+this backend (run_lola/run_mlp are bootstrap-free). Linear transform and
+polynomial evaluation are implemented entirely at this layer (rotate +
+ct-pt multiply + add for LT; Horner's method over ct-ct multiply for
+polynomials) rather than via native evaluator objects -- see
+GenerateLinearTransform and EvaluatePolynomial.
 
 Word size: uint64. Cheddar's Parameter takes explicit prime lists rather
 than bit sizes, so this module converts Orion's LogQ/LogP into
@@ -158,6 +159,12 @@ class CheddarLibrary:
         self._transforms: dict[int, dict] = {}
         self._next_lt_id = 1
 
+        # Polynomial state. No native evaluator -- coefficients are stored
+        # here and evaluated via Horner's method over ct-ct/ct-scalar ops
+        # (see EvaluatePolynomial).
+        self._polynomials: dict[int, tuple[list[float], str]] = {}
+        self._next_poly_id = 1
+
         _register_atexit_cleanup()
 
     # ------------------------------------------------------------------
@@ -236,9 +243,8 @@ class CheddarLibrary:
     def setup_evaluator(self) -> None:
         """No-op. Ops are free functions on the native Context."""
 
-    def setup_poly_evaluator(self) -> None:
-        """No-op. Polynomial eval not yet implemented."""
-
+    # setup_poly_evaluator: defined in the Polynomial evaluation section
+    # below.
     # setup_lt_evaluator: defined in the Linear transform section below.
 
     def setup_bootstrapper(self) -> None:
@@ -281,8 +287,8 @@ class CheddarLibrary:
     def NewEvaluator(self) -> None:
         """No-op."""
 
-    def NewPolynomialEvaluator(self) -> None:
-        """No-op. Polynomial eval not yet implemented."""
+    # NewPolynomialEvaluator: defined in the Polynomial evaluation section
+    # below.
 
     # NewLinearTransformEvaluator: defined in the Linear transform section
     # below.
@@ -577,6 +583,135 @@ class CheddarLibrary:
 
     def LoadPlaintextDiagonal(self, byte_data, lt_id, diag_idx):
         self._not_implemented("LoadPlaintextDiagonal")
+
+    # ------------------------------------------------------------------
+    # Polynomial evaluation
+    #
+    # No native evaluator -- GenerateMonomial/GenerateChebyshev just store
+    # coefficients; EvaluatePolynomial runs Horner's method over ct-ct
+    # multiply (MulRelinCiphertext + Rescale) and ct-scalar ops. Chebyshev
+    # coefficients are converted to monomial basis via numpy's cheb2poly
+    # before evaluation (same fallback DeSiLoLibrary uses) rather than a
+    # ciphertext-level Clenshaw recurrence -- fine at the low degrees this
+    # is tested at; a dedicated Chebyshev evaluator would be needed for
+    # high-degree/high-precision approximations (e.g. sign/ReLU).
+    # ------------------------------------------------------------------
+
+    def setup_poly_evaluator(self) -> None:
+        """No-op. Polynomial state (self._polynomials) is set up in __init__."""
+
+    def NewPolynomialEvaluator(self) -> None:
+        """No-op."""
+
+    def GenerateMonomial(self, coeffs) -> int:
+        """coeffs: ascending [a0, a1, ..., an] (evaluator.py already
+        reversed the caller's descending order before calling this)."""
+        poly_id = self._next_poly_id
+        self._next_poly_id += 1
+        self._polynomials[poly_id] = (list(coeffs), "monomial")
+        return poly_id
+
+    def GenerateChebyshev(self, coeffs) -> int:
+        """coeffs: [c0, c1, ..., cn] for f(x) = sum_j c_j * T_j(x)."""
+        poly_id = self._next_poly_id
+        self._next_poly_id += 1
+        self._polynomials[poly_id] = (list(coeffs), "chebyshev")
+        return poly_id
+
+    def EvaluatePolynomial(self, ct_id: int, poly_id: int, scale) -> int:
+        coeffs, kind = self._polynomials[poly_id]
+        if kind == "chebyshev":
+            coeffs = np.polynomial.chebyshev.cheb2poly(coeffs).tolist()
+        return self._eval_monomial(ct_id, coeffs)
+
+    def _eval_monomial(self, ct_id: int, coeffs: list[float]) -> int:
+        """Horner's method: f(x) = a0 + x*(a1 + x*(... + x*an)).
+        coeffs ascending [a0, ..., an]."""
+        n = len(coeffs) - 1
+        if n < 0:
+            raise ValueError("EvaluatePolynomial: empty coefficient list.")
+        if n == 0:
+            acc = self.Rescale(self.MulScalarFloatNew(ct_id, 0.0))
+            return self.AddScalar(acc, coeffs[0])
+
+        acc = self.Rescale(self.MulScalarFloatNew(ct_id, coeffs[n]))
+        acc = self.AddScalar(acc, coeffs[n - 1])
+        for i in range(n - 2, -1, -1):
+            prod = self.MulRelinCiphertextNew(acc, ct_id)
+            self.DeleteCiphertext(acc)
+            acc = self.Rescale(prod)
+            acc = self.AddScalar(acc, coeffs[i])
+        return acc
+
+    @staticmethod
+    def _fit_chebyshev_standard_basis(x, y, degree):
+        """Least-squares fit in the standard Chebyshev basis T_n(x). No
+        domain mapping (unlike numpy's Chebyshev.fit): the returned
+        coefficients c satisfy sum_j c[j] * T_j(x) ~= y for the actual x
+        values given."""
+        n = degree + 1
+        T = np.zeros((len(x), n))
+        T[:, 0] = 1.0
+        if n > 1:
+            T[:, 1] = x
+        for j in range(2, n):
+            T[:, j] = 2.0 * x * T[:, j - 1] - T[:, j - 2]
+        coeffs, _, _, _ = np.linalg.lstsq(T, y, rcond=None)
+        return coeffs
+
+    @staticmethod
+    def _eval_chebyshev_standard_basis(x, coeffs):
+        n = len(coeffs)
+        T = np.zeros((len(x), n))
+        T[:, 0] = 1.0
+        if n > 1:
+            T[:, 1] = x
+        for j in range(2, n):
+            T[:, j] = 2.0 * x * T[:, j - 1] - T[:, j - 2]
+        return T @ coeffs
+
+    def GenerateMinimaxSignCoeffs(self, degrees, prec, logalpha, logerr,
+                                  debug) -> list[float]:
+        """Composite sign-polynomial coefficients, pure numpy -- no FHE
+        ops, so this is identical in spirit to DeSiLoLibrary's version.
+        Each stage is fitted on the *output range* of the previous stage
+        (matching Lattigo's composite Remez strategy) so the composition
+        converges toward sign(x). The last polynomial approximates
+        step(x) in {0, 1} (Lattigo convention: ReLU = x * step(x)); every
+        earlier one approximates sign(x) in {-1, 1}.
+        """
+        gap = 2.0 ** (-logalpha)
+        domain_min, domain_max = -1.0, 1.0
+        current_gap = gap
+
+        coeffs_flat: list[float] = []
+        for i, deg in enumerate(degrees):
+            is_last = (i == len(degrees) - 1)
+            n_pts = max(8 * deg, 500)
+
+            x_neg = np.linspace(domain_min, -current_gap, n_pts)
+            x_pos = np.linspace(current_gap, domain_max, n_pts)
+            x = np.concatenate([x_neg, x_pos])
+            y = np.where(x > 0, 1.0, 0.0) if is_last else np.sign(x)
+
+            coeffs = self._fit_chebyshev_standard_basis(x, y, deg)
+            coeffs_flat.extend(coeffs[:deg + 1].tolist())
+
+            if not is_last:
+                dense_neg = np.linspace(domain_min, -current_gap, 2000)
+                dense_pos = np.linspace(current_gap, domain_max, 2000)
+                dense = np.concatenate([dense_neg, dense_pos])
+                output = self._eval_chebyshev_standard_basis(dense, coeffs)
+
+                domain_min = float(output.min())
+                domain_max = float(output.max())
+
+                near_gap = np.array([current_gap, -current_gap])
+                near_out = self._eval_chebyshev_standard_basis(near_gap, coeffs)
+                current_gap = max(
+                    float(min(abs(near_out[0]), abs(near_out[1]))), 1e-12)
+
+        return coeffs_flat
 
     # ------------------------------------------------------------------
     # Metadata getters
