@@ -5,10 +5,12 @@ that orion/backend/python/ keeps working unchanged. All actual FHE work
 goes through the native ``_cheddar_native`` pybind11 module built from
 ``orion/backend/cheddar/ext/``.
 
-Not yet implemented: polynomial evaluator, BSGS linear transform, and
-bootstrap -- attempting to use them raises NotImplementedError. Extending
-these is the path to running this backend against the full test suite
-and the run_lola/run_mlp/run_resnet examples.
+Not yet implemented: polynomial evaluator and bootstrap -- attempting to
+use them raises NotImplementedError. Extending these is the path to
+running this backend against the full test suite and the run_lola/
+run_mlp/run_resnet examples. Linear transform is implemented entirely
+at this layer (rotate + ct-pt multiply + add, optionally BSGS-batched)
+rather than via a native LT object -- see GenerateLinearTransform.
 
 Word size: uint64. Cheddar's Parameter takes explicit prime lists rather
 than bit sizes, so this module converts Orion's LogQ/LogP into
@@ -18,7 +20,10 @@ NTT-friendly primes (p = 1 mod 2N) before calling setup_scheme.
 from __future__ import annotations
 
 import atexit
+import math
 from typing import Sequence
+
+import numpy as np
 
 try:
     from . import _cheddar_native as _native
@@ -147,6 +152,12 @@ class CheddarLibrary:
         # up -- an unconditional delete would wipe the new state).
         self._generation: int | None = None
 
+        # Linear-transform state. No native LT object -- evaluated at this
+        # layer via rotate + ct-pt multiply + add (optionally BSGS-batched),
+        # same approach as DeSiLoLibrary.
+        self._transforms: dict[int, dict] = {}
+        self._next_lt_id = 1
+
         _register_atexit_cleanup()
 
     # ------------------------------------------------------------------
@@ -228,8 +239,7 @@ class CheddarLibrary:
     def setup_poly_evaluator(self) -> None:
         """No-op. Polynomial eval not yet implemented."""
 
-    def setup_lt_evaluator(self) -> None:
-        """No-op. Linear-transform eval not yet implemented."""
+    # setup_lt_evaluator: defined in the Linear transform section below.
 
     def setup_bootstrapper(self) -> None:
         """No-op. Bootstrap not yet implemented."""
@@ -274,8 +284,8 @@ class CheddarLibrary:
     def NewPolynomialEvaluator(self) -> None:
         """No-op. Polynomial eval not yet implemented."""
 
-    def NewLinearTransformEvaluator(self) -> None:
-        """No-op. Linear-transform eval not yet implemented."""
+    # NewLinearTransformEvaluator: defined in the Linear transform section
+    # below.
 
     def DeleteBootstrappers(self) -> None:
         """No-op. Bootstrap not yet implemented; nothing allocated to free."""
@@ -416,6 +426,157 @@ class CheddarLibrary:
 
     def DeletePlaintext(self, pt_id: int) -> None:
         _native.DeletePlaintext(int(pt_id))
+
+    # ------------------------------------------------------------------
+    # Linear transform (diagonal matrix-vector multiply)
+    #
+    # No native LT object -- Cheddar's own HoistHandler double-hoisting
+    # is built around a PlainHoistMap constructor we haven't wired up
+    # (see docs on HoistHandler in the vendored source). This evaluates
+    # each diagonal via rotate + ct-pt multiply + add instead, same
+    # approach as DeSiLoLibrary: naive O(N) loop, or BSGS O(2*sqrt(N))
+    # when bsgs_ratio requests it and there's more than one diagonal.
+    #
+    # Rotation convention: RotateNew(ct, k)[i] = ct[i+k] (see the
+    # "Convention check" note in cheddar_pybind.cu). The diag-k
+    # semantics this backend is tested against are
+    # result[i] = sum_k diag_k[i] * input[(i+k) % slots], so baby/giant
+    # rotations use +distance directly -- no sign flip (DeSiLoLibrary's
+    # naive/BSGS loop negates every distance because its native rotate
+    # uses the opposite convention).
+    # ------------------------------------------------------------------
+
+    def setup_lt_evaluator(self) -> None:
+        """No-op. LT state (self._transforms) is already set up in __init__."""
+
+    def NewLinearTransformEvaluator(self) -> None:
+        """No-op."""
+
+    def GenerateLinearTransform(self, diags_idxs, diags_data, level,
+                                bsgs_ratio, io_mode) -> int:
+        num_diags = len(diags_idxs)
+        values_per_diag = len(diags_data) // num_diags
+        diags: dict[int, list[float]] = {}
+        for i, idx in enumerate(diags_idxs):
+            start = i * values_per_diag
+            vals = list(diags_data[start:start + values_per_diag])
+            if len(vals) < self._slots:
+                vals = vals + [0.0] * (self._slots - len(vals))
+            diags[int(idx)] = vals[:self._slots]
+
+        lt_id = self._next_lt_id
+        self._next_lt_id += 1
+        self._transforms[lt_id] = {"diags": diags, "bsgs_ratio": bsgs_ratio}
+        return lt_id
+
+    def _lt_use_bsgs(self, lt_id: int) -> bool:
+        t = self._transforms[lt_id]
+        return t["bsgs_ratio"] not in ("none", None) and len(t["diags"]) > 1
+
+    def _lt_bsgs_stride(self, lt_id: int) -> int:
+        t = self._transforms[lt_id]
+        return max(1, math.ceil(
+            math.sqrt(len(t["diags"]) * float(t["bsgs_ratio"]))))
+
+    def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
+        diags = self._transforms[lt_id]["diags"]
+        if not self._lt_use_bsgs(lt_id):
+            return sorted(k for k in diags if k != 0)
+        bs = self._lt_bsgs_stride(lt_id)
+        dists = set()
+        for k in diags:
+            b, g = k % bs, k // bs
+            if b != 0:
+                dists.add(b)
+            if g != 0:
+                dists.add(g * bs)
+        return sorted(dists)
+
+    def GenerateLinearTransformRotationKey(self, k: int) -> None:
+        self.AddRotationKey(int(k))
+
+    def EvaluateLinearTransform(self, lt_id: int, ct_id: int) -> int:
+        diags = self._transforms[lt_id]["diags"]
+        if self._lt_use_bsgs(lt_id):
+            return self._eval_lt_bsgs(ct_id, diags, self._lt_bsgs_stride(lt_id))
+        return self._eval_lt_naive(ct_id, diags)
+
+    def _lt_encode(self, values, level: int) -> int:
+        return self.Encode(values, level, self._default_scale)
+
+    def _eval_lt_naive(self, ct_id: int, diags: dict[int, list[float]]) -> int:
+        level = self.GetCiphertextLevel(ct_id)
+        result = None
+        for k, vals in diags.items():
+            rotated = ct_id if k == 0 else self.RotateNew(ct_id, k)
+            pt = self._lt_encode(vals, level)
+            prod = self.MulPlaintextNew(rotated, pt)
+            self.DeletePlaintext(pt)
+            if rotated != ct_id:
+                self.DeleteCiphertext(rotated)
+            result = prod if result is None else self._lt_accumulate(result, prod)
+        return result
+
+    def _eval_lt_bsgs(self, ct_id: int, diags: dict[int, list[float]],
+                      bs: int) -> int:
+        level = self.GetCiphertextLevel(ct_id)
+
+        giant_groups: dict[int, list[tuple[int, list[float]]]] = {}
+        for k, vals in diags.items():
+            b, g = k % bs, k // bs
+            giant_groups.setdefault(g, []).append((b, vals))
+
+        needed_babies = sorted({b for group in giant_groups.values()
+                                for b, _ in group})
+        baby_rots = {b: (ct_id if b == 0 else self.RotateNew(ct_id, b))
+                    for b in needed_babies}
+
+        result = None
+        for g, group in giant_groups.items():
+            inner = None
+            for b, vals in group:
+                shifted = vals if g == 0 else np.roll(vals, g * bs).tolist()
+                pt = self._lt_encode(shifted, level)
+                prod = self.MulPlaintextNew(baby_rots[b], pt)
+                self.DeletePlaintext(pt)
+                inner = prod if inner is None else self._lt_accumulate(inner, prod)
+
+            partial = inner if g == 0 else self.RotateNew(inner, g * bs)
+            if partial is not inner:
+                self.DeleteCiphertext(inner)
+            result = partial if result is None else self._lt_accumulate(result, partial)
+
+        for b, rot in baby_rots.items():
+            if rot != ct_id:
+                self.DeleteCiphertext(rot)
+        return result
+
+    def _lt_accumulate(self, a: int, b: int) -> int:
+        out = self.AddCiphertextNew(a, b)
+        self.DeleteCiphertext(a)
+        self.DeleteCiphertext(b)
+        return out
+
+    def DeleteLinearTransform(self, lt_id: int) -> None:
+        self._transforms.pop(lt_id, None)
+
+    def RemoveRotationKeys(self) -> None:
+        """No-op. Cheddar caches rotation keys natively; no release path."""
+
+    def RemovePlaintextDiagonals(self, lt_id: int) -> None:
+        """No-op. No native diagonal storage to release."""
+
+    def GenerateAndSerializeRotationKey(self, k):
+        self._not_implemented("GenerateAndSerializeRotationKey")
+
+    def LoadRotationKey(self, byte_data, k=None):
+        self._not_implemented("LoadRotationKey")
+
+    def SerializeDiagonal(self, lt_id, diag_idx):
+        self._not_implemented("SerializeDiagonal")
+
+    def LoadPlaintextDiagonal(self, byte_data, lt_id, diag_idx):
+        self._not_implemented("LoadPlaintextDiagonal")
 
     # ------------------------------------------------------------------
     # Metadata getters
