@@ -5,13 +5,13 @@ that orion/backend/python/ keeps working unchanged. All actual FHE work
 goes through the native ``_cheddar_native`` pybind11 module built from
 ``orion/backend/cheddar/ext/``.
 
-Not yet implemented: bootstrap -- attempting to use it raises
-NotImplementedError. Extending it is the path to running run_resnet on
-this backend (run_lola/run_mlp are bootstrap-free). Linear transform and
-polynomial evaluation are implemented entirely at this layer (rotate +
-ct-pt multiply + add for LT; Horner's method over ct-ct multiply for
-polynomials) rather than via native evaluator objects -- see
-GenerateLinearTransform and EvaluatePolynomial.
+Bootstrap orchestrates Cheddar's native BootContext (CoeffToSlot / EvalMod /
+SlotToCoeff) from this layer -- see NewBootstrapper/Bootstrap below and
+extension/BootContext.h. Linear transform and polynomial evaluation are
+implemented entirely at this layer (rotate + ct-pt multiply + add for LT;
+Horner's method over ct-ct multiply for polynomials) rather than via
+native evaluator objects -- see GenerateLinearTransform and
+EvaluatePolynomial.
 
 Word size: uint64. Cheddar's Parameter takes explicit prime lists rather
 than bit sizes, so this module converts Orion's LogQ/LogP into
@@ -196,11 +196,17 @@ class CheddarLibrary:
         if self._device != "gpu":
             raise RuntimeError("Cheddar backend only supports device='gpu'.")
 
-        if orion_params.get_boot_logp() != logp:
-            raise NotImplementedError(
-                "Cheddar backend doesn't wrap bootstrapping. Use desilo "
-                "or lattigo for bootstrap-dependent configs."
-            )
+        # boot_params.LogP is a lattigo-specific knob (extra auxiliary
+        # primes for its bootstrap circuit) -- ignored here, same as
+        # desilo. Cheddar's BootContext reuses this scheme's own aux
+        # primes for its internal key-switching; the knobs it actually
+        # needs (num_cts_levels/num_stc_levels/log_message_ratio) come
+        # from boot_params separately and are only consumed lazily, in
+        # NewBootstrapper.
+        self._boot_num_cts_levels = orion_params.get_boot_num_cts_levels() or 4
+        self._boot_num_stc_levels = orion_params.get_boot_num_stc_levels() or 3
+        self._boot_log_message_ratio = (
+            orion_params.get_boot_log_message_ratio() or 5)
 
         used: set[int] = set()
         main_primes = _gen_primes(logq, logn, used)
@@ -248,7 +254,8 @@ class CheddarLibrary:
     # setup_lt_evaluator: defined in the Linear transform section below.
 
     def setup_bootstrapper(self) -> None:
-        """No-op. Bootstrap not yet implemented."""
+        """No-op. NewBootstrapper lazily builds Cheddar's BootContext on
+        first use -- most configs (e.g. lola/mlp) never call it."""
 
     # ------------------------------------------------------------------
     # Key generation. UserInterface's constructor samples secrets and
@@ -294,7 +301,7 @@ class CheddarLibrary:
     # below.
 
     def DeleteBootstrappers(self) -> None:
-        """No-op. Bootstrap not yet implemented; nothing allocated to free."""
+        _native.DeleteBootstrappers()
 
     # ------------------------------------------------------------------
     # Encode / Encrypt / Decode / Decrypt
@@ -756,8 +763,24 @@ class CheddarLibrary:
             f"orion/backend/cheddar/."
         )
 
-    def NewBootstrapper(self, *args, **kwargs):
-        self._not_implemented("NewBootstrapper")
+    # ------------------------------------------------------------------
+    #  Bootstrap
+    # ------------------------------------------------------------------
 
-    def Bootstrap(self, *args, **kwargs):
-        self._not_implemented("Bootstrap")
+    def NewBootstrapper(self, logPs, slots: int) -> None:
+        """Prepare Cheddar's native BootContext for the given slot count.
+
+        logPs (lattigo's auxiliary-prime sizing knob) is ignored -- see
+        the comment in setup_scheme. Idempotent per slot count: the
+        BootContext and its EvalMod are built once and reused; only
+        PrepareEvalSpecialFFT + rotation-key generation repeat for a new
+        slot count.
+        """
+        print(f"[Cheddar] Preparing bootstrapper for slots={slots} ...")
+        _native.NewBootstrapper(
+            self._boot_num_cts_levels, self._boot_num_stc_levels,
+            self._boot_log_message_ratio, int(slots))
+        print(f"[Cheddar] Bootstrapper ready.")
+
+    def Bootstrap(self, ct_id: int, slots: int) -> int:
+        return _native.Bootstrap(int(ct_id), int(slots))

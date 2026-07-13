@@ -1,9 +1,8 @@
 // Copyright 2026 The HE-LRM authors
 // pybind11 module exposing Cheddar's CKKS API to Orion's backend layer.
 //
-// Not yet implemented: poly eval, linear transform, bootstrap (see
-// bindings.py). Extending these is future work, not a permanent scope
-// limit.
+// Not yet implemented: see bindings.py for the current list. Extending
+// these is future work, not a permanent scope limit.
 //
 // Word size is uint64_t: Orion LogQ/LogP bit sizes map to one prime per
 // level, same regime as the lattigo/desilo backends. The Python side
@@ -17,6 +16,7 @@
 
 #include <UserInterface.h>
 #include <core/Context.h>
+#include <extension/BootContext.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -55,6 +55,17 @@ struct BackendState {
 
     // Rotation distances with a prepared key (normalized to [0, slots)).
     std::set<int> rot_keys;
+
+    // Bootstrap. BootContext extends Context and is built against the
+    // same param_ as the regular context above -- ciphertexts aren't
+    // tied to a specific Context instance, so ops on either context
+    // freely interoperate. Built lazily on first NewBootstrapper call
+    // (not every scheme needs bootstrap). One BootContext/BootParameter
+    // pair per scheme; PrepareEvalSpecialFFT is repeated per distinct
+    // slot count (boot_prepared_slots tracks which have run).
+    std::unique_ptr<cheddar::BootParameter> boot_param;
+    std::shared_ptr<cheddar::BootContext<word>> boot_context;
+    std::set<int> boot_prepared_slots;
 
     double default_scale = 0.0;
     int max_level = 0;
@@ -208,6 +219,9 @@ void delete_scheme() {
     g_state.plaintexts.clear();
     g_state.ciphertexts.clear();
     g_state.rot_keys.clear();
+    g_state.boot_prepared_slots.clear();
+    g_state.boot_context.reset();
+    g_state.boot_param.reset();
     g_state.iface.reset();
     g_state.context.reset();
     g_state.param.reset();
@@ -767,6 +781,63 @@ std::vector<int> RotateBatchNew(int ct_id, std::vector<int> shifts,
 }
 
 // ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+// Cheddar exposes bootstrap as raw building blocks (BootContext) rather
+// than lattigo/desilo's single opaque call, so this orchestrates the
+// sequence documented in BootContext.h: prepare EvalMod once, prepare
+// the special FFT per slot count, discover+generate the rotation keys
+// the circuit needs (folded into the same EvkMap/UserInterface every
+// other op already shares), then Boot().
+//
+// BootContext is built against the scheme's existing param_ (same NTT/
+// RNS machinery as the regular Context), so ciphertexts created via
+// g_state.context interoperate with it directly -- no re-encryption or
+// separate key material needed, matching lattigo's bootstrapping.
+// Evaluator being a wrapper around the same scheme.Params/SecretKey.
+
+void NewBootstrapper(int num_cts_levels, int num_stc_levels,
+                     int log_message_ratio, int slots) {
+    ensure_keys();
+    if (!g_state.boot_context) {
+        g_state.boot_param = std::make_unique<cheddar::BootParameter>(
+            g_state.max_level, num_cts_levels, num_stc_levels,
+            log_message_ratio);
+        g_state.boot_context = cheddar::BootContext<word>::Create(
+            *g_state.param, *g_state.boot_param);
+        g_state.boot_context->PrepareEvalMod();
+    }
+    if (g_state.boot_prepared_slots.count(slots)) return;
+
+    g_state.boot_context->PrepareEvalSpecialFFT(slots);
+
+    cheddar::EvkRequest req;
+    g_state.boot_context->AddRequiredRotations(req, slots, /*min_ks=*/false);
+    g_state.iface->PrepareRotationKey(req);
+
+    g_state.boot_prepared_slots.insert(slots);
+}
+
+int Bootstrap(int ct_id, int slots) {
+    ensure_keys();
+    if (!g_state.boot_context || !g_state.boot_prepared_slots.count(slots))
+        throw std::runtime_error(
+            "Cheddar: no bootstrapper prepared for slots=" +
+            std::to_string(slots) + ". Call NewBootstrapper first.");
+
+    auto out = std::make_unique<Ct>();
+    g_state.boot_context->Boot(*out, g_state.ct(ct_id),
+                              g_state.iface->GetEvkMap(), /*min_ks=*/false);
+    return g_state.put_ct(std::move(out));
+}
+
+void DeleteBootstrappers() {
+    g_state.boot_prepared_slots.clear();
+    g_state.boot_context.reset();
+    g_state.boot_param.reset();
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle: ID deletion
 // ---------------------------------------------------------------------------
 
@@ -883,6 +954,13 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("RotateNew", &RotateNew, py::arg("ct_id"), py::arg("k"));
     m.def("RotateBatchNew", &RotateBatchNew, py::arg("ct_id"),
           py::arg("shifts"), py::arg("hoist_mode") = 0);
+
+    // Bootstrap
+    m.def("NewBootstrapper", &NewBootstrapper, py::arg("num_cts_levels"),
+          py::arg("num_stc_levels"), py::arg("log_message_ratio"),
+          py::arg("slots"));
+    m.def("Bootstrap", &Bootstrap, py::arg("ct_id"), py::arg("slots"));
+    m.def("DeleteBootstrappers", &DeleteBootstrappers);
 
     // Lifecycle: ID deletion
     m.def("DeleteCiphertext", &DeleteCiphertext, py::arg("ct_id"));

@@ -21,7 +21,7 @@ from fhe_test_utils import assert_fhe_close
 
 
 def _make_bootstrap_config(backend):
-    return {
+    config = {
         "ckks_params": {
             "LogN": 16,
             "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
@@ -40,8 +40,39 @@ def _make_bootstrap_config(backend):
         },
     }
 
+    if backend == "cheddar":
+        # LogP above is lattigo's boot-aux-prime knob and is ignored by
+        # cheddar (see bindings.py setup_scheme); num_cts_levels/
+        # num_stc_levels are what its BootContext actually consumes,
+        # matching cheddar's own 64-bit/scale-40 reference parameter set
+        # (parameters/bootparam_40_64bit.json upstream). Cheddar is
+        # GPU-only.
+        #
+        # Unlike lattigo (whose bootstrapping.Parameters silently builds
+        # a larger internal chain from boot_params.LogP) and desilo
+        # (whose engine manages its own primes), cheddar's BootContext
+        # runs directly on this scheme's own LogQ -- there's no hidden
+        # extra chain. So LogQ itself must be deep enough to fit
+        # CoeffToSlot + EvalMod + SlotToCoeff: BootParameter's
+        # mod_coefficients_ table is 31 entries -> GetNumEvalModLevels()
+        # = Log2Ceil(31) + num_double_angle_(3) = 8, fixed regardless of
+        # num_cts_levels/num_stc_levels. So max_level must be >=
+        # num_cts_levels + 8 + num_stc_levels = 15 for our 4/3 choice;
+        # the shared 11-level LogQ above is too shallow. 18 entries
+        # (max_level=17) gives a couple of levels of headroom.
+        num_cts_levels, num_stc_levels = 4, 3
+        min_max_level = num_cts_levels + 8 + num_stc_levels
+        config["ckks_params"]["LogQ"] = [55] + [40] * (min_max_level + 2)
+        config["boot_params"] = {
+            "num_cts_levels": num_cts_levels,
+            "num_stc_levels": num_stc_levels,
+        }
+        config["orion"]["device"] = "gpu"
 
-@pytest.fixture(scope="module", params=["lattigo", "desilo"])
+    return config
+
+
+@pytest.fixture(scope="module", params=["lattigo", "desilo", "cheddar"])
 def boot_scheme(request):
     """Module-scoped scheme with bootstrap support, one per backend."""
     s = Scheme()
