@@ -12,6 +12,14 @@ class CKKSParameters:
     h: int = 192
     ringtype: str = "standard"
     boot_logp: List[int] = field(default=None)
+    # Cheddar-specific bootstrap circuit knobs (ignored by lattigo/desilo,
+    # which manage their own bootstrap parameterization internally). See
+    # cheddar's BootParameter: num_cts_levels/num_stc_levels size the
+    # CoeffToSlot/SlotToCoeff stages, log_message_ratio approximates
+    # log2(q0 / scale) at the lowest level.
+    boot_num_cts_levels: int = field(default=None)
+    boot_num_stc_levels: int = field(default=None)
+    boot_log_message_ratio: int = 5
 
     def __post_init__(self):
         if self.logq and self.logp and len(self.logp) > len(self.logq):
@@ -115,7 +123,10 @@ class NewParameters:
             k.lower(): v for k, v in params.get("orion", {}).items()}
 
         self.ckks_params = CKKSParameters(
-            **ckks_params, boot_logp=boot_params.get("logp")
+            **ckks_params, boot_logp=boot_params.get("logp"),
+            boot_num_cts_levels=boot_params.get("num_cts_levels"),
+            boot_num_stc_levels=boot_params.get("num_stc_levels"),
+            boot_log_message_ratio=boot_params.get("log_message_ratio", 5),
         )
         self.orion_params = OrionParameters(**orion_params)
 
@@ -190,6 +201,15 @@ class NewParameters:
 
     def get_boot_logp(self):
         return self.ckks_params.boot_logp
+
+    def get_boot_num_cts_levels(self):
+        return self.ckks_params.boot_num_cts_levels
+
+    def get_boot_num_stc_levels(self):
+        return self.ckks_params.boot_num_stc_levels
+
+    def get_boot_log_message_ratio(self):
+        return self.ckks_params.boot_log_message_ratio
 
     def io_paths_exist(self):
         return bool(self.get_diags_path()) and bool(self.get_keys_path())
