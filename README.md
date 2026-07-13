@@ -38,10 +38,28 @@ uv run examples/run_mlp.py
 uv run examples/run_resnet.py
 ```
 
+#### Running with the Cheddar backend
+
+To run with the [Cheddar](https://github.com/scale-snu/cheddar-fhe) backend (GPU-only, C++/CUDA CKKS), first build the native extension -- see `orion/backend/cheddar/README.md` for the CMake steps.
+
+```
+uv run examples/run_lola.py configs/lola_cheddar.yml
+uv run examples/run_mlp.py configs/mlp_cheddar.yml
+```
+
+> **Note:** Cheddar doesn't implement bootstrapping yet, so `run_resnet.py` and `run_helrm.py` (both bootstrap-dependent) aren't supported on this backend. LoLA and MLP are bootstrap-free and run end to end.
+
+Unlike DeSiLo, Cheddar has no CPU path -- `device: gpu` is required in the config.
+
 #### Running oracle tests
 
 ```
 uv run pytest tests/oracle/ -v -s
+```
+
+To run with Cheddar:
+```
+uv run pytest tests/oracle/ -v -s --backend=cheddar
 ```
 
 Bootstrap tests are skipped by default. To include them:

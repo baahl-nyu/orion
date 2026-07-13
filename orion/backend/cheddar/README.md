@@ -4,12 +4,14 @@ Wraps [Cheddar](https://github.com/scale-snu/cheddar-fhe) (SNU SCALE lab,
 C++/CUDA CKKS) behind the same ID-based interface as the desilo backend.
 64-bit word mode.
 
-Not yet implemented: polynomial evaluator, BSGS linear transform, and
-bootstrap (raise `NotImplementedError`) -- so `run_lola`/`run_mlp`/
-`run_resnet` and the poly-eval/linear-transform/bootstrap sections of
-`tests/oracle/` don't work on this backend yet. Encode/decode,
-encrypt/decrypt, ct-ct and ct-pt arithmetic, rescale, and rotation
-(incl. hoisted batch rotation) are implemented and tested.
+Not yet implemented: bootstrap (raises `NotImplementedError`) -- so
+`run_resnet`/`run_helrm` and the bootstrap section of `tests/oracle/`
+don't work on this backend yet. Everything else does: encode/decode,
+encrypt/decrypt, ct-ct/ct-pt/scalar arithmetic, rescale, rotation
+(incl. hoisted batch rotation), linear transform, and polynomial
+evaluation -- `run_lola`/`run_mlp` run end to end
+(`tests/oracle/ --backend=cheddar` is 71/71 outside the `slow`-marked
+bootstrap tests).
 
 ## Build
 
@@ -54,6 +56,13 @@ is needed at runtime.
 orion:
   backend: cheddar
   device: gpu        # GPU-only backend
+```
+
+Examples:
+
+```bash
+python examples/run_lola.py configs/lola_cheddar.yml
+python examples/run_mlp.py configs/mlp_cheddar.yml
 ```
 
 Oracle tests:
