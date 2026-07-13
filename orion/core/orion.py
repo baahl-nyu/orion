@@ -97,6 +97,16 @@ class Scheme:
             py_desilo = dsl.DeSiLoLibrary()
             py_desilo.setup_bindings(params)
             return py_desilo
+        elif backend == "cheddar":
+            import os
+            from orion.backend.cheddar import CheddarLibrary
+            # Default "single" = shared ModUp across a batch of rotations.
+            # Builds against plain upstream Cheddar. Override via env for
+            # A/B runs against "none" (per-shift rotation loop).
+            hoist_mode = os.environ.get("ORION_CHEDDAR_HOIST_MODE", "single")
+            py_cheddar = CheddarLibrary(hoist_mode=hoist_mode)
+            py_cheddar.setup_bindings(params)
+            return py_cheddar
         elif backend in ("heaan", "openfhe"):
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
