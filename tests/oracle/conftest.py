@@ -31,12 +31,37 @@ TEST_CKKS_CONFIG = {
     },
 }
 
+# Cheddar is GPU-only and doesn't implement the ConjugateInvariant ring --
+# its native setup_scheme always treats LogN as the Standard-ring degree
+# (slots = N/2), so it silently mismatches TEST_CKKS_CONFIG's slot count
+# (H=8192 assumes ConjugateInvariant's N=8192 slots). Same level count and
+# bit-sizes, just Standard ring + device=gpu, so tested mult depth /
+# tolerance stays comparable to the other backends.
+CHEDDAR_CKKS_CONFIG = {
+    "ckks_params": {
+        "LogN": 13,
+        "LogQ": [29, 26, 26, 26],
+        "LogP": [29],
+        "LogScale": 26,
+        "H": 8192,
+        "RingType": "Standard",
+    },
+    "orion": {
+        "backend": "cheddar",
+        "device": "gpu",
+        "io_mode": "none",
+        "debug": False,
+    },
+}
+
 
 @pytest.fixture(scope="session")
-def scheme():
-    """Session-scoped Lattigo scheme shared by all tests."""
+def scheme(request):
+    """Session-scoped scheme shared by all tests; config picked by --backend."""
+    backend = request.config.getoption("--backend")
+    config = CHEDDAR_CKKS_CONFIG if backend == "cheddar" else TEST_CKKS_CONFIG
     s = Scheme()
-    s.init_scheme(TEST_CKKS_CONFIG)
+    s.init_scheme(config)
     yield s
     s.delete_scheme()
 
