@@ -303,17 +303,29 @@ class CheddarLibrary:
     def AddCiphertextNew(self, a: int, b: int) -> int:
         return _native.AddCiphertextNew(int(a), int(b))
 
+    def AddCiphertext(self, a: int, b: int) -> int:
+        return _native.AddCiphertext(int(a), int(b))
+
     def SubCiphertextNew(self, a: int, b: int) -> int:
         return _native.SubCiphertextNew(int(a), int(b))
 
+    def SubCiphertext(self, a: int, b: int) -> int:
+        return _native.SubCiphertext(int(a), int(b))
+
     def MulRelinCiphertextNew(self, a: int, b: int) -> int:
         return _native.MulRelinCiphertextNew(int(a), int(b))
+
+    def MulRelinCiphertext(self, a: int, b: int) -> int:
+        return _native.MulRelinCiphertext(int(a), int(b))
 
     def MulNoRelinCiphertextNew(self, a: int, b: int) -> int:
         return _native.MulNoRelinCiphertextNew(int(a), int(b))
 
     def RelinearizeNew(self, a: int) -> int:
         return _native.RelinearizeNew(int(a))
+
+    def Negate(self, ct_id: int) -> int:
+        return _native.Negate(int(ct_id))
 
     # ------------------------------------------------------------------
     # ct - pt arithmetic
@@ -322,11 +334,20 @@ class CheddarLibrary:
     def MulPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintextNew(int(ct_id), int(pt_id))
 
+    def MulPlaintext(self, ct_id: int, pt_id: int) -> int:
+        return _native.MulPlaintext(int(ct_id), int(pt_id))
+
     def AddPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.AddPlaintextNew(int(ct_id), int(pt_id))
 
+    def AddPlaintext(self, ct_id: int, pt_id: int) -> int:
+        return _native.AddPlaintext(int(ct_id), int(pt_id))
+
     def SubPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.SubPlaintextNew(int(ct_id), int(pt_id))
+
+    def SubPlaintext(self, ct_id: int, pt_id: int) -> int:
+        return _native.SubPlaintext(int(ct_id), int(pt_id))
 
     # ------------------------------------------------------------------
     # Rescale
@@ -334,6 +355,9 @@ class CheddarLibrary:
 
     def RescaleNew(self, ct_id: int) -> int:
         return _native.RescaleNew(int(ct_id))
+
+    def Rescale(self, ct_id: int) -> int:
+        return _native.Rescale(int(ct_id))
 
     # ------------------------------------------------------------------
     # Rotations
@@ -384,6 +408,18 @@ class CheddarLibrary:
 
     def GetPlaintextSlots(self, pt_id: int) -> int:
         return _native.GetPlaintextSlots(int(pt_id))
+
+    def GetCiphertextScale(self, ct_id: int) -> float:
+        return _native.GetCiphertextScale(int(ct_id))
+
+    def GetPlaintextScale(self, pt_id: int) -> float:
+        return _native.GetPlaintextScale(int(pt_id))
+
+    def SetCiphertextScale(self, ct_id: int, scale) -> None:
+        _native.SetCiphertextScale(int(ct_id), float(scale))
+
+    def SetPlaintextScale(self, pt_id: int, scale) -> None:
+        _native.SetPlaintextScale(int(pt_id), float(scale))
 
     # ------------------------------------------------------------------
     # Not yet implemented
