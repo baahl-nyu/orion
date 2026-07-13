@@ -100,6 +100,17 @@ void ensure_setup() {
             "Cheddar backend not initialised. Call setup_scheme() first.");
 }
 
+// In-place op support: move the ciphertext computed at `from` into `id`'s
+// map slot (destroying whatever was previously there) and drop the now-
+// empty `from` entry. Callers compute a result via the existing *New path
+// into a fresh id, then fold it back onto the id the caller expects to
+// keep -- same pattern desilo's _replace uses, just at the map level since
+// Cheddar's ids live in g_state rather than a Python-side registry.
+void replace_ct(int id, int from) {
+    g_state.ciphertexts[id] = std::move(g_state.ciphertexts.at(from));
+    g_state.ciphertexts.erase(from);
+}
+
 template <typename Container>
 int level_of(const Container& c) {
     return g_state.param->NPToLevel(c.GetNP());
@@ -321,6 +332,11 @@ int AddCiphertextNew(int a, int b) {
     return g_state.put_ct(std::move(out));
 }
 
+int AddCiphertext(int a, int b) {
+    replace_ct(a, AddCiphertextNew(a, b));
+    return a;
+}
+
 int SubCiphertextNew(int a, int b) {
     ensure_setup();
     const Ct& ca = g_state.ct(a);
@@ -333,6 +349,11 @@ int SubCiphertextNew(int a, int b) {
     auto out = std::make_unique<Ct>();
     g_state.context->Sub(*out, *ua, *ub);
     return g_state.put_ct(std::move(out));
+}
+
+int SubCiphertext(int a, int b) {
+    replace_ct(a, SubCiphertextNew(a, b));
+    return a;
 }
 
 int MulNoRelinCiphertextNew(int a, int b) {
@@ -377,6 +398,11 @@ int MulRelinCiphertextNew(int a, int b) {
     return out;
 }
 
+int MulRelinCiphertext(int a, int b) {
+    replace_ct(a, MulRelinCiphertextNew(a, b));
+    return a;
+}
+
 // ---------------------------------------------------------------------------
 // ct x pt (THOR / BMM-3 hot path)
 // ---------------------------------------------------------------------------
@@ -410,6 +436,11 @@ int MulPlaintextNew(int ct_id, int pt_id) {
     return g_state.put_ct(std::move(out));
 }
 
+int MulPlaintext(int ct_id, int pt_id) {
+    replace_ct(ct_id, MulPlaintextNew(ct_id, pt_id));
+    return ct_id;
+}
+
 int AddPlaintextNew(int ct_id, int pt_id) {
     ensure_setup();
     const Ct& c = g_state.ct(ct_id);
@@ -429,6 +460,11 @@ int AddPlaintextNew(int ct_id, int pt_id) {
     return g_state.put_ct(std::move(out));
 }
 
+int AddPlaintext(int ct_id, int pt_id) {
+    replace_ct(ct_id, AddPlaintextNew(ct_id, pt_id));
+    return ct_id;
+}
+
 int SubPlaintextNew(int ct_id, int pt_id) {
     ensure_setup();
     const Ct& c = g_state.ct(ct_id);
@@ -445,6 +481,22 @@ int SubPlaintextNew(int ct_id, int pt_id) {
     return g_state.put_ct(std::move(out));
 }
 
+int SubPlaintext(int ct_id, int pt_id) {
+    replace_ct(ct_id, SubPlaintextNew(ct_id, pt_id));
+    return ct_id;
+}
+
+// ---------------------------------------------------------------------------
+// Negate
+// ---------------------------------------------------------------------------
+
+int Negate(int ct_id) {
+    ensure_setup();
+    auto out = std::make_unique<Ct>();
+    g_state.context->Neg(*out, g_state.ct(ct_id));
+    return g_state.put_ct(std::move(out));
+}
+
 // ---------------------------------------------------------------------------
 // Rescale
 // ---------------------------------------------------------------------------
@@ -457,6 +509,11 @@ int RescaleNew(int ct_id) {
     auto out = std::make_unique<Ct>();
     g_state.context->Rescale(*out, c);  // native HasRx() path for degree-2
     return g_state.put_ct(std::move(out));
+}
+
+int Rescale(int ct_id) {
+    replace_ct(ct_id, RescaleNew(ct_id));
+    return ct_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +722,15 @@ int GetPlaintextLevel(int pt_id) { return level_of(g_state.pt(pt_id)); }
 int GetCiphertextSlots(int /*ct_id*/) { return g_state.slot_count; }
 int GetPlaintextSlots(int /*pt_id*/) { return g_state.slot_count; }
 
+double GetCiphertextScale(int ct_id) { return g_state.ct(ct_id).GetScale(); }
+double GetPlaintextScale(int pt_id) { return g_state.pt(pt_id).GetScale(); }
+void SetCiphertextScale(int ct_id, double scale) {
+    g_state.ct(ct_id).SetScale(scale);
+}
+void SetPlaintextScale(int pt_id, double scale) {
+    g_state.pt(pt_id).SetScale(scale);
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -701,18 +767,28 @@ PYBIND11_MODULE(_cheddar_native, m) {
 
     // ct - ct
     m.def("AddCiphertextNew", &AddCiphertextNew);
+    m.def("AddCiphertext", &AddCiphertext);
     m.def("SubCiphertextNew", &SubCiphertextNew);
+    m.def("SubCiphertext", &SubCiphertext);
     m.def("MulRelinCiphertextNew", &MulRelinCiphertextNew);
+    m.def("MulRelinCiphertext", &MulRelinCiphertext);
     m.def("MulNoRelinCiphertextNew", &MulNoRelinCiphertextNew);
     m.def("RelinearizeNew", &RelinearizeNew);
 
     // ct - pt
     m.def("MulPlaintextNew", &MulPlaintextNew);
+    m.def("MulPlaintext", &MulPlaintext);
     m.def("AddPlaintextNew", &AddPlaintextNew);
+    m.def("AddPlaintext", &AddPlaintext);
     m.def("SubPlaintextNew", &SubPlaintextNew);
+    m.def("SubPlaintext", &SubPlaintext);
+
+    // Negate
+    m.def("Negate", &Negate, py::arg("ct_id"));
 
     // Rescale
     m.def("RescaleNew", &RescaleNew);
+    m.def("Rescale", &Rescale);
 
     // Rotations
     m.def("AddRotationKey", &AddRotationKey, py::arg("k"));
@@ -730,4 +806,10 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("GetPlaintextLevel", &GetPlaintextLevel, py::arg("pt_id"));
     m.def("GetCiphertextSlots", &GetCiphertextSlots, py::arg("ct_id"));
     m.def("GetPlaintextSlots", &GetPlaintextSlots, py::arg("pt_id"));
+    m.def("GetCiphertextScale", &GetCiphertextScale, py::arg("ct_id"));
+    m.def("GetPlaintextScale", &GetPlaintextScale, py::arg("pt_id"));
+    m.def("SetCiphertextScale", &SetCiphertextScale, py::arg("ct_id"),
+          py::arg("scale"));
+    m.def("SetPlaintextScale", &SetPlaintextScale, py::arg("pt_id"),
+          py::arg("scale"));
 }
