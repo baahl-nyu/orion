@@ -206,3 +206,6 @@ go.work.sum
 
 # env file
 .env
+
+# Cheddar's vendored source clone (see orion/backend/cheddar/README.md)
+matmul-encoding-material/
