@@ -1,0 +1,30 @@
+comment: "ResNet Parameter Set (Cheddar backend)"
+
+ckks_params:
+  LogN: 16
+  LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+  LogP: [61, 61, 61]
+  LogScale: 40
+  H: 192
+  RingType: standard
+
+# Cheddar ignores boot_params.LogP (lattigo's aux-prime knob) and instead
+# reserves the top (num_cts_levels + eval_mod_levels) primes of the chain
+# for the boot circuit -- see orion/backend/cheddar/README.md. LogQ above
+# is the *usable* chain; cheddar appends the reserved boot primes natively.
+boot_params:
+  num_cts_levels: 4
+  num_stc_levels: 3
+
+orion:
+  margin: 2 # >= 1
+  embedding_method: hybrid # [hybrid, square]
+  backend: cheddar
+  device: gpu # cheddar is GPU-only
+
+  fuse_modules: true
+  debug: true
+
+  diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
+  keys_path: ../data/keys.h5 # "path/to/keys" | ""
+  io_mode: none # "load" | "save" | "none"

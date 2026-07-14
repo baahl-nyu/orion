@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import atexit
 import math
+import os
 from typing import Sequence
 
 import numpy as np
@@ -147,6 +148,8 @@ class CheddarLibrary:
         self._max_level: int | None = None
         self._slots: int | None = None
         self._device: str | None = None
+        # Usable-level moduli (one prime per Orion level), set in setup_scheme.
+        self._usable_primes: list[int] = []
         # Generation this instance owns; DeleteScheme only tears down
         # native state if it is still the live generation (the bench
         # runner GC-finalizes the OLD scheme after the NEW one is set
@@ -223,6 +226,11 @@ class CheddarLibrary:
         used: set[int] = set()
         main_primes = _gen_primes(logq, logn, used)
         default_enc_level = len(main_primes) - 1  # usable-chain top
+        # The usable-level moduli, indexed by Orion level (0..default_enc_level).
+        # GetModuliChain returns these -- callers encode plaintexts at
+        # scale = q[level] for errorless rescaling. Excludes the reserved
+        # boot primes appended below (those aren't Orion-visible levels).
+        self._usable_primes = list(main_primes)
 
         if self._boot_enabled:
             eval_mod_levels = _native.BootNumEvalModLevels()
@@ -266,6 +274,13 @@ class CheddarLibrary:
             setup_args["BootNumCtsLevels"] = self._boot_num_cts_levels
             setup_args["BootNumStcLevels"] = self._boot_num_stc_levels
             setup_args["BootLogMessageRatio"] = self._boot_log_message_ratio
+            # min_ks: full boot key set by default (fastest). Set
+            # ORION_CHEDDAR_BOOT_MIN_KS=1 to trade Boot speed for far less
+            # rotation-key memory -- needed when many boot circuits (several
+            # slot counts) plus linear-transform keys must be resident at
+            # once, e.g. ResNet on a 24GB card.
+            env = os.environ.get("ORION_CHEDDAR_BOOT_MIN_KS", "").lower()
+            setup_args["BootMinKs"] = env in ("1", "true", "yes", "on")
 
         self._generation = _native.setup_scheme(setup_args)
 
@@ -772,6 +787,20 @@ class CheddarLibrary:
     def GetKeyMemoryMB(self) -> float:
         """Exact resident evaluation-key memory (rotation + basic evks)."""
         return _native.GetKeyMemoryMB()
+
+    def GetModuliChain(self) -> list[int]:
+        """Usable-level moduli (q_i), indexed by Orion level 0..max_level.
+
+        Callers (bootstrap prescale, batch norm, extract/embedding) encode
+        plaintexts at scale = q[level] so the following rescale is
+        errorless. Excludes the reserved boot-circuit primes -- those sit
+        above Orion's level range. Returns the actual primes (not a
+        default-scale stub as desilo does) since cheddar rescales by the
+        exact prime, so the real value is what keeps rescaling clean."""
+        return list(self._usable_primes)
+
+    def GetAuxModuliChain(self) -> list[int]:
+        return []
 
     def GetCiphertextLevel(self, ct_id: int) -> int:
         return _native.GetCiphertextLevel(int(ct_id))
