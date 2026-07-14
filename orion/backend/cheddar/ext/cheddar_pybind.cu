@@ -66,6 +66,9 @@ struct BackendState {
     std::unique_ptr<cheddar::BootParameter> boot_param;
     std::shared_ptr<cheddar::BootContext<word>> boot_context;
     std::set<int> boot_prepared_slots;
+    // EvalMod precompute is slot-independent and built once (lazily, on the
+    // first NewBootstrapper call) into boot_context; this tracks that.
+    bool eval_mod_prepared = false;
 
     double default_scale = 0.0;
     int max_level = 0;
@@ -204,10 +207,45 @@ int setup_scheme(py::dict params) {
 
     double base_scale = std::pow(2.0, logScale);
 
+    // default_encryption_level = the top of the *usable* chain, where
+    // fresh ciphertexts are encrypted and where Orion's level accounting
+    // tops out. For bootstrap-enabled schemes this is strictly below
+    // num_levels-1: the topmost (num_cts + eval_mod) primes are reserved
+    // for the boot circuit (CoeffToSlot + EvalMod), and BootContext
+    // asserts default_encryption_level == GetStCStartLevel() == max_level
+    // - num_cts_levels - GetNumEvalModLevels(). When bootstrap is not
+    // configured, Python passes num_levels-1 (whole chain usable) and
+    // no primes are reserved.
+    int default_enc_level = params.contains("DefaultEncryptionLevel")
+        ? params["DefaultEncryptionLevel"].cast<int>()
+        : num_levels - 1;
+
     g_state.param = std::make_unique<Param>(
-        logN, base_scale, /*default_encryption_level=*/num_levels - 1,
+        logN, base_scale, default_enc_level,
         level_config, main_primes, aux_primes);
-    g_state.context = cheddar::Context<word>::Create(*g_state.param);
+
+    // When bootstrap is configured (Python passes the boot level knobs),
+    // build a BootContext and use it as *the* context -- BootContext
+    // derives from Context, so all regular ops go through it unchanged.
+    // Keeping a single context (rather than a separate regular Context +
+    // BootContext) roughly halves resident memory, which is what lets
+    // full-slot LogN=16 bootstrap fit on a 24GB card. The heavy,
+    // slot-specific precompute (EvalMod / special FFT) stays lazy in
+    // NewBootstrapper; only the light constant tables are built here.
+    if (params.contains("BootNumCtsLevels")) {
+        int nc = params["BootNumCtsLevels"].cast<int>();
+        int ns = params["BootNumStcLevels"].cast<int>();
+        int lmr = params.contains("BootLogMessageRatio")
+            ? params["BootLogMessageRatio"].cast<int>() : 5;
+        g_state.boot_param = std::make_unique<cheddar::BootParameter>(
+            num_levels - 1, nc, ns, lmr);
+        g_state.boot_context = cheddar::BootContext<word>::Create(
+            *g_state.param, *g_state.boot_param);
+        g_state.eval_mod_prepared = false;
+        g_state.context = g_state.boot_context;  // shared: one context
+    } else {
+        g_state.context = cheddar::Context<word>::Create(*g_state.param);
+    }
 
     g_state.default_scale = base_scale;
     g_state.max_level = num_levels - 1;
@@ -220,6 +258,10 @@ void delete_scheme() {
     g_state.ciphertexts.clear();
     g_state.rot_keys.clear();
     g_state.boot_prepared_slots.clear();
+    g_state.eval_mod_prepared = false;
+    // boot_context aliases context (shared_ptr): resetting it here drops
+    // one ref; context.reset() below drops the last and destroys the
+    // single underlying (Boot)Context.
     g_state.boot_context.reset();
     g_state.boot_param.reset();
     g_state.iface.reset();
@@ -796,21 +838,30 @@ std::vector<int> RotateBatchNew(int ct_id, std::vector<int> shifts,
 // separate key material needed, matching lattigo's bootstrapping.
 // Evaluator being a wrapper around the same scheme.Params/SecretKey.
 
-void NewBootstrapper(int num_cts_levels, int num_stc_levels,
-                     int log_message_ratio, int slots) {
+void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
+                     int /*log_message_ratio*/, int slots) {
     ensure_keys();
-    if (!g_state.boot_context) {
-        g_state.boot_param = std::make_unique<cheddar::BootParameter>(
-            g_state.max_level, num_cts_levels, num_stc_levels,
-            log_message_ratio);
-        g_state.boot_context = cheddar::BootContext<word>::Create(
-            *g_state.param, *g_state.boot_param);
+    // boot_context is built at setup_scheme time (as the shared context)
+    // whenever boot_params are present. If it is missing, the scheme was
+    // created without boot level knobs -- surface that clearly rather than
+    // segfaulting on a null context.
+    if (!g_state.boot_context)
+        throw std::runtime_error(
+            "Cheddar: scheme was not built with bootstrap parameters. Set "
+            "boot_params num_cts_levels/num_stc_levels in the Orion config.");
+    if (!g_state.eval_mod_prepared) {
         g_state.boot_context->PrepareEvalMod();
+        g_state.eval_mod_prepared = true;
     }
     if (g_state.boot_prepared_slots.count(slots)) return;
 
     g_state.boot_context->PrepareEvalSpecialFFT(slots);
 
+    // min_ks=false: generate the full rotation-key set for the fastest
+    // Boot execution. With the single-context design above, full-slot
+    // LogN=16 boot peaks ~15GB (matching upstream's own boot_test), so
+    // the larger key set fits comfortably on a 24GB card. Boot() below
+    // must use the same min_ks value the keys were generated for.
     cheddar::EvkRequest req;
     g_state.boot_context->AddRequiredRotations(req, slots, /*min_ks=*/false);
     g_state.iface->PrepareRotationKey(req);
@@ -832,9 +883,24 @@ int Bootstrap(int ct_id, int slots) {
 }
 
 void DeleteBootstrappers() {
-    g_state.boot_prepared_slots.clear();
-    g_state.boot_context.reset();
-    g_state.boot_param.reset();
+    // No-op: the BootContext is the scheme's single shared context, so it
+    // cannot be torn down independently -- doing so would destroy the
+    // context regular ops still use (or, if another ref keeps it alive,
+    // leave boot_prepared_slots inconsistent with the still-live
+    // precompute). All boot state is released by delete_scheme() at scheme
+    // teardown. This is also generation-safe: a stale bootstrapper
+    // finalizer running after a new scheme is set up won't disturb it.
+}
+
+// Number of levels EvalMod consumes in the boot circuit. Fixed by the
+// vendored BootParameter's mod_coefficients_ table + num_double_angle_
+// (independent of max_level / num_cts / num_stc), so Python can call it
+// once to size the reserved boot-prime region without duplicating the
+// magic constant. Constructed with dummy level args since
+// GetNumEvalModLevels() ignores them.
+int BootNumEvalModLevels() {
+    return cheddar::BootParameter(/*max_level=*/64, /*num_cts=*/1,
+                                  /*num_stc=*/1).GetNumEvalModLevels();
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +1027,7 @@ PYBIND11_MODULE(_cheddar_native, m) {
           py::arg("slots"));
     m.def("Bootstrap", &Bootstrap, py::arg("ct_id"), py::arg("slots"));
     m.def("DeleteBootstrappers", &DeleteBootstrappers);
+    m.def("BootNumEvalModLevels", &BootNumEvalModLevels);
 
     // Lifecycle: ID deletion
     m.def("DeleteCiphertext", &DeleteCiphertext, py::arg("ct_id"));
