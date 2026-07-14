@@ -48,21 +48,24 @@ def _make_bootstrap_config(backend):
         # (parameters/bootparam_40_64bit.json upstream). Cheddar is
         # GPU-only.
         #
-        # Unlike lattigo (whose bootstrapping.Parameters silently builds
-        # a larger internal chain from boot_params.LogP) and desilo
-        # (whose engine manages its own primes), cheddar's BootContext
-        # runs directly on this scheme's own LogQ -- there's no hidden
-        # extra chain. So LogQ itself must be deep enough to fit
-        # CoeffToSlot + EvalMod + SlotToCoeff: BootParameter's
-        # mod_coefficients_ table is 31 entries -> GetNumEvalModLevels()
-        # = Log2Ceil(31) + num_double_angle_(3) = 8, fixed regardless of
-        # num_cts_levels/num_stc_levels. So max_level must be >=
-        # num_cts_levels + 8 + num_stc_levels = 15 for our 4/3 choice;
-        # the shared 11-level LogQ above is too shallow. 18 entries
-        # (max_level=17) gives a couple of levels of headroom.
+        # Like lattigo (whose bootstrapping.Parameters silently extends
+        # the modulus chain for its boot circuit), cheddar reserves the
+        # topmost (num_cts_levels + eval_mod_levels) primes of the chain
+        # for CoeffToSlot + EvalMod; SlotToCoeff then consumes
+        # num_stc_levels. The LogQ here is therefore the *usable* chain
+        # (Orion's level range); the reserved boot primes are appended
+        # natively (see CheddarLibrary.setup_scheme). BootContext asserts
+        # default_encryption_level == max_level - num_cts_levels -
+        # GetNumEvalModLevels(), so this usable depth becomes the level a
+        # fresh ciphertext starts at, and bootstrap restores back up to
+        # (usable_levels - num_stc_levels).
+        #
+        # 13 usable levels matches the reference param set's
+        # default_encryption_level=13. Full-slot (N/2) boot at this depth
+        # peaks ~21GB on a 24GB card via cheddar's single-context design.
         num_cts_levels, num_stc_levels = 4, 3
-        min_max_level = num_cts_levels + 8 + num_stc_levels
-        config["ckks_params"]["LogQ"] = [55] + [40] * (min_max_level + 2)
+        usable_levels = 13
+        config["ckks_params"]["LogQ"] = [55] + [40] * usable_levels
         config["boot_params"] = {
             "num_cts_levels": num_cts_levels,
             "num_stc_levels": num_stc_levels,
@@ -173,7 +176,10 @@ class TestBootstrap:
     def test_bootstrap_sparse(self, boot_scheme):
         """Sparse bootstrap (fewer slots than available)."""
         scheme = boot_scheme
-        num_values = 64  # fewer than full slots
+        # Cheddar's EvalSpecialFFT asserts num_slots >= 256, so its
+        # smallest supported sparse count is 256 (still << full N/2);
+        # lattigo/desilo happily bootstrap fewer.
+        num_values = 256 if scheme.params.get_backend() == "cheddar" else 64
 
         scheme.bootstrapper.generate_bootstrapper(num_values)
 

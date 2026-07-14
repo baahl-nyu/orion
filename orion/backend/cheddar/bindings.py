@@ -201,28 +201,73 @@ class CheddarLibrary:
         # desilo. Cheddar's BootContext reuses this scheme's own aux
         # primes for its internal key-switching; the knobs it actually
         # needs (num_cts_levels/num_stc_levels/log_message_ratio) come
-        # from boot_params separately and are only consumed lazily, in
-        # NewBootstrapper.
-        self._boot_num_cts_levels = orion_params.get_boot_num_cts_levels() or 4
-        self._boot_num_stc_levels = orion_params.get_boot_num_stc_levels() or 3
+        # from boot_params separately.
+        #
+        # Bootstrap is enabled iff num_cts_levels *and* num_stc_levels are
+        # explicitly given in boot_params. When enabled, the topmost
+        # (num_cts_levels + eval_mod_levels) primes of the chain are
+        # reserved for the boot circuit (CoeffToSlot + EvalMod) and are
+        # NOT part of Orion's usable level range -- BootContext asserts
+        # default_encryption_level == max_level - num_cts_levels -
+        # GetNumEvalModLevels(). This mirrors how lattigo silently extends
+        # its modulus chain for the bootstrap circuit: Orion's LogQ is the
+        # usable chain; the reserved primes sit above it.
+        raw_cts = orion_params.get_boot_num_cts_levels()
+        raw_stc = orion_params.get_boot_num_stc_levels()
+        self._boot_enabled = raw_cts is not None and raw_stc is not None
+        self._boot_num_cts_levels = raw_cts or 4
+        self._boot_num_stc_levels = raw_stc or 3
         self._boot_log_message_ratio = (
             orion_params.get_boot_log_message_ratio() or 5)
 
         used: set[int] = set()
         main_primes = _gen_primes(logq, logn, used)
+        default_enc_level = len(main_primes) - 1  # usable-chain top
+
+        if self._boot_enabled:
+            eval_mod_levels = _native.BootNumEvalModLevels()
+            num_reserved = self._boot_num_cts_levels + eval_mod_levels
+            # Reserved boot-circuit primes. Sized like Cheddar's own 64-bit
+            # reference set (parameters/bootparam_40_64bit.json), whose boot
+            # levels run ~15 bits above the scale (scale 2^40 -> ~2^55
+            # primes) to give EvalMod/CtS/StC precision headroom. Capped at
+            # 61 to stay comfortably below the uint64 prime ceiling.
+            boot_prime_bits = min(logscale + 15, 61)
+            boot_primes = _gen_primes(
+                [boot_prime_bits] * num_reserved, logn, used)
+            main_primes = main_primes + boot_primes
+
         aux_primes = _gen_primes(logp, logn, used)
 
+        max_level = len(main_primes) - 1
         print(f"[Cheddar] Creating CKKS context: LogN={logn}, "
               f"LogQ={list(logq)}, LogP={list(logp)}, scale=2^{logscale}, "
               f"slots={self._slots}, word=uint64, "
-              f"hoist_mode={self._hoist_mode_name}")
+              f"hoist_mode={self._hoist_mode_name}, "
+              f"boot={'on' if self._boot_enabled else 'off'}, "
+              f"max_level={max_level}, default_enc_level={default_enc_level}")
 
-        self._generation = _native.setup_scheme({
+        setup_args = {
             "LogN": logn,
             "LogScale": logscale,
             "MainPrimes": main_primes,
             "AuxPrimes": aux_primes,
-        })
+            "DefaultEncryptionLevel": default_enc_level,
+        }
+        if self._boot_enabled:
+            # Presence of these keys tells the native layer to build the
+            # scheme's single context as a BootContext (see setup_scheme in
+            # cheddar_pybind.cu). Using one context rather than a separate
+            # regular Context + BootContext roughly halves resident memory
+            # -- the difference between fitting and OOMing full-slot
+            # LogN=16 bootstrap on a 24GB card. Must satisfy default_enc_level
+            # == max_level - num_cts_levels - eval_mod_levels, which the
+            # chain extension above guarantees by construction.
+            setup_args["BootNumCtsLevels"] = self._boot_num_cts_levels
+            setup_args["BootNumStcLevels"] = self._boot_num_stc_levels
+            setup_args["BootLogMessageRatio"] = self._boot_log_message_ratio
+
+        self._generation = _native.setup_scheme(setup_args)
 
     def DeleteScheme(self) -> None:
         if self._generation is not None:
