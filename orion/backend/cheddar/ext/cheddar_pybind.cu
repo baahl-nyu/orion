@@ -69,6 +69,14 @@ struct BackendState {
     // EvalMod precompute is slot-independent and built once (lazily, on the
     // first NewBootstrapper call) into boot_context; this tracks that.
     bool eval_mod_prepared = false;
+    // min_ks (minimum key-switching): far fewer boot rotation keys at the
+    // cost of slower Boot. Set at setup_scheme from the Orion config; the
+    // key generation (AddRequiredRotations) and Boot must agree on it.
+    // Default false (full key set, fastest); worth enabling for workloads
+    // that keep many boot circuits + linear-transform keys resident at once
+    // (e.g. ResNet's several slot counts), where the full set OOMs a 24GB
+    // card.
+    bool boot_min_ks = false;
 
     double default_scale = 0.0;
     int max_level = 0;
@@ -242,6 +250,8 @@ int setup_scheme(py::dict params) {
         g_state.boot_context = cheddar::BootContext<word>::Create(
             *g_state.param, *g_state.boot_param);
         g_state.eval_mod_prepared = false;
+        g_state.boot_min_ks = params.contains("BootMinKs")
+            ? params["BootMinKs"].cast<bool>() : false;
         g_state.context = g_state.boot_context;  // shared: one context
     } else {
         g_state.context = cheddar::Context<word>::Create(*g_state.param);
@@ -863,7 +873,7 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
     // the larger key set fits comfortably on a 24GB card. Boot() below
     // must use the same min_ks value the keys were generated for.
     cheddar::EvkRequest req;
-    g_state.boot_context->AddRequiredRotations(req, slots, /*min_ks=*/false);
+    g_state.boot_context->AddRequiredRotations(req, slots, g_state.boot_min_ks);
     g_state.iface->PrepareRotationKey(req);
 
     g_state.boot_prepared_slots.insert(slots);
@@ -895,7 +905,7 @@ int Bootstrap(int ct_id, int slots) {
     if (std::abs(r - 1.0) <= 1e-9) {
         auto out = std::make_unique<Ct>();
         g_state.boot_context->Boot(*out, g_state.ct(ct_id),
-                                   g_state.iface->GetEvkMap(), /*min_ks=*/false);
+                                   g_state.iface->GetEvkMap(), g_state.boot_min_ks);
         return g_state.put_ct(std::move(out));
     }
 
@@ -905,7 +915,7 @@ int Bootstrap(int ct_id, int slots) {
 
     auto booted = std::make_unique<Ct>();
     g_state.boot_context->Boot(*booted, snapped,
-                               g_state.iface->GetEvkMap(), /*min_ks=*/false);
+                               g_state.iface->GetEvkMap(), g_state.boot_min_ks);
     int boot_id = g_state.put_ct(std::move(booted));
 
     // Undo the r factor: MulScalarFloatNew encodes 1/r at the (base) scale

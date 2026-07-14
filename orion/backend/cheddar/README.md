@@ -120,6 +120,29 @@ Env knobs:
   `num_slots >= 256`, so sparse bootstrap below 256 slots is unsupported
   (lattigo/desilo go lower).
 
+- **Aggregate key memory on big models (`min_ks`).** A deep model like
+  ResNet bootstraps at several slot counts (32768, 16384, 8192, 4096 as
+  the spatial dims shrink), and Orion prepares a *separate* boot circuit
+  per slot count -- all resident at once, each with its own rotation
+  keys, on top of every linear-transform's rotation keys. With the
+  default full key set (`min_ks=false`) that overflows a 24GB card (OOM
+  while generating the conv rotation keys, *after* the boot circuits are
+  built). Set `ORION_CHEDDAR_BOOT_MIN_KS=1` to generate the minimum boot
+  key set instead -- far less memory, slower Boot. Unlike lattigo/desilo,
+  cheddar has no key/diagonal serialization (`GenerateAndSerializeRotationKey`
+  / `LoadRotationKey` raise `NotImplementedError`), so `io_mode: load/save`
+  can't stream keys from disk -- everything must fit in GPU memory at once.
+
+- **`GetModuliChain` returns the real usable primes.** The production
+  bootstrap path (and batch norm / extract / embedding layers) call
+  `get_moduli_chain()[level]` to encode plaintexts at `scale = q[level]`
+  for errorless rescaling. Desilo returns a `default_scale` stub (it
+  manages scale internally); cheddar returns the *actual* usable-level
+  primes (excluding the reserved boot primes), since it rescales by the
+  exact prime so the real value is what keeps rescaling clean. The oracle
+  bootstrap tests don't exercise this (they encode the prescale at the
+  default scale), so it only surfaced running a real model.
+
 - **Input-scale snapping (precision, has a tradeoff worth knowing).**
   Cheddar's `Boot` precomputes its EvalMod/CtS/StC constants *once* from
   the scheme's fixed `base_scale`, i.e. it *assumes the input ciphertext
