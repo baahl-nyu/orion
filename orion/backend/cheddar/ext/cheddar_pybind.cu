@@ -876,10 +876,46 @@ int Bootstrap(int ct_id, int slots) {
             "Cheddar: no bootstrapper prepared for slots=" +
             std::to_string(slots) + ". Call NewBootstrapper first.");
 
-    auto out = std::make_unique<Ct>();
-    g_state.boot_context->Boot(*out, g_state.ct(ct_id),
-                              g_state.iface->GetEvkMap(), /*min_ks=*/false);
-    return g_state.put_ct(std::move(out));
+    // Scale snapping. Cheddar's Boot derives its EvalMod scaleup from the
+    // scheme's fixed base_scale, i.e. it assumes the input sits at exactly
+    // base_scale. But exact-prime rescaling drifts the scale away from
+    // base_scale -- and because MulScalar-then-Rescale squares the scale,
+    // the per-prime offset compounds, reaching ~1% after a dozen rescales.
+    // Bootstrap precision is empirically capped near
+    // -log2(|scale/base_scale - 1|) (a 1% drift caps it at ~7 bits vs the
+    // ~19 achievable on an undrifted input). So: snap the input to
+    // base_scale with a pure scale relabel (which rescales the
+    // *represented* message by r = scale/base_scale), boot the snapped
+    // copy, then divide the result by r to recover the true message. Costs
+    // one level for the correction multiply; a fresh, undrifted input
+    // (r == 1, e.g. a bare encode) skips the whole dance.
+    const double base = g_state.default_scale;
+    const double r = g_state.ct(ct_id).GetScale() / base;
+
+    if (std::abs(r - 1.0) <= 1e-9) {
+        auto out = std::make_unique<Ct>();
+        g_state.boot_context->Boot(*out, g_state.ct(ct_id),
+                                   g_state.iface->GetEvkMap(), /*min_ks=*/false);
+        return g_state.put_ct(std::move(out));
+    }
+
+    Ct snapped;
+    g_state.context->Copy(snapped, g_state.ct(ct_id));
+    snapped.SetScale(base);
+
+    auto booted = std::make_unique<Ct>();
+    g_state.boot_context->Boot(*booted, snapped,
+                               g_state.iface->GetEvkMap(), /*min_ks=*/false);
+    int boot_id = g_state.put_ct(std::move(booted));
+
+    // Undo the r factor: MulScalarFloatNew encodes 1/r at the (base) scale
+    // and RescaleNew brings the squared scale back down -- same pattern the
+    // scalar-mul path uses elsewhere, leaving a clean ~base_scale result.
+    int scaled = MulScalarFloatNew(boot_id, 1.0 / r);
+    g_state.ciphertexts.erase(boot_id);
+    int corrected = RescaleNew(scaled);
+    g_state.ciphertexts.erase(scaled);
+    return corrected;
 }
 
 void DeleteBootstrappers() {
