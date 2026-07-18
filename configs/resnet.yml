@@ -5,13 +5,14 @@ ckks_params:
   LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
   LogP: [61, 61, 61]
   LogScale: 40
-  H: 192
+  H: 16384
   RingType: standard
 
 boot_params:
   LogP: [61, 61, 61, 61, 61, 61, 61, 61]
 
 orion:
+  batch_size: 1
   margin: 2 # >= 1
   embedding_method: hybrid # [hybrid, square]
   backend: lattigo # [lattigo, openfhe, heaan]

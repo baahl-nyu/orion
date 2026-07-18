@@ -101,3 +101,5 @@ Bootstrap tests are skipped by default. To include them:
 ```
 uv run pytest tests/oracle/ -v -s --backend=desilo -m ""
 ```
+
+The Criteo HELRM example lives in `examples/criteo/`.

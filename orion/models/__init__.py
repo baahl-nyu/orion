@@ -6,3 +6,4 @@ from .vgg import *
 from .yolo import *
 from .mlp import *
 from .helrm import *
+from .mobilenet import *

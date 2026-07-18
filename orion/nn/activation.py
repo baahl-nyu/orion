@@ -79,8 +79,8 @@ class Chebyshev(Module):
         if not self.within_composite:
             center = (self.input_min + self.input_max) / 2 
             half_range = (self.input_max - self.input_min) / 2
-            self.low = (center - (self.margin * half_range)).item()
-            self.high = (center + (self.margin * half_range)).item()
+            self.low = (center - (self.margin * half_range))
+            self.high = (center + (self.margin * half_range))
 
             nodes = np.polynomial.chebyshev.chebpts1(self.degree + 1)
             if self.low < -1 or self.high > 1:
@@ -298,6 +298,7 @@ class ReLU(Module):
         x *= self.postscale # integer mult, no level consumed
         return x
 
+
 class Cleanse(Module):
     def __init__(self, iter=3):
         super().__init__()
@@ -308,6 +309,7 @@ class Cleanse(Module):
             x = poly(x)
         return x
 
+
 class SqMethod1(Module):
     def __init__(self, p):
         super().__init__()
@@ -316,6 +318,7 @@ class SqMethod1(Module):
 
     def forward(self, x):
         return self.poly(x)
+
 
 class SqMethod2(Module):
     def __init__(self, r):
@@ -327,6 +330,7 @@ class SqMethod2(Module):
         for quad in self.quad:
             x = quad(x)
         return x
+
 
 class SqMethod(Module):
     def __init__(self, p, r):
@@ -340,6 +344,7 @@ class SqMethod(Module):
         x = self.sq1(x)
         x = self.sq2(x)
         return x
+
 
 class EIF(Module):
     def __init__(self, p, r, iter):

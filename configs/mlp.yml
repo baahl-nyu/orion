@@ -2,13 +2,14 @@ comment: Config for MLP from https://eprint.iacr.org/2017/396.pdf
 
 ckks_params:
   LogN: 13
-  LogQ: [29, 26, 26, 26, 26, 26]
-  LogP: [29, 29]
+  LogQ: [29, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26]
+  LogP: [29, 29, 29, 29, 29, 29]
   LogScale: 26
   H: 8192
-  RingType: ConjugateInvariant
+  RingType: Standard
 
 orion:
+  batch_size: 1 
   margin: 2 # >= 1
   embedding_method: hybrid # [hybrid, square]
   backend: lattigo # [lattigo, openfhe, heaan]

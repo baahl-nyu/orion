@@ -8,6 +8,13 @@ class Add(Module):
         super().__init__()
         self.set_depth(0)
 
+    def compute_fhe_output_shape(self, **kwargs):
+        fhe_input_shape = kwargs["fhe_input_shape"]
+
+        if isinstance(fhe_input_shape, list):
+            return fhe_input_shape[0]
+        return fhe_input_shape
+
     def forward(self, x, y):
         return x + y
     
@@ -16,6 +23,13 @@ class Mult(Module):
     def __init__(self):
         super().__init__()
         self.set_depth(1)
+
+    def compute_fhe_output_shape(self, **kwargs):
+        fhe_input_shape = kwargs["fhe_input_shape"]
+
+        if isinstance(fhe_input_shape, list):
+            return fhe_input_shape[0]
+        return fhe_input_shape
 
     def forward(self, x, y):
         return x * y
@@ -38,8 +52,8 @@ class Bootstrap(Module):
     def fit(self):
         center = (self.input_min + self.input_max) / 2 
         half_range = (self.input_max - self.input_min) / 2
-        self.low = (center - (self.margin * half_range)).item()
-        self.high = (center + (self.margin * half_range)).item()
+        self.low = (center - (self.margin * half_range))
+        self.high = (center + (self.margin * half_range))
 
         # We'll want to scale from [A, B] into [-1, 1] using a value of the
         # form 1 / integer, so that way our multiplication back to the range

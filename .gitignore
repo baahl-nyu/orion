@@ -209,3 +209,8 @@ go.work.sum
 
 # Cheddar's vendored source clone (see orion/backend/cheddar/README.md)
 matmul-encoding-material/
+
+examples/criteo/processed/
+examples/criteo/raw/
+examples/criteo/model/
+examples/criteo/fhe/

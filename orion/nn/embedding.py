@@ -8,6 +8,7 @@ from .activation import EIF
 
 from orion.backend.python.tensors import CipherTensor
 
+
 class Embedding(Linear):
     """
     Embedding layer that uses a lookup table to store the embedding vectors.
@@ -19,6 +20,7 @@ class Embedding(Linear):
     def forward(self, x):
         return super().forward(x)
 
+
 class CompressedEmbedding(Linear):
     """
     Concatenated compressed embedding tables (https://arxiv.org/abs/1711.01068)
@@ -29,6 +31,7 @@ class CompressedEmbedding(Linear):
 
     def forward(self, x):
         return super().forward(x)
+
 
 class CompressedIndicatorEmbedding(Module):
     """
@@ -47,11 +50,12 @@ class CompressedIndicatorEmbedding(Module):
         x = self.EmbeddingTable(x)
         return x
 
+
 class BaselineEmbedding(Module):
     """
     Baseline embedding used in:
-    Privacy-Preserving Embedding via Look-up Table Evaluation with Fully Homomorphic Encryption
-    See Table 4, Row 4 (Method CodedHELUT+p1)
+    Privacy-Preserving Embedding via Look-up Table Evaluation with Fully 
+    Homomorphic Encryption. See Table 4, Row 4 (Method CodedHELUT+p1)
 
     """
     def __init__(self, p, l, r, iter, embedding_dim, consolidate=False):
@@ -65,14 +69,23 @@ class BaselineEmbedding(Module):
 
         self.EIF = EIF(p=p, r=r, iter=iter)
         if consolidate:
-            self.table_mult = TableMultConsolidate(num_tables=l, vocab_size=p, embedding_dim=embedding_dim)
+            self.table_mult = TableMultConsolidate(
+                num_tables=l, 
+                vocab_size=p, 
+                embedding_dim=embedding_dim
+            )
         else:
-            self.table_mult = TableMult(num_tables=l, vocab_size=p, embedding_dim=embedding_dim)
+            self.table_mult = TableMult(
+                num_tables=l, 
+                vocab_size=p, 
+                embedding_dim=embedding_dim
+            )
     
     def forward(self, x):
         x = self.EIF(x) # We assume the input is already masked.
         x = self.table_mult(x)
         return x # a list of ciphertexts where each ciphertext has a single hidden dimension.
+
 
 class TableMult(Module):
     def __init__(self, num_tables, vocab_size, embedding_dim):
@@ -107,8 +120,9 @@ class TableMult(Module):
         for i in range(len(self.compressed_tables_ptxts)):
             table_mults.append(x * self.compressed_tables_ptxts[i])
 
-        # O(d log(p*l)) rotations where d is the embedding dimension, p is the vocab size, and l is the number of tables
-        # this makes sure we sum up all the compressed table embedding values
+        # O(d log(p*l)) rotations where d is the embedding dimension, p is the 
+        # vocab size, and l is the number of tables this makes sure we sum up 
+        # all the compressed table embedding values.
         num_rots = math.ceil(math.log2(self.vocab_size * self.num_tables))    
         for i in range(len(table_mults)):
             rot_amount = (self.vocab_size * self.num_tables) // 2
@@ -117,13 +131,23 @@ class TableMult(Module):
                 rot_amount //= 2
 
         # returning a ciphertensor object for the sake of bootstrapping
-        # added a new decrypt/decode method since the first slot in each separate ciphertext contains the data we need.
+        # added a new decrypt/decode method since the first slot in each 
+        # separate ciphertext contains the data we need.
         ids = []
         slots = self.scheme.params.get_slots()
         for table_mult in table_mults:
             for i in range(len(table_mult.ids)):
                 ids.append(table_mult.ids[i])
-        return CipherTensor(self.scheme, ids, shape=None, on_shape=None, start=0, stride=slots, stop=slots*self.embedding_dim)
+        
+        return CipherTensor(
+            self.scheme, ids, 
+            shape=None, 
+            on_shape=None, 
+            start=0, 
+            stride=slots, 
+            stop=slots*self.embedding_dim
+        )
+
 
 # The baseline method places a single output value in a separate ciphertext.
 # This method consolidates all the output values into a single ciphertext.
@@ -163,9 +187,7 @@ class TableMultConsolidate(Module):
 
     def forward(self, x):
         if not self.he_mode:
-            out = self.weight.view(-1, self.embedding_dim) * x.T
-            out = out.sum(dim=0, keepdim=True)
-            return out
+            return (x * self.weight.view(-1, self.embedding_dim).T).sum(dim=1)
 
         # otherwise, we are in FHE mode
 
@@ -174,8 +196,9 @@ class TableMultConsolidate(Module):
         for i in range(len(self.compressed_tables_ptxts)):
             table_mults.append(x * self.compressed_tables_ptxts[i])
 
-        # O(d log(p*l)) rotations where d is the embedding dimension, p is the vocab size, and l is the number of tables
-        # this makes sure we sum up all the compressed table embedding values
+        # O(d log(p*l)) rotations where d is the embedding dimension, p is the 
+        # vocab size, and l is the number of tables. This makes sure we sum up 
+        # all the compressed table embedding values.
         num_rots = math.ceil(math.log2(self.vocab_size * self.num_tables))    
         for i in range(len(table_mults)):
             rot_amount = (self.vocab_size * self.num_tables) // 2
@@ -190,4 +213,5 @@ class TableMultConsolidate(Module):
             masked = table_mults[i] * self.mask
             out += masked.roll(-i)
         out.on_shape = torch.Size([1, self.embedding_dim])
+        
         return out
