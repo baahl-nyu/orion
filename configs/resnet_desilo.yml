@@ -15,6 +15,7 @@ orion:
   margin: 2 # >= 1
   embedding_method: hybrid # [hybrid, square]
   backend: desilo
+  device: gpu # default is cpu if unset -- see OrionParameters.device
 
   fuse_modules: true
   debug: true

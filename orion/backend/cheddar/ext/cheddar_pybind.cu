@@ -16,7 +16,9 @@
 
 #include <UserInterface.h>
 #include <core/Context.h>
+#include <core/MemoryPool.h>
 #include <extension/BootContext.h>
+#include <extension/EvalPoly.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -24,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <set>
@@ -865,6 +868,34 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
     }
     if (g_state.boot_prepared_slots.count(slots)) return;
 
+    // ORION_CHEDDAR_BOOT_EVICT=1: keep at most one slot count's
+    // CoeffToSlot/SlotToCoeff data (BootContext's eval_fft_) resident at a
+    // time, evicting every other prepared slot count before preparing this
+    // one. In pow2-rotate mode this is where nearly all boot-circuit memory
+    // actually lives (see RESNET_MEMORY.md) -- the rotation keys pow2 mode
+    // uses are a small, fixed, slot-count-independent set (never evicted
+    // here), so this never frees a key another slot count still needs.
+    // Orion's placement generates all of a network's boot slot counts
+    // during compile(), before inference starts, so without this a network
+    // needing N slot counts keeps all N resident simultaneously -- fine
+    // for small N, but ResNet20's 4 distinct slot counts (32768 lazily,
+    // plus the 3 placement generates) is enough to OOM a 24GB card once
+    // num_stc_levels shrinks (bigger StC BSGS blocks -> bigger eval_fft_
+    // per slot count). Safe for any network whose slot count only shrinks
+    // over the forward pass (true for ResNet-style feedforward nets); a
+    // network that revisits an evicted slot count just regenerates it
+    // (extra latency, not incorrect -- PrepareEvalSpecialFFT is
+    // idempotent/deterministic).
+    static const bool evict_boot_circuits = [] {
+        const char *v = std::getenv("ORION_CHEDDAR_BOOT_EVICT");
+        return v && std::string(v) != "" && std::string(v) != "0";
+    }();
+    if (evict_boot_circuits) {
+        for (int prev : g_state.boot_prepared_slots)
+            g_state.boot_context->RemoveEvalSpecialFFT(prev);
+        g_state.boot_prepared_slots.clear();
+    }
+
     g_state.boot_context->PrepareEvalSpecialFFT(slots);
 
     // min_ks=false: generate the full rotation-key set for the fastest
@@ -881,10 +912,32 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
 
 int Bootstrap(int ct_id, int slots) {
     ensure_keys();
-    if (!g_state.boot_context || !g_state.boot_prepared_slots.count(slots))
-        throw std::runtime_error(
-            "Cheddar: no bootstrapper prepared for slots=" +
-            std::to_string(slots) + ". Call NewBootstrapper first.");
+    // Orion's placement generates bootstrappers for the slot counts it
+    // decides on, but runtime ops can request a count that was never
+    // placed (observed: ResNet20's conv1 requests logslots-15 when
+    // placement only generated 14/13/12). Unlike desilo's slot-agnostic
+    // key, Cheddar's FFT tables + rotation keys are per-slot-count, so
+    // prepare on demand here rather than surfacing the placement gap as
+    // a crash. NewBootstrapper is idempotent (no-ops if already
+    // prepared) and throws its own clear error if boot_context is
+    // missing entirely.
+    //
+    // Deliberately ignore the caller's `slots` argument for this check
+    // and use the ciphertext's own GetNumSlots() instead. Orion's
+    // Python-side "slots" is a heuristic computed independently from
+    // tensor shape metadata (see tensors.py's bootstrap()); it can
+    // diverge from what the native ciphertext actually carries once
+    // enough ops have propagated through Cheddar's own NumSlots tracking
+    // (see e.g. EvalPoly.cpp/Hoist.cu taking Max() of operand NumSlots).
+    // BootContext::Boot() itself only ever looks at input.GetNumSlots()
+    // (never the slots this wrapper receives), so preparing based on
+    // anything else can silently miss the real requirement -- observed
+    // on ResNet: Python requested slots=16384 (already prepared), but
+    // the ciphertext's actual GetNumSlots() was 32768 (never prepared),
+    // and Boot() crashed on that real value with no lazy-prepare chance.
+    int actual_slots = g_state.ct(ct_id).GetNumSlots();
+    if (!g_state.boot_prepared_slots.count(actual_slots))
+        NewBootstrapper(0, 0, 0, actual_slots);
 
     // Scale snapping. Cheddar's Boot derives its EvalMod scaleup from the
     // scheme's fixed base_scale, i.e. it assumes the input sits at exactly
@@ -926,6 +979,43 @@ int Bootstrap(int ct_id, int slots) {
     int corrected = RescaleNew(scaled);
     g_state.ciphertexts.erase(scaled);
     return corrected;
+}
+
+// ---------------------------------------------------------------------------
+// Polynomial evaluation (native EvalPoly)
+// ---------------------------------------------------------------------------
+// Cheddar's own EvalPoly (extension/EvalPoly.h) already implements a
+// log-depth (BSGS-tree) polynomial evaluator -- the same one BootContext
+// uses internally for EvalMod. bindings.py's GenerateMonomial /
+// GenerateChebyshev previously only fed a pure-Python Horner's-method
+// fallback (O(degree) levels: one Ct-Ct multiply + rescale per
+// coefficient), which silently diverged from the ceil(log2(degree+1))
+// depth orion/nn/activation.py assumes when placing bootstraps -- fine
+// for the tiny (degree <= 3) iterative-sign polynomials, but the
+// composite Sign/ReLU minimax polynomials default to degrees [15, 15, 27],
+// consuming 15/15/27 levels via Horner vs. the 4/4/5 EvalPoly (and the
+// depth model) actually expect -- exceeding the entire level budget
+// (l_eff=10) inside a single polynomial evaluation, making the network
+// unplaceable no matter how bootstraps are scheduled. EvalPoly requires
+// degree >= 2 (asserts otherwise), so bindings.py keeps the Horner path
+// for degree < 2.
+int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
+                             double target_scale) {
+    ensure_keys();
+    const Ct& c = g_state.ct(ct_id);
+    if (c.HasRx())
+        throw std::runtime_error(
+            "EvaluatePolynomialNative: relinearize before evaluating a "
+            "polynomial.");
+
+    cheddar::EvalPoly<word> poly(coeffs, level_of(c), c.GetScale(),
+                                 target_scale, /*chebyshev=*/false);
+    poly.Compile(g_state.context);
+
+    auto out = std::make_unique<Ct>();
+    poly.Evaluate(g_state.context, *out, c,
+                 g_state.iface->GetMultiplicationKey());
+    return g_state.put_ct(std::move(out));
 }
 
 void DeleteBootstrappers() {
@@ -973,6 +1063,15 @@ double GetKeyMemoryMB() {
         for (const auto& dv : key.ax_) words += dv.size();
     }
     return static_cast<double>(words) * sizeof(word) / (1024.0 * 1024.0);
+}
+
+// Peak bytes ever allocated through the RMM pool backing the current
+// scheme (see MemoryPool.h) -- includes keys, ciphertexts and every other
+// device buffer, not just evaluation keys like GetKeyMemoryMB. Measures
+// the true footprint regardless of whether ORION_CHEDDAR_MANAGED_MEMORY
+// is paging part of it to host RAM.
+double GetPeakDeviceMemoryMB() {
+    return static_cast<double>(cheddar::GetPeakDeviceBytes()) / (1024.0 * 1024.0);
 }
 
 int GetCiphertextLevel(int ct_id) { return level_of(g_state.ct(ct_id)); }
@@ -1075,12 +1174,17 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("DeleteBootstrappers", &DeleteBootstrappers);
     m.def("BootNumEvalModLevels", &BootNumEvalModLevels);
 
+    // Polynomial evaluation
+    m.def("EvaluatePolynomialNative", &EvaluatePolynomialNative,
+          py::arg("ct_id"), py::arg("coeffs"), py::arg("target_scale"));
+
     // Lifecycle: ID deletion
     m.def("DeleteCiphertext", &DeleteCiphertext, py::arg("ct_id"));
     m.def("DeletePlaintext", &DeletePlaintext, py::arg("pt_id"));
 
     // Metadata
     m.def("GetKeyMemoryMB", &GetKeyMemoryMB);
+    m.def("GetPeakDeviceMemoryMB", &GetPeakDeviceMemoryMB);
     m.def("GetCiphertextLevel", &GetCiphertextLevel, py::arg("ct_id"));
     m.def("GetPlaintextLevel", &GetPlaintextLevel, py::arg("pt_id"));
     m.def("GetCiphertextSlots", &GetCiphertextSlots, py::arg("ct_id"));

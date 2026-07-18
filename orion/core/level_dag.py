@@ -238,13 +238,44 @@ class LevelDAG(nx.DiGraph):
         if curr_level > prev_level - prev_module.depth:
             if prev_level - prev_module.depth <= 0:
                 return (float("inf"), 0)
-            
+
+            # This model treats every curr_level as an equally-free target
+            # for a bootstrap edge, so the solver greedily "chooses" the
+            # max (l_eff) since more headroom is always at least as good --
+            # i.e. it implicitly assumes bootstrap fully restores to l_eff.
+            # Cheddar's Boot() doesn't: it restores to at most
+            # (l_eff - num_stc_levels), and one level less than that
+            # whenever the input has scale drift (cheddar's
+            # scale-snapping correction -- see the Bootstrap docstring in
+            # cheddar_pybind.cu), which is the normal case for any
+            # ciphertext that isn't a bare fresh encode. Lattigo/desilo hit
+            # this same class of bug when first implemented (their own
+            # bootstrap restores less than l_eff too); cap curr_level here
+            # so the solver can't place a bootstrap targeting a level
+            # cheddar can't actually deliver, instead of silently running
+            # out of levels partway through whatever comes next.
+            #
+            # Cheddar's BootContext could instead give StC its own reserved
+            # primes (like CtS/EvalMod already have) so Boot() restores
+            # fully to l_eff -- see the GetStCStartLevel()/GetEndLevel()
+            # comment in the vendored BootContext.cpp. That cuts ResNet20's
+            # bootstrap count nearly in half (75 -> 38) but is a net
+            # latency loss (51.4s vs 36.0s): the wider reserved-prime chain
+            # and the higher post-boot level both make every op between
+            # bootstraps costlier, more than offsetting having fewer of
+            # them. Deliberately not done here for that reason.
+            if prev_module.scheme.params.get_backend() == "cheddar":
+                num_stc_levels = prev_module.scheme.params.get_boot_num_stc_levels() or 0
+                max_post_boot_level = self.l_eff - num_stc_levels - 1
+                if curr_level > max_post_boot_level:
+                    return (float("inf"), 0)
+
             # Analytical fit based on experiments. Once again could benefit
             # from a profiler, but the search space here is quite massive.
             a, b, c = 3.41, 0.18, 4.81
             t_boot = a * math.exp(b * self.l_eff) + c
             num_boots_required = self.get_num_input_cts(prev_module)
-            
+
             return (t_boot * num_boots_required, num_boots_required)
 
         # Case 4: No bootstrap required
