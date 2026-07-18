@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 
-def get_mnist_datasets(data_dir, batch_size, test_samples=10000, seed=None):
+def get_mnist_datasets(data_dir, batch_size=128, test_samples=10000, seed=None):
     """
     Loads MNIST datasets and returns training and test DataLoaders.
     
@@ -82,7 +82,7 @@ def get_mnist_datasets(data_dir, batch_size, test_samples=10000, seed=None):
         ssl._create_default_https_context = old_context
 
 
-def get_cifar_datasets(data_dir, batch_size, test_samples=10000, seed=None):
+def get_cifar_datasets(data_dir, batch_size=128, test_samples=10000, seed=None):
     """
     Loads CIFAR-10 datasets and returns training and test DataLoaders.
     
@@ -243,24 +243,56 @@ def download_and_prepare_tinyimagenet(data_dir='./data'):
 
 def get_tiny_datasets(data_dir, batch_size, test_samples=10000, seed=None):
     """
-    Loads Tiny-ImageNet datasets and returns training and test DataLoaders.
-    
-    Parameters:
-        data_dir (str): Directory to store/download Tiny-ImageNet data.
-        batch_size (int): Batch size for the DataLoaders.
-        test_samples (int): Number of samples to include in the test set.
-        seed (int, optional): Random seed for reproducibility.
-    
+    Return Tiny-ImageNet train/test DataLoaders.
+
+    This is path-agnostic:
+      - If `data_dir` is the parent (contains tiny-imagenet-200/), it works.
+      - If `data_dir` is already the dataset root (has train/ and val/), it
+        works.
+      - If a nested root exists (tiny-imagenet-200/tiny-imagenet-200), it
+        resolves it.
+
+    Args:
+        data_dir (str): Parent folder OR dataset root.
+        batch_size (int): Batch size for DataLoaders.
+        test_samples (int): Max number of validation samples to keep.
+        seed (int|None): Seed for reproducibility.
+
     Returns:
-        tuple: (train_loader, test_loader)
+        (DataLoader, DataLoader): (train_loader, test_loader)
     """
-    # Download and prepare the Tiny-ImageNet dataset
-    download_and_prepare_tinyimagenet(data_dir)
+    def has_train_val(root):
+        tdir = os.path.join(root, "train")
+        vdir = os.path.join(root, "val")
+        return os.path.isdir(tdir) and os.path.isdir(vdir)
+
+    # Candidate roots, in order of likelihood.
+    candidates = [
+        data_dir,
+        os.path.join(data_dir, "tiny-imagenet-200"),
+        os.path.join(data_dir, "tiny-imagenet-200", "tiny-imagenet-200"),
+    ]
+
+    dataset_root = next((c for c in candidates if has_train_val(c)), None)
+
+    # If not found, attempt download/prepare into the *parent* folder,
+    # then re-resolve the root.
+    if dataset_root is None:
+        download_and_prepare_tinyimagenet(data_dir)
+        dataset_root = next((c for c in candidates if has_train_val(c)), None)
+
+    if dataset_root is None:
+        tried = ", ".join(candidates)
+        raise FileNotFoundError(
+            "Could not locate Tiny-ImageNet 'train'/'val' folders. "
+            f"Tried roots: {tried}. If you pass the parent folder, the "
+            "dataset should appear at <parent>/tiny-imagenet-200/{train,val}. "
+            "If you pass the root, it should directly contain {train,val}."
+        )
 
     if seed is not None:
-        torch.manual_seed(seed)  # Set global seed for reproducibility
+        torch.manual_seed(seed)
 
-    # Define data transformations
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(64),
         transforms.RandomHorizontalFlip(),
@@ -270,8 +302,8 @@ def get_tiny_datasets(data_dir, batch_size, test_samples=10000, seed=None):
         ),
         transforms.ToTensor(),
         transforms.Normalize(
-            (0.4802, 0.4481, 0.3975), 
-            (0.2302, 0.2265, 0.2262)
+            (0.4802, 0.4481, 0.3975),
+            (0.2302, 0.2265, 0.2262),
         ),
     ])
 
@@ -279,33 +311,27 @@ def get_tiny_datasets(data_dir, batch_size, test_samples=10000, seed=None):
         transforms.Resize(64),
         transforms.ToTensor(),
         transforms.Normalize(
-            (0.4802, 0.4481, 0.3975), 
-            (0.2302, 0.2265, 0.2262)
+            (0.4802, 0.4481, 0.3975),
+            (0.2302, 0.2265, 0.2262),
         ),
     ])
 
-    # Define dataset directories
-    train_dir = f"{data_dir}/train"
-    test_dir = f"{data_dir}/val"
+    train_dir = os.path.join(dataset_root, "train")
+    val_dir = os.path.join(dataset_root, "val")
 
-    # Load the Tiny-ImageNet datasets
     train_dataset = datasets.ImageFolder(train_dir, transform=transform_train)
-    test_dataset = datasets.ImageFolder(test_dir, transform=transform_test)
+    test_dataset = datasets.ImageFolder(val_dir, transform=transform_test)
 
-    # Limit the number of test samples if necessary
-    if test_samples < len(test_dataset):
+    if test_samples is not None and test_samples < len(test_dataset):
         test_dataset, _ = random_split(
             test_dataset,
             [test_samples, len(test_dataset) - test_samples]
         )
 
-    # Create DataLoaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True
     )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size
-    )
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
     return train_loader, test_loader
 

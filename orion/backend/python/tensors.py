@@ -149,6 +149,9 @@ class CipherTensor:
     
     def __add__(self, other):
         return self.add(other, in_place=False)
+    
+    def __radd__(self, other):
+        return self.add(other, in_place=False)
 
     def __iadd__(self, other):
         return self.add(other, in_place=True)
@@ -182,6 +185,9 @@ class CipherTensor:
 
     def __isub__(self, other):
         return self.sub(other, in_place=True)
+
+    def __rsub__(self, other):
+        return self.sub(other, in_place=False)
     
     def mul(self, other, in_place=False):
         self._check_valid(other)
@@ -212,6 +218,9 @@ class CipherTensor:
 
     def __imul__(self, other):
         return self.mul(other, in_place=True)
+
+    def __rmul__(self, other):
+        return self.mul(other, in_place=False)
     
     def roll(self, amount, in_place=False):
         rot_ids = []

@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 
 from orion.nn.linear import LinearTransform
 
+
+
 class LevelDAG(nx.DiGraph):
     """
     The level digraph implementation from Section 5.2 of Orion:
@@ -152,7 +154,6 @@ class LevelDAG(nx.DiGraph):
     def build_layer(self, node: str):
         """Builds the next layer of nodes in the level DAG and estimates
            their latency, eventually used in shortest path."""
-
         level_dag_nodes = [f"{node}@l={i}" for i in range(self.l_eff+1)]
         self.add_nodes_from(level_dag_nodes)
 
@@ -172,10 +173,9 @@ class LevelDAG(nx.DiGraph):
         of bootstrapping. Even setting to zero every linear layer 
         latency here will not affect bootstrap counts.
         """
-
         if isinstance(module, nn.Identity):
             return 0
-        elif module and not hasattr(module, "depth"):
+        elif module and (module.depth == None):
             raise ValueError(
                 f"The multiplicative depth of the Orion module {module} "
                 f"cannot be automatically determined. Ensure it has a " 
@@ -218,9 +218,21 @@ class LevelDAG(nx.DiGraph):
         # Extract node information
         prev_path_node = prev_node.split("@")[0]
         prev_module = self.network_dag.nodes[prev_path_node]["module"]
+        prev_op = self.network_dag.nodes[prev_path_node]["op"]
         prev_level = int(prev_node.split("=")[-1])
         curr_level = int(curr_node.split("=")[-1])
-        
+
+        # Case 0: Previous module is a call_function
+        if prev_op == "call_function":
+            depth = 1 if "mul" in prev_path_node else 0 
+            if curr_level > prev_level - depth:
+                return (float("inf"), 0)
+
+            elif prev_level - depth <= 0:
+                return (float("inf"), 0)
+            else:
+                return (0,0)
+
         # Case 1: Previous module is None or Identity
         if prev_module is None or isinstance(prev_module, nn.Identity):
             if prev_level >= curr_level:
@@ -233,7 +245,7 @@ class LevelDAG(nx.DiGraph):
                 f"The multiplicative depth of the Orion module {prev_module} "
                 "cannot be automatically determined. Ensure it has a depth attribute."
             )
-        
+            
         # Case 3: Bootstrap required
         if curr_level > prev_level - prev_module.depth:
             if prev_level - prev_module.depth <= 0:
@@ -274,17 +286,24 @@ class LevelDAG(nx.DiGraph):
             # from a profiler, but the search space here is quite massive.
             a, b, c = 3.41, 0.18, 4.81
             t_boot = a * math.exp(b * self.l_eff) + c
-            num_boots_required = self.get_num_input_cts(prev_module)
+            num_boots_required = self.get_num_output_cts(prev_module)
+
 
             return (t_boot * num_boots_required, num_boots_required)
-
+        
         # Case 4: No bootstrap required
         return (0, 0)
 
-    def get_num_input_cts(self, module):
+    def get_num_output_cts(self, module):
         num_slots = module.scheme.params.get_slots()
-        num_elements = module.fhe_input_shape.numel()
-        return int(math.ceil(num_elements / num_slots))
+        
+        # This node may have multiple outgoing edges
+        if isinstance(module.fhe_output_shape, list):
+            num_elements = [shape.numel() for shape in module.fhe_output_shape]
+            return sum([math.ceil(e / num_slots) for e in num_elements])
+        
+        num_elements = module.fhe_output_shape.numel()
+        return math.ceil(num_elements / num_slots)
 
     def shortest_path(self, source, target):
         """Relaxation stage of topological sort."""

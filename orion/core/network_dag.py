@@ -1,38 +1,113 @@
+import torch
+import torch.fx as fx
 import networkx as nx
 import matplotlib.pyplot as plt
+import operator
 
 from orion.nn.normalization import BatchNormNd
+
 
 class NetworkDAG(nx.DiGraph):
     """
     Represents a neural network as a directed acyclic graph (DAG) using 
-    NetworkX. This class builds a DAG from a symbolic trace of a PyTorch 
-    network, identifies residual connections, and provides several useful 
-    methods that we will use in our automatic bootstrap placement algorithm. 
-    """
+    NetworkX. This class builds a DAG from a PyTorch network, identifies
+    residual connections, and provides several useful methods that we will 
+    use in our automatic bootstrap placement algorithm. 
+    """   
     def __init__(self, trace):
         super().__init__()
         self.trace = trace
-        self.residuals = {}
-
+        self.residuals = {}  # Maps fork nodes to their corresponding join nodes
+    
     def build_dag(self):
-        """Builds the DAG representation of the neural network based on 
-        the provided symbolic trace."""
-
+        """Extract computational graph from PyTorch model using torch.fx"""
+        
+        # Only keep nn.Modules, on.Modules, and basic arithmetic operations
+        # in the final network graph we pass onward.
+        keep_ops = {operator.add, operator.sub, operator.mul, 
+                    torch.add, torch.sub, torch.mul}
+        
+        nodes_to_keep = set()
         for node in self.trace.graph.nodes:
-            # If the user assumes a default layer parameter (e.g. bias=False)
-            # this will appear as an unconnected node with node.users = 0.
-            # It is fine to disregard these cases.
-            if len(node.users) > 0:
-                module = None
-                if node.op == "call_module":
-                    module = self.trace.get_submodule(node.target)
+            if node.op in ['call_module', 'placeholder']:
+                nodes_to_keep.add(node.name)
+            elif node.op == 'call_function' and node.target in keep_ops:
+                nodes_to_keep.add(node.name)
+        
+        # Build parent relationships including nested args
+        parent_map = {}
+        for node in self.trace.graph.nodes:
+            parent_map[node.name] = []
+            for arg in node.args:
+                if isinstance(arg, fx.Node):
+                    parent_map[node.name].append(arg.name)
+                elif isinstance(arg, (tuple, list)):
+                    for item in arg:
+                        if isinstance(item, fx.Node):
+                            parent_map[node.name].append(item.name)
+        
+        # Add nodes and edges, bridging over filtered nodes
+        for node in self.trace.graph.nodes:
+            if node.name not in nodes_to_keep:
+                continue
+            
+            label = f"{node.name}\n({node.op})"
+            
+            # Get actual module reference if this is a call_module
+            module = None
+            if node.op == "call_module":
+                module = self.trace.get_submodule(str(node.target))
+            
+            self.add_node(node.name, op=node.op, module=module, label=label)
+            
+            def get_sources(node_name):
+                # Recursively find kept nodes by traversing filtered parents
+                if node_name in nodes_to_keep:
+                    return [node_name]
+                sources = []
+                for parent in parent_map.get(node_name, []):
+                    sources.extend(get_sources(parent))
+                return sources
+            
+            for parent in parent_map[node.name]:
+                for source in get_sources(parent):
+                    if source != node.name:
+                        self.add_edge(source, node.name)
 
-                # Insert the node into the graph
-                self.add_node(node.name, fx_node=node, op=node.op, module=module)
-                for input_node in node.all_input_nodes:
-                    self.add_edge(input_node.name, node.name)
+        # Verify network works with automatic bootstrap placement
+        self._validate_single_output()
+    
+    def _validate_single_output(self):
+        """
+        Ensure the network has single entry and exit points by adding 
+        placeholder nodes if necessary. This is required for automatic 
+        bootstrap placement.
+        """
+        input_nodes = [n for n in self.nodes if self.in_degree(n) == 0]
+        output_nodes = [n for n in self.nodes if self.out_degree(n) == 0]
 
+        # Add a common placeholder parent for all input nodes
+        if len(input_nodes) > 1:
+            placeholder_input = "__placeholder_input__"
+            self.add_node(placeholder_input, op="placeholder", 
+                        module=None, label="placeholder_input")
+            for input_node in input_nodes:
+                self.add_edge(placeholder_input, input_node)
+        elif len(input_nodes) == 0:
+            # Handle edge case of empty graph
+            raise ValueError("Graph has no input nodes")
+
+        # Add a common placeholder child for all output nodes
+        if len(output_nodes) > 1:
+            placeholder_output = "__placeholder_output__"
+            self.add_node(placeholder_output, op="placeholder", 
+                        module=None, label="placeholder_output")
+            for output_node in output_nodes:
+                self.add_edge(output_node, placeholder_output)
+        elif len(output_nodes) == 0:
+            # Handle edge case of empty graph
+            raise ValueError("Graph has no output nodes")
+        
     def find_residuals(self):
         """Finds pairs of fork/join nodes representing residual connections. 
         We consider a fork (join) node to be any Orion module or arithmetic 
@@ -48,80 +123,114 @@ class NetworkDAG(nx.DiGraph):
         # subgraphs between pairs of fork/join nodes. This function nicely finds 
         # fork/join pairs and stores them in the self.residuals dictionary so 
         # we can reference them later.
-        topo = list(nx.topological_sort(self))
-        for start_node in list(self.nodes):
-            successors = list(self.successors(start_node))
+        changed = True
+        while changed:
+            changed = False
 
-            # Fork node found
-            if len(successors) > 1:
-                paths = []
-                # For each child of the node, get a path from that child to the 
-                # last node in the network.
-                for source in successors:
-                    path = nx.shortest_path(self, source, topo[-1])
-                    paths.append(set(path))
+            # Deterministic topo order: by generations, then by name in each gen
+            layers = list(nx.topological_generations(self))
+            order = [n for layer in layers for n in sorted(layer)]
 
-                # By set intersecting all paths from child -> end, we can find 
-                # nodes common between all paths.
-                common_nodes = list(set.intersection(*paths))
+            for node in order:
+                # Skip synthetic helpers
+                if self.nodes[node].get('op') in ['fork', 'join']:
+                    continue
 
-                # The join node is the "first" common node of the graph in 
-                # topological order.
-                end_node = [node for node in topo if node in common_nodes][0]
+                successors = list(self.successors(node))
+                predecessors = list(self.predecessors(node))
 
-                # Finally, we'll insert special (auxiliary) fork/join nodes into 
-                # the graph. This makes our automatic bootstrap placement 
-                # algorithm slightly cleaner.
-                fork, join = self.insert_fork_and_join_nodes(start_node, end_node)
-                self.residuals[fork] = join
-
-    def insert_fork_and_join_nodes(self, start, end):
-        """Inserts special fork/join nodes into the graph around the residual
-        connection. This makes our automatic bootstrap placement algorithm 
-        slightly cleaner."""
-
-        fork = f"{start}_fork"
-        join = f"{end}_join"
-
-        # Add fork/join nodes to the network
-        self.add_node(fork, op="fork", module=None)
-        self.add_node(join, op="join", module=None)
-
-        # Insert fork node and update edges
-        for child in list(self.successors(start)):
-            self.remove_edge(start, child)
-            self.add_edge(fork, child)
-        self.add_edge(start, fork)
-
-        # Insert join node and update edges
-        for parent in list(self.predecessors(end)):
-            self.remove_edge(parent, end)
-            self.add_edge(parent, join)
-        self.add_edge(join, end)
-
-        return fork, join
-
+                # Divergence -> try to bracket a residual
+                if len(successors) >= 2:
+                    convergence = self._find_convergence(node, successors)
+                    if convergence:
+                        self._process_residual(node, convergence)
+                        changed = True
+                        break
+    
+    def _find_convergence(self, node, successors):
+        """Find where diverging paths reconverge (residual pattern)"""
+        descendants = {s: {s} | nx.descendants(self, s) for s in successors}
+        topo_order = list(nx.topological_sort(self))
+        start_idx = topo_order.index(node)
+        
+        # Search forward in topological order
+        for candidate in topo_order[start_idx + 1:]:
+            if sum(candidate in desc for desc in descendants.values()) >= 2:
+                return candidate
+        return None
+    
+    def _process_residual(self, node, convergence):
+        """Create fork/join pair for residual connection"""
+        successors = list(self.successors(node))
+        fork = self._unique_name(f"{node}_fork")
+        join = self._unique_name(f"{convergence}_join")
+        
+        self.add_node(fork, op="fork", module=None, label=f"{fork}\n(fork)")
+        self.add_node(join, op="join", module=None, label=f"{join}\n(join)")
+        
+        # Identify which branches actually converge
+        converging = []
+        for s in successors:
+            if s == convergence or nx.has_path(self, s, convergence):
+                converging.append(s)
+        
+        for s in successors:
+            self.remove_edge(node, s)
+        
+        self.add_edge(node, fork)
+        
+        # Fork handles 2 branches (prefer ones that converge)
+        branches_for_fork = converging[:2] if len(converging) >= 2 else successors[:2]
+        for branch in branches_for_fork:
+            self.add_edge(fork, branch)
+        
+        # Non-forked branches stay connected to original node
+        remaining = [s for s in successors if s not in branches_for_fork]
+        for branch in remaining:
+            self.add_edge(node, branch)
+        
+        # Insert join before convergence point
+        fork_reach = {fork} | nx.descendants(self, fork)
+        for pred in list(self.predecessors(convergence)):
+            if pred in fork_reach:
+                self.remove_edge(pred, convergence)
+                self.add_edge(pred, join)
+        self.add_edge(join, convergence)
+        
+        self.residuals[fork] = join
+    
+    def _unique_name(self, base):
+        """Generate unique node name with counter suffix if needed"""
+        if base not in self.nodes:
+            return base
+        counter = 1
+        while f"{base}_{counter}" in self.nodes:
+            counter += 1
+        return f"{base}_{counter}"
+    
     def extract_residual_subgraph(self, fork):
-        """A helper function designed to extract the subgraphs between
-        the fork/join nodes of a residual connection."""
-
+        """Extract subgraph between a fork and its corresponding join"""
+        if fork not in self.residuals:
+            raise ValueError(f"{fork} is not a fork node")
+        
+        join = self.residuals[fork]
+        
+        # Collect all nodes/edges in paths from fork to join
         nodes_in_residual = set()
         edges_in_residual = set()
-
-        # Get all paths from fork -> join and build up a set of unique
-        # nodes/edges in its subgraph
-        join = self.residuals[fork]
+        
         for path in nx.all_simple_paths(self, fork, join):
             nodes_in_residual.update(path)
             edges_in_residual.update(zip(path[:-1], path[1:]))
-
-        # Rebuild the subgraph from the nodes/edges
-        residual_subgraph = nx.DiGraph()
-        residual_subgraph.add_nodes_from(nodes_in_residual)
-        residual_subgraph.add_edges_from(edges_in_residual)
-
-        return residual_subgraph
-
+        
+        # Build subgraph
+        subgraph = nx.DiGraph()
+        for node in nodes_in_residual:
+            subgraph.add_node(node, **self.nodes[node]) # Preserve node attributes
+        subgraph.add_edges_from(edges_in_residual)
+        
+        return subgraph
+    
     def remove_fused_batchnorms(self):
         """Removes BatchNorm nodes from the graph when it is known that they
         can be fused with preceding linear layers."""
@@ -129,7 +238,7 @@ class NetworkDAG(nx.DiGraph):
         for node in list(self.nodes):
             node_module = self.nodes[node]["module"]
             
-            if isinstance(node_module, BatchNormNd):
+            if isinstance(node_module, BatchNormNd) and node_module.fused:
                 # Get the parents and children of the batchnorm node
                 parent_nodes = list(self.predecessors(node))
                 child_nodes = list(self.successors(node))
@@ -146,23 +255,35 @@ class NetworkDAG(nx.DiGraph):
                     for child in child_nodes:
                         self.add_edge(parent, child)
                     self.remove_node(node)
-
+    
     def topological_sort(self):
         return nx.topological_sort(self)
-
-    def plot(self, save_path="", figsize=(10,10)):
-        """Plot the network digraph. For the best visualization, please install
-        Graphviz and PyGraphviz."""
-
+    
+    def plot(self, figsize=(15, 7.5), save_path=None):
+        """Visualize the DAG with color-coded node types"""
+        color_map = {
+            'placeholder': 'lightgreen',
+            'call_module': 'lightblue',
+            'call_function': 'lightyellow',
+            'fork': 'salmon',
+            'join': 'salmon',
+            'merge': 'orange'
+        }
+        
+        node_colors = [color_map.get(self.nodes[node]['op'], 'white') 
+                        for node in self.nodes()]
+        labels = nx.get_node_attributes(self, 'label')
+        
         try:
             pos = nx.nx_agraph.graphviz_layout(self, prog='dot')
         except:
-            print("Graphviz not installed. Defaulting to worse visualization.\n")
-            pos = nx.kamada_kawai_layout(self)
+            pos = nx.spring_layout(self, k=2, iterations=50)
         
         plt.figure(figsize=figsize)
-        nx.draw(self, pos, with_labels=True, arrows=True, font_size=8)
-
+        nx.draw(self, pos, labels=labels, node_color=node_colors,
+                node_size=1000, font_size=8, arrows=True, 
+                edge_color='gray', arrowsize=15)
+                
         if save_path:
-            plt.savefig(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.show()
