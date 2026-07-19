@@ -1,5 +1,6 @@
 import json
 import math
+import sys
 import time
 from os import makedirs
 from os.path import join
@@ -21,8 +22,8 @@ def compare(clear, fhe):
     }
 
 
-def run_fhe(model, dense, expanded_sparse):
-    orion.init_scheme("params.yaml")
+def run_fhe(model, dense, expanded_sparse, config="params.yaml"):
+    orion.init_scheme(config)
     orion.fit(model, [dense, expanded_sparse])
     input_level = orion.compile(model)
 
@@ -38,6 +39,7 @@ def run_fhe(model, dense, expanded_sparse):
 
 
 def main():
+    config = sys.argv[1] if len(sys.argv) > 1 else "params.yaml"
     model_dir = "model"
     out_dir = "fhe"
     makedirs(out_dir, exist_ok=True)
@@ -73,7 +75,7 @@ def main():
     model.eval()
     dense, expanded_sparse = model.fhe_input(dense, sparse_ids)
 
-    fhe_logit, runtime = run_fhe(model, dense, expanded_sparse)
+    fhe_logit, runtime = run_fhe(model, dense, expanded_sparse, config)
     result = compare(clear_logit, fhe_logit)
     result["runtime_seconds"] = runtime
 
