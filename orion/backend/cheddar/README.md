@@ -10,23 +10,49 @@ encrypt/decrypt, ct-ct/ct-pt/scalar arithmetic, rescale, rotation
 and bootstrap. `run_lola`/`run_mlp` run end to end;
 `tests/oracle/ --backend=cheddar` is 71/71, plus the `slow`-marked
 bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
-(`run_resnet`/`run_helrm` still need a `configs/resnet_cheddar.yml`,
-which doesn't exist yet.)
+
+- `run_resnet.py configs/resnet_cheddar.yml` (ResNet20/CIFAR-10) runs end
+  to end: MAE 0.0008, ~36s on a 24GB card, with
+  `ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1` (needed --
+  ResNet20's exact-key working set is ~90GB; see "Env knobs" below).
+- `examples/criteo/run_orion.py examples/criteo/params_cheddar.yaml`
+  (Criteo HE-LRM) is verified against a synthetic (untrained) instance of
+  the real architecture at `batch_size=16` (MAE 0.0004; 16 is a floor, not
+  a tuning choice -- HELRM's narrowest bootstrapped layer is 16 wide, and
+  Cheddar's `EvalSpecialFFT` hard-asserts `num_slots >= 256`). Needs the
+  same mitigations as ResNet20 plus `ORION_CHEDDAR_BOOT_MIN_KS=1`. Not yet
+  runnable through `run_orion.py`'s real entrypoint, which reads a trained
+  checkpoint (`model/model.pt`) that requires the actual Criteo dataset
+  and training run, neither of which has happened yet.
 
 ## Build
 
-1. Build Cheddar itself (once). Plain upstream, no patches needed:
+1. Build Cheddar itself (once). Clone plain upstream, then apply this
+   branch's 3 required patches from
+   [CHEDDAR_PATCHES.md](CHEDDAR_PATCHES.md) (`managed-memory`,
+   `evalpoly-argswap`, `boot-circuit-eviction` -- copy each diff block into
+   a file and `git apply` it; a 4th patch, `fused-rotate`, is documented
+   there too but isn't needed on this branch):
 
 ```bash
 git clone https://github.com/scale-snu/cheddar-fhe.git \
     matmul-encoding-material/cheddar
 cd matmul-encoding-material/cheddar
+git apply /path/to/managed-memory.patch
+git apply /path/to/evalpoly-argswap.patch
+git apply /path/to/boot-circuit-eviction.patch
 CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release -DUSE_GMP=ON \
     -DCMAKE_CUDA_ARCHITECTURES=86 \
     -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11
 cmake --build build -j
 ```
+
+Without these patches: native `EvalPoly` (polynomial degree >= 2, used for
+ResNet's composite ReLU/sign activation) crashes with an out-of-range
+access, and `RemoveEvalSpecialFFT`/`GetPeakDeviceMemoryMB` won't exist for
+the extension to link against -- see [CHEDDAR_PATCHES.md](CHEDDAR_PATCHES.md)
+for why each one is needed and what it does.
 
 Requires CMake >= 3.24 (`pip install cmake` if the system one is older)
 and network access on first configure (rmm via FetchContent). The
@@ -63,6 +89,8 @@ Examples:
 ```bash
 python examples/run_lola.py configs/lola_cheddar.yml
 python examples/run_mlp.py configs/mlp_cheddar.yml
+ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1 \
+    python examples/run_resnet.py configs/resnet_cheddar.yml
 ```
 
 Oracle tests:
@@ -73,9 +101,26 @@ pytest tests/oracle/ --backend=cheddar
 
 Env knobs:
 
-- `ORION_CHEDDAR_HOIST_MODE`: `none` (per-shift rotation loop) or
-  `single` (shared ModUp per batch, the default). Both build against
-  plain upstream Cheddar.
+- `ORION_CHEDDAR_HOIST_MODE` (read in `orion/core/orion.py`): `none`
+  (per-shift rotation loop) or `single` (shared ModUp per batch, the
+  default). Both work on plain upstream Cheddar; `single` is default.
+- `ORION_CHEDDAR_POW2_ROTATE=1`: swap per-layer exact-BSGS-distance
+  rotation keys for a fixed universal power-of-two key set (~log2(slots)
+  keys total, shared by every layer). Cuts ResNet20's key memory from
+  ~90GB to ~15GB at the cost of up to log2(slots) rotations per logical
+  shift instead of 1. Off (exact-key) by default.
+- `ORION_CHEDDAR_MANAGED_MEMORY=1` (read inside the vendored C++
+  `MemoryPool`, requires the `managed-memory` patch): page allocations
+  beyond VRAM to host RAM via CUDA managed memory instead of OOMing.
+  cuda_async (hard VRAM cap) by default.
+- `ORION_CHEDDAR_BOOT_MIN_KS=1`: generate the minimum rotation-key set
+  for bootstrap instead of the full set -- less memory, slower Boot. Off
+  by default.
+- `ORION_CHEDDAR_BOOT_EVICT=1` (requires the `boot-circuit-eviction`
+  patch): keep at most one boot circuit's CoeffToSlot/SlotToCoeff data
+  resident at a time, evicting others before preparing a new one, instead
+  of keeping every slot count a network needs simultaneously resident.
+  Off by default.
 
 ## Quirks discovered
 
