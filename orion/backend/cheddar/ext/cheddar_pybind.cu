@@ -854,6 +854,17 @@ std::vector<int> RotateBatchNew(int ct_id, std::vector<int> shifts,
 void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
                      int /*log_message_ratio*/, int slots) {
     ensure_keys();
+    // Cheddar's EvalSpecialFFT hard-asserts num_slots >= 256 (its FFT
+    // tables aren't built for anything sparser). Narrow layers -- e.g.
+    // HELRM's 16-wide embedding_features bootstrap -- request fewer slots
+    // than that. Clamp what we *prepare* to 256; BootContext::Boot()
+    // already rounds a ciphertext's real (smaller) GetNumSlots() up to
+    // the next slot count it finds prepared (GetBootEnabledNumSlots in
+    // BootContext.cpp), so preparing 256 here is sufficient for Boot() to
+    // pick it up transparently for any narrower ciphertext. The unused
+    // slots beyond the ciphertext's real width are already zero, so this
+    // only spends extra (wasted) FFT work, not incorrect results.
+    slots = std::max(slots, 256);
     // boot_context is built at setup_scheme time (as the shared context)
     // whenever boot_params are present. If it is missing, the scheme was
     // created without boot level knobs -- surface that clearly rather than
