@@ -1,7 +1,10 @@
-# Python 
+# Python
 
 *.DS_Store
 *data/
+
+# Confidential/reference PDFs (never commit)
+examples/criteo/*.pdf
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/
