@@ -24,7 +24,9 @@ Lets `MemoryPool`'s RMM upstream be swapped to `managed_memory_resource` via
 instead of OOMing (default `cuda_async` unchanged when unset). A
 `statistics_resource_adaptor` exposes `GetPeakDeviceBytes()` for the true
 logical peak regardless of physical residency — needed to measure and run
-ResNet20's real ~90GB working set on a 24GB card.
+ResNet20's real working set (exact-key mode: ~96-98GB; `POW2_ROTATE=1`:
+~24-28GB) on a 24GB card. See `README.md`'s "Memory" section for the full
+env-knob sweep.
 
 ```diff
 diff --git a/include/core/MemoryPool.h b/include/core/MemoryPool.h

@@ -37,6 +37,7 @@ from orion.core.utils import get_cifar_datasets
 from orion.core.fuser import Fuser
 from orion.core.network_dag import NetworkDAG
 from orion.core.auto_bootstrap import BootstrapSolver, BootstrapPlacer
+from orion.core import packing
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 
@@ -69,7 +70,7 @@ def instrumented_compile(scheme, net):
     net.set_scheme(scheme)
     net.set_margin(scheme.params.get_margin())
 
-    network_dag = NetworkDAG(scheme.traced)
+    network_dag = NetworkDAG(scheme.trace)
     network_dag.build_dag()
 
     for module in net.modules():
@@ -93,6 +94,12 @@ def instrumented_compile(scheme, net):
         if isinstance(module, LinearTransform):
             last_linear = node
             break
+
+    # Mirrors Scheme.compile() (orion/core/orion.py) -- without this, every
+    # layer would pack at the scheme's fixed global max slot width instead
+    # of its real physical width, silently measuring the pre-narrow-packing
+    # memory behavior regardless of what's actually on this branch.
+    packing.propagate_physical_slots(network_dag, topo_sort)
 
     print("\nGenerating matrix diagonals...", flush=True)
     for node in topo_sort:
