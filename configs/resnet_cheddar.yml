@@ -3,7 +3,12 @@ comment: "ResNet Parameter Set (Cheddar backend)"
 ckks_params:
   LogN: 16
   LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
-  LogP: [61, 61, 61]
+  # 7 aux primes (dnum=4, matching Cheddar's own paper/reference config),
+  # not the 3 inherited from the lattigo config template (dnum=8) -- see
+  # Parameter.cu's dnum formula. Measured no timing difference on this
+  # 24GB card (key-switching is bandwidth- not launch-count-bound here),
+  # but matches the paper's tuning and leaves headroom for a bigger GPU.
+  LogP: [61, 61, 61, 61, 61, 61, 61]
   LogScale: 40
   H: 192
   RingType: standard
