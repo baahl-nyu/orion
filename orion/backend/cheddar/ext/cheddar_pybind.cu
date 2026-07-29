@@ -510,6 +510,83 @@ int MulPlaintext(int ct_id, int pt_id) {
     return ct_id;
 }
 
+// Fused MAC: out = sum_i ct_i * pt_i in one ElementWiseHandler::PAccum
+// call instead of N ct-pt Mults + (N-1) Adds -- each of those is a
+// separate memory-bound elementwise pass over full ciphertexts, so
+// fusing them into one kernel (CPAccumWorker chunks internally by 8,
+// carrying partial sums through the trailing extra-ct slot, so any N
+// works) removes 2N-2 full-ciphertext memory round trips. Built purely
+// from public Context members (elem_handler_), same as
+// RotateBatchHoistedNew -- no cheddar source patch needed. Mirrors
+// HoistHandler::EvaluateSingleAccum's result setup (Hoist.cu).
+int MulPlaintextAccumNew(std::vector<int> ct_ids, std::vector<int> pt_ids) {
+    ensure_setup();
+    if (ct_ids.empty() || ct_ids.size() != pt_ids.size())
+        throw std::runtime_error(
+            "MulPlaintextAccumNew: ct_ids/pt_ids must be equal-length and "
+            "non-empty.");
+    if (ct_ids.size() == 1) return MulPlaintextNew(ct_ids[0], pt_ids[0]);
+
+    // Align everything to the lowest operand level (same policy as
+    // MulPlaintextNew: drop cts, re-encode pts).
+    int target = 1 << 30;
+    for (int id : ct_ids) target = std::min(target, level_of(g_state.ct(id)));
+    for (int id : pt_ids) target = std::min(target, level_of(g_state.pt(id)));
+
+    size_t n = ct_ids.size();
+    std::vector<std::unique_ptr<Ct>> tmp_cts(n);
+    std::vector<std::unique_ptr<Pt>> tmp_pts(n);
+    std::vector<const Ct*> cts(n);
+    std::vector<const Pt*> pts(n);
+    for (size_t i = 0; i < n; i++) {
+        const Ct& c = g_state.ct(ct_ids[i]);
+        if (c.HasRx())
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: operand is degree-2; relinearize "
+                "first.");
+        cts[i] = align_down(c, target, tmp_cts[i]);
+        const Pt& p = g_state.pt(pt_ids[i]);
+        pts[i] = (level_of(p) > target) ? align_pt(*cts[i], p, tmp_pts[i])
+                                        : &p;
+    }
+
+    const cheddar::NPInfo np = cts[0]->GetNP();
+    const double out_scale = cts[0]->GetScale() * pts[0]->GetScale();
+    int num_slots = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cts[i]->GetNP().GetNumQ() != np.GetNumQ() ||
+            cts[i]->GetNP().num_aux_ != np.num_aux_)
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: ciphertext NP mismatch after level "
+                "alignment.");
+        double s = cts[i]->GetScale() * pts[i]->GetScale();
+        if (std::abs(s - out_scale) > 1e-9 * out_scale)
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: inconsistent ct*pt scale products "
+                "across pairs.");
+        num_slots = std::max(
+            num_slots, std::max(cts[i]->GetNumSlots(), pts[i]->GetNumSlots()));
+    }
+
+    auto out = std::make_unique<Ct>();
+    out->RemoveRx();
+    out->ModifyNP(np);
+    out->SetScale(out_scale);
+    out->SetNumSlots(num_slots);
+    std::vector<cheddar::DvView<word>> out_view = out->ViewVector();
+
+    std::vector<std::vector<cheddar::DvConstView<word>>> ct_views;
+    std::vector<cheddar::DvConstView<word>> pt_views;
+    ct_views.reserve(n);
+    pt_views.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        ct_views.push_back(cts[i]->ConstViewVector());
+        pt_views.push_back(pts[i]->ConstView());
+    }
+    g_state.context->elem_handler_.PAccum(out_view, np, ct_views, pt_views);
+    return g_state.put_ct(std::move(out));
+}
+
 int AddPlaintextNew(int ct_id, int pt_id) {
     ensure_setup();
     const Ct& c = g_state.ct(ct_id);
@@ -1145,6 +1222,8 @@ PYBIND11_MODULE(_cheddar_native, m) {
     // ct - pt
     m.def("MulPlaintextNew", &MulPlaintextNew);
     m.def("MulPlaintext", &MulPlaintext);
+    m.def("MulPlaintextAccumNew", &MulPlaintextAccumNew, py::arg("ct_ids"),
+          py::arg("pt_ids"));
     m.def("AddPlaintextNew", &AddPlaintextNew);
     m.def("AddPlaintext", &AddPlaintext);
     m.def("SubPlaintextNew", &SubPlaintextNew);
