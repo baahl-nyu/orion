@@ -12,9 +12,12 @@ and bootstrap. `run_lola`/`run_mlp` run end to end;
 bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
 
 - `run_resnet.py configs/resnet_cheddar.yml` (ResNet20/CIFAR-10) runs end
-  to end: MAE 0.0008, ~36s on a 24GB card, with
-  `ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1` (needed --
-  ResNet20's exact-key working set is ~90GB; see "Env knobs" below).
+  to end: MAE 0.0003, ~30s on a 24GB card, with
+  `ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1
+  ORION_CHEDDAR_BOOT_EVICT=1` -- needed because ResNet20's exact-key
+  working set is ~96-102GB even with narrow per-layer slot packing (see
+  "Memory" below for the full env-knob sweep and why narrow packing
+  barely moves this number).
 - `examples/criteo/run_orion.py examples/criteo/params_cheddar.yaml`
   (Criteo HE-LRM) is verified against a synthetic (untrained) instance of
   the real architecture at `batch_size=16` (MAE 0.0004; 16 is a floor, not
@@ -106,9 +109,10 @@ Env knobs:
   default). Both work on plain upstream Cheddar; `single` is default.
 - `ORION_CHEDDAR_POW2_ROTATE=1`: swap per-layer exact-BSGS-distance
   rotation keys for a fixed universal power-of-two key set (~log2(slots)
-  keys total, shared by every layer). Cuts ResNet20's key memory from
-  ~90GB to ~15GB at the cost of up to log2(slots) rotations per logical
-  shift instead of 1. Off (exact-key) by default.
+  keys total, shared by every layer), at the cost of up to log2(slots)
+  rotations per logical shift instead of 1. Off (exact-key) by default.
+  This is the single biggest ResNet20 memory lever -- see "Memory" below
+  for exactly how much.
 - `ORION_CHEDDAR_MANAGED_MEMORY=1` (read inside the vendored C++
   `MemoryPool`, requires the `managed-memory` patch): page allocations
   beyond VRAM to host RAM via CUDA managed memory instead of OOMing.
@@ -121,6 +125,54 @@ Env knobs:
   resident at a time, evicting others before preparing a new one, instead
   of keeping every slot count a network needs simultaneously resident.
   Off by default.
+
+## Memory
+
+**The table below is measured WITH narrow per-layer slot packing**
+(current `cheddar-backend` HEAD, `orion/core/packing.py`'s
+`propagate_physical_slots`) -- full ResNet20/CIFAR-10 compile-time
+memory, swept across all 16 combinations of the four knobs above
+(`measure_resnet_memory.py`, `GetPeakDeviceMemoryMB`/`GetKeyMemoryMB`).
+All figures GiB.
+
+Without `MANAGED_MEMORY=1`: **every combination OOMs** on this 24GB
+card, regardless of the other three knobs -- there's no VRAM-only
+configuration that fits.
+
+With `MANAGED_MEMORY=1` (each row re-verified with a solo, non-concurrent
+rerun -- an earlier pass of this table ran pairs concurrently across two
+GPUs and mismeasured `BOOT_EVICT`'s column from cross-process contention;
+see below):
+
+| POW2_ROTATE | BOOT_MIN_KS | BOOT_EVICT | peak logical | key mem | VRAM resident |
+|---|---|---|---|---|---|
+| 0 (exact-key) | 0 | 0 | 98.3 | 76.6 | 23.6 |
+| 0 (exact-key) | 0 | 1 | 98.3 | 76.6 | 23.6 |
+| 0 (exact-key) | 1 | 0 | 95.8 | 74.9 | 23.6 |
+| 0 (exact-key) | 1 | 1 | 95.8 | 74.9 | 23.6 |
+| 1 | 0 | 0 | 28.4 | 5.9 | 22.5 |
+| 1 | 0 | 1 | 28.4 | 5.9 | 22.5 |
+| 1 | 1 | 0 | 24.3 | 3.7 | 20.4 |
+| 1 | 1 | 1 | 24.3 | 3.7 | 20.4 |
+
+**`BOOT_EVICT` shows no effect anywhere in this table**, on any of the
+three columns. That's not a measurement failure -- it only ever evicts a
+*previously* prepared boot circuit before building a *different* one, and
+every row above needs exactly one distinct boot slot count (16384) for
+the *entire* network (narrow per-layer slot packing pins all of
+ResNet20's bootstraps at `conv1`'s width). With nothing else ever
+prepared, there's nothing to evict. It would matter for a network that
+genuinely needs multiple slot counts across its bootstrap sites -- e.g.
+the pre-narrow-packing baseline, which needed 3 (16384/8192/4096, one per
+ResNet stage).
+
+`POW2_ROTATE` is what takes the working set from ~96-98GB down to
+~24-28GB, not narrow per-layer slot packing (`orion/core/packing.py`'s
+`propagate_physical_slots`), which only saves ~6% here (measured
+old-code-vs-new-code at the exact-key row above: 99.9GB -> 95.8GB) and
+0% in `POW2_ROTATE=1` mode (28.4GB both) -- its real win is runtime
+(49.44s -> 29.88s), not memory, since the peak is set by `conv1` alone
+(16384 of 32768 slots) either way.
 
 ## Quirks discovered
 
