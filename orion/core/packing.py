@@ -130,8 +130,144 @@ def _packing_panel(
 #   Packing Logic   #
 #-------------------#
 
+def shape_numel(shape):
+    """Total element count of a layer shape attribute (fhe_input_shape /
+    fhe_output_shape), tolerating the occasional list-of-shapes case (a
+    node with several distinct outgoing shapes) the same way
+    core/level_dag.py::get_num_output_cts does."""
+    if shape is None:
+        return 0
+    if isinstance(shape, (list, tuple)) and shape and not isinstance(shape[0], int):
+        return max((s.numel() for s in shape), default=0)
+    return shape.numel()
+
+def round_up_slots(elements, max_slots):
+    """Next power-of-two slot count that fits `elements`, floored at 256
+    (Cheddar's EvalSpecialFFT hard minimum) and capped at the scheme's
+    max slots."""
+    if elements <= 0:
+        return 0
+    val = 1 << math.ceil(math.log2(elements))
+    val = max(256, val)
+    if max_slots is not None:
+        val = min(max_slots, val)
+    return val
+
+def propagate_physical_slots(network_dag, topo_sort):
+    """Compute each layer's true *physical* ciphertext slot width by
+    walking the network in topological order, instead of letting every
+    layer assume the scheme's fixed global max.
+
+    Why this exists (cheddar-only concern): pack_conv2d/pack_linear used
+    to always pack against `scheme.params.get_slots()`, so every Cheddar
+    ciphertext ended up encoded at full width regardless of how few
+    elements were meaningful -- confirmed to silently defeat Cheddar's
+    own sparse-bootstrap circuit (see test_bootstrap_sparse[cheddar]).
+    This is gated to the cheddar backend only: lattigo/desilo's rotation
+    primitives were never verified to be safe with a narrower-than-global
+    packing width (unlike Cheddar's HRot, which was directly confirmed to
+    wrap modulo the ciphertext's own tracked width, not the full ring --
+    see Context.cpp::HRot in the local cheddar clone). For every other
+    backend this function is a pure no-op: every module gets `.slots`/
+    `.physical_slots` set to the scheme's global max, identical to the
+    pre-existing behavior, so lattigo/desilo are unaffected byte-for-byte.
+
+    Naively computing each layer's width independently from its own
+    shape is unsafe: the "hybrid" packing method's output-rotation fold
+    (see LinearTransform.evaluate_transforms) only *logically* compresses
+    a layer's output -- it never narrows the ciphertext's physical width
+    -- so a downstream layer computing its own width in isolation could
+    build diagonals for a different physical width than the ciphertext it
+    actually receives, causing silently wrong rotation wraparound. This
+    pass instead threads the *actual* physical width forward: a node's
+    input width is the max over its predecessors' physical output width
+    (this is what reconciles residual-add branches that could otherwise
+    diverge), and non-LinearTransform ops just relay it unchanged. Width
+    can only stay the same or grow here -- there is no resize primitive
+    (yet) to narrow it back down mid-network.
+
+    Sets `module.physical_slots` on every module in the DAG (so
+    auto_bootstrap.py's get_bootstrap_slots can reuse the same
+    authoritative value instead of recomputing its own), and additionally
+    `module.slots` on every LinearTransform (read directly by
+    pack_conv2d/pack_linear/evaluate_transforms).
+
+    Returns the physical width the network's own input must be encoded
+    at, i.e. whatever the first LinearTransform layer's packing requires.
+    """
+    max_slots = None
+    backend = None
+    output_width = {}
+    network_input_slots = None
+
+    for node in topo_sort:
+        module = network_dag.nodes[node]["module"]
+        preds = list(network_dag.predecessors(node))
+        pred_width = max((output_width[p] for p in preds), default=0)
+
+        if module is None:
+            output_width[node] = pred_width
+            continue
+
+        if max_slots is None:
+            max_slots = module.scheme.params.get_slots()
+            backend = module.scheme.params.get_backend()
+
+        if backend != "cheddar":
+            # No-op path for every other backend: deliberately do NOT
+            # touch .slots/.physical_slots here, leaving them at their
+            # class-level None default. Every consumer already falls
+            # back correctly when they're None -- pack_conv2d/
+            # pack_linear/evaluate_transforms via `self.slots or
+            # get_slots()`, auto_bootstrap.get_bootstrap_slots via an
+            # explicit `is not None` check. Setting them to max_slots
+            # here would look equivalent for packing (those consumers
+            # already default to the global max) but would silently
+            # override nn.operations.Bootstrap.compile()'s own
+            # `self.physical_slots or <narrower elements-based calc>`
+            # fallback -- permanently forcing full-width bootstraps for
+            # lattigo/desilo instead of the narrower sparse bootstrap
+            # they already correctly compute on their own from a
+            # layer's logical shape. output_width still needs a value
+            # for this loop's own bookkeeping, just not exposed here.
+            output_width[node] = max_slots
+            if network_input_slots is None and hasattr(module, "generate_diagonals"):
+                network_input_slots = max_slots
+            continue
+
+        own_input_elements = shape_numel(getattr(module, "fhe_input_shape", None))
+        input_width = pred_width
+        if own_input_elements:
+            input_width = max(input_width, round_up_slots(own_input_elements, max_slots))
+        if input_width == 0:
+            input_width = max_slots
+
+        is_linear_transform = hasattr(module, "generate_diagonals")
+        if is_linear_transform:
+            own_output_elements = shape_numel(module.fhe_output_shape)
+            width = max(input_width, round_up_slots(own_output_elements, max_slots))
+            width = min(max_slots, width)
+            module.slots = width
+            if network_input_slots is None:
+                # diagonalize() uses this same single `width` scalar as
+                # the block edge length for BOTH matrix dimensions (see
+                # packing.diagonalize's num_block_rows/num_block_cols),
+                # so the input ciphertext this layer consumes must
+                # already be encoded at `width`, not the narrower
+                # pre-output-max `input_width` -- that mismatch silently
+                # produced wrong rotation wraparound (caught by
+                # test_cheddar_narrow_packing.py's MAE assertion).
+                network_input_slots = width
+        else:
+            width = input_width
+
+        module.physical_slots = width
+        output_width[node] = width
+
+    return network_input_slots
+
 def pack_conv2d(conv_layer: nn.Module, last: bool):
-    slots = conv_layer.scheme.params.get_slots()
+    slots = conv_layer.slots or conv_layer.scheme.params.get_slots()
     embed_method = conv_layer.scheme.params.get_embedding_method()
 
     weight = conv_layer.on_weight
@@ -244,7 +380,7 @@ def construct_conv2d_bias(conv_layer):
     return bias_vector
 
 def pack_linear(linear_layer: nn.Module, last: bool):
-    slots = linear_layer.scheme.params.get_slots()
+    slots = linear_layer.slots or linear_layer.scheme.params.get_slots()
     embed_method = linear_layer.scheme.params.get_embedding_method()
 
     weight = construct_linear_matrix(linear_layer)

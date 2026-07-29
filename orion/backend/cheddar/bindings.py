@@ -584,14 +584,26 @@ class CheddarLibrary:
     def GenerateLinearTransform(self, diags_idxs, diags_data, level,
                                 bsgs_ratio, io_mode) -> int:
         num_diags = len(diags_idxs)
+        # values_per_diag is this transform's own authoritative slot
+        # width -- whatever packing.diagonalize() actually built each
+        # diagonal at (self.slots on the layer, propagated per-layer for
+        # cheddar; see packing.propagate_physical_slots). It used to
+        # always equal self._slots (the scheme's fixed global max) back
+        # when every layer packed at the global width unconditionally,
+        # which made the old `pad/truncate to self._slots` below a
+        # silent no-op. Now that layers can pack narrower, doing that
+        # padding would re-widen every diagonal back to the global max
+        # right before encoding it -- defeating narrow packing at the
+        # one place nothing else could catch it (each diagonal is still
+        # numerically correct zero-padded, so a layer evaluated in
+        # isolation looks fine; only a downstream layer, packed for the
+        # narrower width, then receives a wider-than-expected ciphertext
+        # and silently mis-wraps its own rotations).
         values_per_diag = len(diags_data) // num_diags
         diags: dict[int, list[float]] = {}
         for i, idx in enumerate(diags_idxs):
             start = i * values_per_diag
-            vals = list(diags_data[start:start + values_per_diag])
-            if len(vals) < self._slots:
-                vals = vals + [0.0] * (self._slots - len(vals))
-            diags[int(idx)] = vals[:self._slots]
+            diags[int(idx)] = list(diags_data[start:start + values_per_diag])
 
         use_bsgs = bsgs_ratio not in ("none", None) and len(diags) > 1
         bs = (max(1, math.ceil(math.sqrt(len(diags) * float(bsgs_ratio))))

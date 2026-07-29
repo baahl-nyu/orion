@@ -23,11 +23,12 @@ from orion.backend.python import (
     bootstrapper
 )
 
-from .tracer import OrionTracer, StatsTracker 
+from .tracer import OrionTracer, StatsTracker
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
 from .logger import logger as ORION_LOGGER
+from . import packing
 
 
 class Scheme:
@@ -54,6 +55,10 @@ class Scheme:
     def __init__(self):
         self.backend = None
         self.trace = None
+        # Physical slot width the network's own input must be encoded at,
+        # set by compile()'s physical-width propagation pass (cheddar
+        # only need this be non-default; see packing.propagate_physical_slots).
+        self.compiled_input_slots = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
         """Initializes the scheme."""
@@ -117,9 +122,18 @@ class Scheme:
                 f"further notice."
             )
 
-    def encode(self, tensor, level=None, scale=None):
+    def encode(self, tensor, level=None, scale=None, target_slots=None):
         self._check_initialization()
-        return self.encoder.encode(tensor, level, scale)
+        # The network's own input must land at whatever physical width
+        # the first compiled layer's packing expects (see
+        # packing.propagate_physical_slots) -- a no-op default
+        # (compiled_input_slots stays None) until compile() has run, and
+        # for non-cheddar backends it's just the scheme's global max.
+        # An explicit target_slots (e.g. a test encoding some other
+        # narrow plaintext post-compile) always takes precedence.
+        if target_slots is None:
+            target_slots = self.compiled_input_slots
+        return self.encoder.encode(tensor, level, scale, target_slots=target_slots)
 
     def decode(self, ptxt):
         self._check_initialization() 
@@ -246,7 +260,14 @@ class Scheme:
                 last_linear = node
                 break
 
-        # Now we can generate the diagonals 
+        # Determine each layer's true *physical* ciphertext slot width
+        # before packing, rather than letting every layer assume the
+        # scheme's fixed global max. See packing.propagate_physical_slots
+        # for why this matters (cheddar-only concern; no-op elsewhere).
+        self.compiled_input_slots = packing.propagate_physical_slots(
+            network_dag, topo_sort)
+
+        # Now we can generate the diagonals
         if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
             print("\n{3} Generating matrix diagonals...", flush=True)
         for node in topo_sort:
