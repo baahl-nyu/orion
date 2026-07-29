@@ -437,6 +437,14 @@ class CheddarLibrary:
     def MulPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintextNew(int(ct_id), int(pt_id))
 
+    def MulPlaintextAccumNew(self, ct_ids: Sequence[int],
+                             pt_ids: Sequence[int]) -> int:
+        """Fused MAC: sum_i ct_i * pt_i in one native PAccum kernel chain
+        instead of N ct-pt mults + N-1 adds (each a separate memory-bound
+        pass over full ciphertexts)."""
+        return _native.MulPlaintextAccumNew(
+            [int(c) for c in ct_ids], [int(p) for p in pt_ids])
+
     def MulPlaintext(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintext(int(ct_id), int(pt_id))
 
@@ -667,15 +675,14 @@ class CheddarLibrary:
     def _eval_lt_naive(self, ct_id: int, diags: dict[int, list[float]],
                        pt_ids: dict[int, int]) -> int:
         # Every diagonal rotates the same input ct -- hoist them as one
-        # batch (k=0 uses the input directly, as before).
+        # batch (k=0 uses the input directly), then fold the whole
+        # rotate*diag sum into one fused MAC call.
         rots = self._rotate_lt_batch(ct_id, [k for k in diags if k != 0])
-        result = None
-        for k in diags:
-            rotated = rots.get(k, ct_id)
-            prod = self.MulPlaintextNew(rotated, pt_ids[k])
-            if rotated != ct_id:
-                self.DeleteCiphertext(rotated)
-            result = prod if result is None else self._lt_accumulate(result, prod)
+        ks = list(diags)
+        result = self.MulPlaintextAccumNew(
+            [rots.get(k, ct_id) for k in ks], [pt_ids[k] for k in ks])
+        for rot in rots.values():
+            self.DeleteCiphertext(rot)
         return result
 
     def _eval_lt_bsgs(self, ct_id: int, diags: dict[int, list[float]],
@@ -697,10 +704,11 @@ class CheddarLibrary:
 
         result = None
         for g, group in giant_groups.items():
-            inner = None
-            for b, k in group:
-                prod = self.MulPlaintextNew(baby_rots[b], pt_ids[k])
-                inner = prod if inner is None else self._lt_accumulate(inner, prod)
+            # One fused MAC per giant group: sum_b baby_rots[b] * diag_k
+            # replaces len(group) mults + len(group)-1 adds.
+            inner = self.MulPlaintextAccumNew(
+                [baby_rots[b] for b, _ in group],
+                [pt_ids[k] for _, k in group])
 
             partial = self._rotate_lt(inner, g * bs)
             if partial is not inner:
