@@ -285,9 +285,79 @@ index fcc6b7a..ee825d2 100644
                                               bool min_ks) const {
 ```
 
+### 4. `fused-dispatch-beta1`
+
+Fixes a one-element dispatch gap in `HoistHandler`'s two fused kernels.
+Both `BSFusedKeyMult` and `GSFusedPAccum` pick a compile-time-padded
+kernel instantiation with `constexpr_for<1, ...>`, i.e. starting at
+padded size 2 — so `num_accum == 1` (a single decomposition digit,
+beta = 1) and `num_bs == 1` (a single baby-step index) match no
+instantiation and the kernel silently never launches, leaving the
+output zero. No error, no assert: the accumulation just doesn't happen.
+
+Upstream bug, not an Orion workaround — but upstream's own bootstrap
+never trips it, because boot circuits run at high levels where the digit
+count is always ≥ 2. It surfaces the moment `HoistHandler` is used where
+it's most attractive: hoisted (double-hoisted) linear transforms
+mid-network at low levels, where `num_q ≤ alpha` gives beta = 1. Without
+this patch the `ORION_CHEDDAR_DOUBLE_HOIST` path in `bindings.py`
+produces wrong results (giant-step term only, baby contributions zero)
+at low levels; with it, all oracle LT tests pass at ~3e-8.
+
+The fix starts the dispatch at padded size 1 (`constexpr_for<0, ...>`)
+and guards the lower-bound check, which is ill-formed for `i == 0`.
+
+```diff
+diff --git a/src/extension/Hoist.cu b/src/extension/Hoist.cu
+index f561b66..35f6d3e 100644
+--- a/src/extension/Hoist.cu
++++ b/src/extension/Hoist.cu
+@@ -324,10 +324,20 @@ void HoistHandler<word>::BSFusedKeyMult(
+   AssertTrue(num_accum <= (1 << max_log_beta_),
+              "num_accum should not be greater than " +
+                  std::to_string(1 << max_log_beta_));
+-  constexpr_for<1, max_log_beta_ + 1>([&](auto i) {
++  // ORION_PATCH (fused-dispatch-beta1): the dispatch used to start at
++  // i=1, so num_accum == 1 (beta == 1: low-level inputs, num_q <= alpha)
++  // matched no instantiation and the kernel silently never launched --
++  // every baby-step rotation came back zero. Bootstrap never hits this
++  // (its circuits run at high levels where beta >= 2), so it only
++  // surfaces when using the hoisted path at low levels, e.g. hoisted
++  // linear transforms mid-network. Start at i=0 (padded size 1) and
++  // guard the lower-bound check, which is ill-formed for i == 0.
++  constexpr_for<0, max_log_beta_ + 1>([&](auto i) {
+     constexpr int num_accum_padded = 1 << i;
+     if (num_accum > num_accum_padded) return;
+-    if (num_accum <= (1 << (i - 1))) return;
++    if constexpr (i > 0) {
++      if (num_accum <= (1 << (i - 1))) return;
++    }
+     kernel::BSFusedKernel<word, num_accum_padded><<<grid_dim, block_dim>>>(
+         dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), modup_d_ptrs.data(),
+         key_b_d_ptrs.data(), key_a_d_ptrs.data(), num_accum, num_rotations,
+@@ -436,10 +446,15 @@ void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
+   dim3 block_dim(kernel_block_dim_);
+   dim3 grid_dim(num_primes * context->param_.degree_ / kernel_block_dim_);
+ 
+-  constexpr_for<1, max_log_bs_ + 1>([&](auto i) {
++  // ORION_PATCH (fused-dispatch-beta1): same one-element dispatch gap as
++  // BSFusedKeyMult above -- num_bs == 1 (a single baby-step index)
++  // matched no instantiation and the accumulation silently stayed zero.
++  constexpr_for<0, max_log_bs_ + 1>([&](auto i) {
+     constexpr int num_bs_padded = 1 << i;
+     if (num_bs > num_bs_padded) return;
+-    if (num_bs <= (1 << (i - 1))) return;
++    if constexpr (i > 0) {
++      if (num_bs <= (1 << (i - 1))) return;
++    }
+     kernel::GSFusedKernel<word, num_bs_padded><<<grid_dim, block_dim>>>(
+         dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), bx_d_ptrs.data(),
+         ax_d_ptrs.data(), mx_d_ptrs.data(), num_bs, num_gs, primes, inv_primes);
+```
+
 ## Not used on `cheddar-backend`
 
-### 4. `fused-rotate`
+### 5. `fused-rotate`
 
 Makes `HoistHandler::BSFusedKeyMult` public and static (plus adds
 `PopulateCM`) so an external caller can run a fused hoisted N-way rotation

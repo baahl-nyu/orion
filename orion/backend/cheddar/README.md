@@ -131,6 +131,19 @@ Env knobs:
   resident at a time, evicting others before preparing a new one, instead
   of keeping every slot count a network needs simultaneously resident.
   Off by default.
+- `ORION_CHEDDAR_DOUBLE_HOIST=1` (requires the `fused-dispatch-beta1`
+  patch): evaluate every linear transform through Cheddar's native
+  double-hoisted `HoistHandler` (fused baby-step KeyMult + fused
+  giant-step plaintext accumulation, output pre-rescaled) instead of the
+  Python BSGS loop. Numerically verified (oracle LTs ~3e-8, ResNet MAE
+  0.0003) but **off by default: slower on a 24GB/64-bit setup** — the
+  hoist-map plaintext cache lives in the extended (q+p) basis, ~40GB for
+  ResNet20, and streaming it through UVM costs more than the fused
+  kernels save (measured 32.1s vs 25.6s at `SHARED_BS=64`; see the nsys
+  attribution in the ablation section). Expected to become profitable
+  with the 32-bit word build and/or cards the pt cache fits in. The
+  hoist baby-step count follows `ORION_CHEDDAR_SHARED_BS` when set,
+  else each LT's natural `ceil(sqrt(num_diags))`.
 
 ## Memory & runtime (env-knob ablation)
 
