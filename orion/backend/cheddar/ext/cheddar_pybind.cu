@@ -882,10 +882,9 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
     // ORION_CHEDDAR_BOOT_EVICT=1: keep at most one slot count's
     // CoeffToSlot/SlotToCoeff data (BootContext's eval_fft_) resident at a
     // time, evicting every other prepared slot count before preparing this
-    // one. In pow2-rotate mode this is where nearly all boot-circuit memory
-    // actually lives (see RESNET_MEMORY.md) -- the rotation keys pow2 mode
-    // uses are a small, fixed, slot-count-independent set (never evicted
-    // here), so this never frees a key another slot count still needs.
+    // one. Rotation keys are never evicted here (they live in the shared
+    // EvkMap, slot-count-independent), so this never frees a key another
+    // slot count still needs.
     // Orion's placement generates all of a network's boot slot counts
     // during compile(), before inference starts, so without this a network
     // needing N slot counts keeps all N resident simultaneously -- fine

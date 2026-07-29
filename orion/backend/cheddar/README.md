@@ -12,18 +12,20 @@ and bootstrap. `run_lola`/`run_mlp` run end to end;
 bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
 
 - `run_resnet.py configs/resnet_cheddar.yml` (ResNet20/CIFAR-10) runs end
-  to end: MAE 0.0003, ~30s on a 24GB card, with
-  `ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1
-  ORION_CHEDDAR_BOOT_EVICT=1` -- needed because ResNet20's exact-key
-  working set is ~96-102GB even with narrow per-layer slot packing (see
-  "Memory" below for the full env-knob sweep and why narrow packing
-  barely moves this number).
+  to end: MAE 0.0003, 25.6 +/- 0.8s (3 trials) on a 24GB card, with
+  `ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_SHARED_BS=64
+  ORION_CHEDDAR_BOOT_MIN_KS=1` (~41GB peak working set, paged via managed
+  memory -- see "Memory" below for the full env-knob ablation).
 - `examples/criteo/run_orion.py examples/criteo/params_cheddar.yaml`
   (Criteo HE-LRM) is verified against a synthetic (untrained) instance of
   the real architecture at `batch_size=16` (MAE 0.0004; 16 is a floor, not
   a tuning choice -- HELRM's narrowest bootstrapped layer is 16 wide, and
-  Cheddar's `EvalSpecialFFT` hard-asserts `num_slots >= 256`). Needs the
-  same mitigations as ResNet20 plus `ORION_CHEDDAR_BOOT_MIN_KS=1`. Not yet
+  Cheddar's `EvalSpecialFFT` hard-asserts `num_slots >= 256`). Was
+  validated with the since-removed `POW2_ROTATE` knob (see "Memory &
+  runtime" below); needs re-validation under exact-key mode
+  (`ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_BOOT_MIN_KS=1`; its
+  exact-key working set is unmeasured, and `SHARED_BS=64` was tuned on
+  ResNet20's diagonal profile, not HELRM's). Not yet
   runnable through `run_orion.py`'s real entrypoint, which reads a trained
   checkpoint (`model/model.pt`) that requires the actual Criteo dataset
   and training run, neither of which has happened yet.
@@ -92,7 +94,8 @@ Examples:
 ```bash
 python examples/run_lola.py configs/lola_cheddar.yml
 python examples/run_mlp.py configs/mlp_cheddar.yml
-ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_MANAGED_MEMORY=1 \
+ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_SHARED_BS=64 \
+    ORION_CHEDDAR_BOOT_MIN_KS=1 \
     python examples/run_resnet.py configs/resnet_cheddar.yml
 ```
 
@@ -107,12 +110,15 @@ Env knobs:
 - `ORION_CHEDDAR_HOIST_MODE` (read in `orion/core/orion.py`): `none`
   (per-shift rotation loop) or `single` (shared ModUp per batch, the
   default). Both work on plain upstream Cheddar; `single` is default.
-- `ORION_CHEDDAR_POW2_ROTATE=1`: swap per-layer exact-BSGS-distance
-  rotation keys for a fixed universal power-of-two key set (~log2(slots)
-  keys total, shared by every layer), at the cost of up to log2(slots)
-  rotations per logical shift instead of 1. Off (exact-key) by default.
-  This is the single biggest ResNet20 memory lever -- see "Memory" below
-  for exactly how much.
+- `ORION_CHEDDAR_SHARED_BS=<int>`: use one fixed BSGS baby-step stride for
+  every linear-transform block network-wide instead of each layer picking
+  its own `ceil(sqrt(num_diags * bsgs_ratio))`. Per-layer strides are
+  locally optimal but make giant-step rotation distances incommensurate
+  across layers (multiples of a different stride each), so their keys
+  never overlap; one shared stride makes both baby and giant keys
+  reusable across layers. `64` cuts ResNet20's distinct rotation keys
+  from 362 to 134 (key mem 43.2GB -> 16.2GB). Unset by default
+  (per-layer behavior).
 - `ORION_CHEDDAR_MANAGED_MEMORY=1` (read inside the vendored C++
   `MemoryPool`, requires the `managed-memory` patch): page allocations
   beyond VRAM to host RAM via CUDA managed memory instead of OOMing.
@@ -126,53 +132,59 @@ Env knobs:
   of keeping every slot count a network needs simultaneously resident.
   Off by default.
 
-## Memory
+## Memory & runtime (env-knob ablation)
 
-**The table below is measured WITH narrow per-layer slot packing**
-(current `cheddar-backend` HEAD, `orion/core/packing.py`'s
-`propagate_physical_slots`) -- full ResNet20/CIFAR-10 compile-time
-memory, swept across all 16 combinations of the four knobs above
-(`measure_resnet_memory.py`, `GetPeakDeviceMemoryMB`/`GetKeyMemoryMB`).
-All figures GiB.
+**All figures below are measured WITH narrow per-layer slot packing**
+(`orion/core/packing.py`'s `propagate_physical_slots`) and the
+`dnum=4` config (`LogP` x7 in `configs/resnet_cheddar.yml`) -- full
+ResNet20/CIFAR-10 runs (`debug: false`), solo sequential (never
+concurrent -- concurrent managed-memory runs contaminate each other's
+measurements), 2026-07-29. Peak/key mem via
+`GetPeakDeviceMemoryMB`/`GetKeyMemoryMB`, all figures GiB, MAE 0.0003
+in every row.
 
-Without `MANAGED_MEMORY=1`: **every combination OOMs** on this 24GB
-card, regardless of the other three knobs -- there's no VRAM-only
-configuration that fits.
+Without `MANAGED_MEMORY=1`: **every configuration OOMs** on this 24GB
+card -- there's no VRAM-only configuration that fits. With
+`MANAGED_MEMORY=1`:
 
-With `MANAGED_MEMORY=1` (each row re-verified with a solo, non-concurrent
-rerun -- an earlier pass of this table ran pairs concurrently across two
-GPUs and mismeasured `BOOT_EVICT`'s column from cross-process contention;
-see below):
+| SHARED_BS | BOOT_MIN_KS | runtime | key mem | peak logical |
+|---|---|---|---|---|
+| unset | 0 | 29.7s | 44.2 | 71.0 |
+| unset | 1 | 29.2s | 43.3 | 69.2 |
+| 64 | 0 | 28.9s | 16.5 | 44.7 |
+| 64 | 1 | **25.8s** | **16.2** | **41.1** |
 
-| POW2_ROTATE | BOOT_MIN_KS | BOOT_EVICT | peak logical | key mem | VRAM resident |
-|---|---|---|---|---|---|
-| 0 (exact-key) | 0 | 0 | 98.3 | 76.6 | 23.6 |
-| 0 (exact-key) | 0 | 1 | 98.3 | 76.6 | 23.6 |
-| 0 (exact-key) | 1 | 0 | 95.8 | 74.9 | 23.6 |
-| 0 (exact-key) | 1 | 1 | 95.8 | 74.9 | 23.6 |
-| 1 | 0 | 0 | 28.4 | 5.9 | 22.5 |
-| 1 | 0 | 1 | 28.4 | 5.9 | 22.5 |
-| 1 | 1 | 0 | 24.3 | 3.7 | 20.4 |
-| 1 | 1 | 1 | 24.3 | 3.7 | 20.4 |
+Notes on reading this table:
 
-**`BOOT_EVICT` shows no effect anywhere in this table**, on any of the
-three columns. That's not a measurement failure -- it only ever evicts a
-*previously* prepared boot circuit before building a *different* one, and
-every row above needs exactly one distinct boot slot count (16384) for
-the *entire* network (narrow per-layer slot packing pins all of
-ResNet20's bootstraps at `conv1`'s width). With nothing else ever
-prepared, there's nothing to evict. It would matter for a network that
-genuinely needs multiple slot counts across its bootstrap sites -- e.g.
-the pre-narrow-packing baseline, which needed 3 (16384/8192/4096, one per
-ResNet stage).
+- Neither knob moves runtime alone; only the combination does. The win
+  is likely paging-mediated (total working set small enough to ease UVM
+  pressure), so it's a property of this 24GB card -- re-ablate
+  `BOOT_MIN_KS` on a card that fits the working set in VRAM before
+  assuming it still helps there (its boot path trades chained rotations
+  for fewer keys, a pure loss once paging is free).
+- **`BOOT_EVICT` is omitted: it has no effect for this network** (its
+  column was byte-identical in an earlier 16-combo sweep). It only
+  evicts a *previously* prepared boot circuit before building a
+  *different* one, and narrow packing pins all of ResNet20's bootstraps
+  at one slot count (16384, `conv1`'s width) -- nothing else is ever
+  prepared, so there's nothing to evict. It still matters for networks
+  genuinely needing multiple boot slot counts (e.g. the
+  pre-narrow-packing baseline needed 3: 16384/8192/4096).
+- Narrow packing's memory contribution is small (~6% at exact-key,
+  measured 99.9GB -> 95.8GB pre-`dnum=4`); its real win is runtime
+  (49.44s -> 29.88s). The big memory levers are `dnum=4` (~96GB -> ~70GB)
+  and `SHARED_BS` (44GB -> 16GB of keys).
 
-`POW2_ROTATE` is what takes the working set from ~96-98GB down to
-~24-28GB, not narrow per-layer slot packing (`orion/core/packing.py`'s
-`propagate_physical_slots`), which only saves ~6% here (measured
-old-code-vs-new-code at the exact-key row above: 99.9GB -> 95.8GB) and
-0% in `POW2_ROTATE=1` mode (28.4GB both) -- its real win is runtime
-(49.44s -> 29.88s), not memory, since the peak is set by `conv1` alone
-(16384 of 32768 slots) either way.
+**Killed after this ablation: `ORION_CHEDDAR_POW2_ROTATE`** (compose
+every rotation from a fixed universal power-of-two key set, ~log2(slots)
+keys total). It was the original "fit on 24GB" lever (~24-28GB total),
+but the ablation showed it buys no runtime in any combination (28.9-29.7s,
+same band as exact-key vanilla; its up-to-log2(slots)-HRots-per-rotation
+chain offsets the smaller key set), and its memory advantage is moot
+since `MANAGED_MEMORY=1` is mandatory on this card either way. Exact-key
+`SHARED_BS=64 + BOOT_MIN_KS=1` is both faster and small enough. Removed
+from `bindings.py` (`git log -S POW2_ROTATE` for the history); exact-key
+is now the only rotation-key mode.
 
 ## Quirks discovered
 
