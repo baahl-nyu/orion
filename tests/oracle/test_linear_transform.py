@@ -28,7 +28,10 @@ class TestLinearTransform:
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
 
         # Rescale after linear transform
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         # Decrypt the raw ciphertext ID
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
@@ -55,7 +58,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)
@@ -82,7 +88,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)
@@ -110,7 +119,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)

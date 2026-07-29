@@ -19,6 +19,7 @@
 #include <core/MemoryPool.h>
 #include <extension/BootContext.h>
 #include <extension/EvalPoly.h>
+#include <extension/Hoist.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -90,6 +91,16 @@ struct BackendState {
     std::map<int, std::unique_ptr<Ct>> ciphertexts;
     int next_pt_id = 1;
     int next_ct_id = 1;
+
+    // Double-hoisted linear transforms: native HoistHandler per LT block
+    // (see GenerateHoistLT below). pt_level recorded per handler because
+    // HoistHandler asserts its input arrives at exactly that level.
+    struct HoistLT {
+        std::unique_ptr<cheddar::HoistHandler<word>> handler;
+        int pt_level;
+    };
+    std::map<int, HoistLT> hoist_lts;
+    int next_hoist_lt_id = 1;
 
     int put_pt(std::unique_ptr<Pt> pt) {
         int id = next_pt_id++;
@@ -269,6 +280,7 @@ int setup_scheme(py::dict params) {
 void delete_scheme() {
     g_state.plaintexts.clear();
     g_state.ciphertexts.clear();
+    g_state.hoist_lts.clear();
     g_state.rot_keys.clear();
     g_state.boot_prepared_slots.clear();
     g_state.eval_mod_prepared = false;
@@ -586,6 +598,109 @@ int MulPlaintextAccumNew(std::vector<int> ct_ids, std::vector<int> pt_ids) {
     g_state.context->elem_handler_.PAccum(out_view, np, ct_views, pt_views);
     return g_state.put_ct(std::move(out));
 }
+
+// ---------------------------------------------------------------------------
+// Double-hoisted linear transform (native HoistHandler)
+// ---------------------------------------------------------------------------
+// Wraps cheddar's HoistHandler (extension/Hoist.h, the Bossuat et al.
+// EUROCRYPT'21 double-hoisting BSGS): baby-step rotations share one ModUp
+// AND stay fused (BSFusedKeyMult: KeyMult+MAC+automorphism in one kernel
+// when beta fits), giant-step accumulation runs GSFusedPAccum +
+// PermuteAccum, and the final ModDown folds the rescale in for free
+// (EvaluateFinalModDown -> ModDownAndRescale). The PlainHoistMap is built
+// directly from Orion's diagonals -- LinearTransform's square/power-of-two
+// factory constraint does NOT apply to HoistHandler itself.
+//
+// Conventions (match the Python BSGS path exactly): with HRot(ct,k)[i] =
+// ct[i+k], Evaluate computes res[i] = sum_gs sum_bs pt[gs][bs][i+gs] *
+// input[i+gs+bs]; we need res[i] = sum_k diag_k[i]*input[i+k] for
+// k = gs+bs, so pt[gs][bs] = roll(diag_k, +gs) -- the same giant-step
+// pre-roll GenerateLinearTransform bakes into its cached plaintexts.
+//
+// The output is ALREADY rescaled (level pt_level-1, scale
+// input_scale*pt_scale/q[pt_level]) -- callers must skip their usual
+// post-LT rescale (bindings.py advertises this via lt_output_prerescaled).
+//
+// Key set: read back from the constructed handler via
+// AddRequiredRotations, never recomputed externally -- the constructor
+// can swap bs/gs for single-giant-group maps (kOptimizeAutomorphism),
+// changing which distances it needs.
+
+int GenerateHoistLT(std::vector<int> diags_idxs, std::vector<double> diags_data,
+                    int level, int bs) {
+    ensure_setup();
+    const size_t num_diags = diags_idxs.size();
+    if (num_diags == 0 || diags_data.size() % num_diags != 0)
+        throw std::runtime_error(
+            "GenerateHoistLT: empty or ragged diagonal data.");
+    const size_t width = diags_data.size() / num_diags;
+    if (bs < 1) throw std::runtime_error("GenerateHoistLT: bs must be >= 1.");
+
+    cheddar::PlainHoistMap hoist_map;
+    for (size_t i = 0; i < num_diags; i++) {
+        int k = diags_idxs[i];
+        if (k < 0 || static_cast<size_t>(k) >= width)
+            throw std::runtime_error(
+                "GenerateHoistLT: diagonal index out of [0, width).");
+        int b = k % bs;
+        int g = k - b;
+        cheddar::Message msg(width, Complex(0.0, 0.0));
+        const double* src = diags_data.data() + i * width;
+        // pt[g][b][j'] = diag_k[j' - g]  (roll by +g)
+        for (size_t j = 0; j < width; j++)
+            msg[(j + g) % width] = Complex(src[j], 0.0);
+        hoist_map[g].emplace(b, std::move(msg));
+    }
+
+    BackendState::HoistLT entry;
+    entry.handler = std::make_unique<cheddar::HoistHandler<word>>(
+        g_state.context, hoist_map, level, g_state.default_scale);
+    entry.pt_level = level;
+    int id = g_state.next_hoist_lt_id++;
+    g_state.hoist_lts[id] = std::move(entry);
+    return id;
+}
+
+std::vector<int> GetHoistLTRotationKeys(int hlt_id) {
+    auto it = g_state.hoist_lts.find(hlt_id);
+    if (it == g_state.hoist_lts.end())
+        throw std::out_of_range("HoistLT id " + std::to_string(hlt_id) +
+                                " not found");
+    cheddar::EvkRequest req;
+    it->second.handler->AddRequiredRotations(req, /*min_ks=*/false);
+    std::vector<int> keys;
+    keys.reserve(req.size());
+    for (const auto& [rot, lvl] : req) keys.push_back(rot);
+    return keys;
+}
+
+int EvaluateHoistLT(int hlt_id, int ct_id) {
+    ensure_keys();
+    auto it = g_state.hoist_lts.find(hlt_id);
+    if (it == g_state.hoist_lts.end())
+        throw std::out_of_range("HoistLT id " + std::to_string(hlt_id) +
+                                " not found");
+    const Ct& c = g_state.ct(ct_id);
+    if (c.HasRx())
+        throw std::runtime_error(
+            "EvaluateHoistLT: input is degree-2; relinearize first.");
+    std::unique_ptr<Ct> tmp;
+    const Ct* input = align_down(c, it->second.pt_level, tmp);
+    if (level_of(*input) != it->second.pt_level)
+        throw std::runtime_error(
+            "EvaluateHoistLT: input level below the transform's pt_level.");
+    auto out = std::make_unique<Ct>();
+    // Shared max-level key map: BSFusedKeyMult handles key level >=
+    // input level fine (key_extra/num_accum_offset alignment) once the
+    // fused-dispatch-beta1 patch is in -- verified empirically at
+    // level 3 with max-level keys. No per-level key material needed.
+    it->second.handler->Evaluate(g_state.context, *out, *input,
+                                 g_state.iface->GetEvkMap(),
+                                 /*min_ks=*/false);
+    return g_state.put_ct(std::move(out));
+}
+
+void DeleteHoistLT(int hlt_id) { g_state.hoist_lts.erase(hlt_id); }
 
 int AddPlaintextNew(int ct_id, int pt_id) {
     ensure_setup();
@@ -1224,6 +1339,15 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("MulPlaintext", &MulPlaintext);
     m.def("MulPlaintextAccumNew", &MulPlaintextAccumNew, py::arg("ct_ids"),
           py::arg("pt_ids"));
+
+    // Double-hoisted linear transform
+    m.def("GenerateHoistLT", &GenerateHoistLT, py::arg("diags_idxs"),
+          py::arg("diags_data"), py::arg("level"), py::arg("bs"));
+    m.def("GetHoistLTRotationKeys", &GetHoistLTRotationKeys,
+          py::arg("hlt_id"));
+    m.def("EvaluateHoistLT", &EvaluateHoistLT, py::arg("hlt_id"),
+          py::arg("ct_id"));
+    m.def("DeleteHoistLT", &DeleteHoistLT, py::arg("hlt_id"));
     m.def("AddPlaintextNew", &AddPlaintextNew);
     m.def("AddPlaintext", &AddPlaintext);
     m.def("SubPlaintextNew", &SubPlaintextNew);

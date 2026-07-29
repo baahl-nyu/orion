@@ -161,6 +161,18 @@ class CheddarLibrary:
         shared_bs_env = os.environ.get("ORION_CHEDDAR_SHARED_BS", "").strip()
         self._shared_bs = int(shared_bs_env) if shared_bs_env else None
 
+        # ORION_CHEDDAR_DOUBLE_HOIST=1: evaluate every linear-transform
+        # block through the native HoistHandler (Bossuat et al.
+        # EUROCRYPT'21 double hoisting: fused baby-step
+        # KeyMult+MAC+automorphism sharing one ModUp, fused giant-step
+        # accumulation, final ModDown with the rescale folded in) instead
+        # of the Python-orchestrated BSGS loop. The native output is
+        # already rescaled -- lt_output_prerescaled tells lt_evaluator to
+        # skip its usual post-LT rescale. Off by default until verified.
+        dh_env = os.environ.get("ORION_CHEDDAR_DOUBLE_HOIST", "").lower()
+        self._double_hoist = dh_env in ("1", "true", "yes", "on")
+        self.lt_output_prerescaled = self._double_hoist
+
         self._default_scale: int | None = None
         self._max_level: int | None = None
         self._slots: int | None = None
@@ -602,6 +614,24 @@ class CheddarLibrary:
         else:
             bs = None
 
+        # Double-hoisted path: hand the raw diagonals to the native
+        # HoistHandler (it pre-encodes its own per-(gs,bs) plaintexts with
+        # the giant-step roll baked in, so the Python-side pt cache below
+        # is skipped entirely). ALL blocks route through it when enabled --
+        # mixing native (pre-rescaled) and Python (unrescaled) blocks in
+        # one accumulation row would mismatch scales.
+        if self._double_hoist:
+            hoist_bs = bs if bs is not None else max(
+                1, math.ceil(math.sqrt(max(1, len(diags)))))
+            hoist_id = _native.GenerateHoistLT(
+                [int(k) for k in diags],
+                [float(v) for vals in diags.values() for v in vals],
+                int(level), int(hoist_bs))
+            lt_id = self._next_lt_id
+            self._next_lt_id += 1
+            self._transforms[lt_id] = {"hoist_id": hoist_id}
+            return lt_id
+
         # Encode every diagonal's plaintext once, here at compile time,
         # instead of on every EvaluateLinearTransform call. Diagonal values
         # are the model's fixed trained weights -- they never depend on the
@@ -636,7 +666,15 @@ class CheddarLibrary:
         return self._transforms[lt_id]["bs"]
 
     def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
-        diags = self._transforms[lt_id]["diags"]
+        t = self._transforms[lt_id]
+        if "hoist_id" in t:
+            # Ask the constructed handler -- it may have swapped bs/gs
+            # internally (single-giant-group optimization), changing
+            # which distances it needs. Keys land in the shared
+            # max-level map via the normal AddRotationKey flow; the
+            # fused kernels handle key level >= input level.
+            return list(_native.GetHoistLTRotationKeys(t["hoist_id"]))
+        diags = t["diags"]
         if not self._lt_use_bsgs(lt_id):
             return sorted(k for k in diags if k != 0)
         bs = self._lt_bsgs_stride(lt_id)
@@ -654,6 +692,8 @@ class CheddarLibrary:
 
     def EvaluateLinearTransform(self, lt_id: int, ct_id: int) -> int:
         t = self._transforms[lt_id]
+        if "hoist_id" in t:
+            return _native.EvaluateHoistLT(t["hoist_id"], int(ct_id))
         if t["use_bsgs"]:
             return self._eval_lt_bsgs(ct_id, t["diags"], t["bs"], t["pt_ids"])
         return self._eval_lt_naive(ct_id, t["diags"], t["pt_ids"])
@@ -728,9 +768,13 @@ class CheddarLibrary:
 
     def DeleteLinearTransform(self, lt_id: int) -> None:
         t = self._transforms.pop(lt_id, None)
-        if t is not None:
-            for pt_id in t["pt_ids"].values():
-                self.DeletePlaintext(pt_id)
+        if t is None:
+            return
+        if "hoist_id" in t:
+            _native.DeleteHoistLT(t["hoist_id"])
+            return
+        for pt_id in t["pt_ids"].values():
+            self.DeletePlaintext(pt_id)
 
     def RemoveRotationKeys(self) -> None:
         """No-op. Cheddar caches rotation keys natively; no release path."""
