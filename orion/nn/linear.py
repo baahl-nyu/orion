@@ -20,6 +20,15 @@ class LinearTransform(Module):
         self.transform_ids = {} # ids[(row, col)] = int
         self.output_rotations = 0
 
+        # Physical ciphertext slot width this layer was packed against.
+        # Set by packing.propagate_physical_slots() during compile(),
+        # before generate_diagonals() runs. Falls back to the scheme's
+        # global slots (the old, always-full-width behavior) if the
+        # propagation pass hasn't run -- e.g. lattigo/desilo, where
+        # packing width has always been the global constant.
+        self.slots = None
+        self.physical_slots = None
+
     def __del__(self):
         if 'sys' in globals() and sys.modules and self.scheme:
             try:
@@ -66,8 +75,12 @@ class LinearTransform(Module):
     def evaluate_transforms(self, x):
         out = self.scheme.lt_evaluator.evaluate_transforms(self, x)
 
-        # Hybrid method's output rotations
-        slots = self.scheme.params.get_slots()
+        # Hybrid method's output rotations. Must use the exact same slot
+        # width diagonalize() used when computing self.output_rotations
+        # at pack time (see packing.py::diagonalize) -- these roll
+        # amounts are only correct relative to that width, not the
+        # scheme's global max.
+        slots = self.slots or self.scheme.params.get_slots()
         for i in range(1, self.output_rotations+1):
             out += out.roll(slots // (2**i))
 
@@ -131,7 +144,8 @@ class Linear(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_linear_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        self.on_bias_ptxt = self.scheme.encoder.encode(
+            bias, self.level-self.depth, target_slots=self.slots)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
     
     def forward(self, x):
@@ -240,7 +254,8 @@ class Conv2d(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_conv2d_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        self.on_bias_ptxt = self.scheme.encoder.encode(
+            bias, self.level-self.depth, target_slots=self.slots)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
     def forward(self, x):

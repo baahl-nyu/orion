@@ -44,6 +44,11 @@ class Bootstrap(Module):
         self.prescale = 1
         self.postscale = 1
         self.constant = 0
+        # Set by BootstrapPlacer._create_bootstrapper to the producing
+        # layer's true physical ciphertext width (may exceed
+        # fhe_input_shape.numel() -- see that call site). None on
+        # non-cheddar backends / before propagate_physical_slots ran.
+        self.physical_slots = None
 
     def extra_repr(self):
         l_eff = len(self.scheme.params.get_logq()) - 1
@@ -68,14 +73,20 @@ class Bootstrap(Module):
         # We'll then encode the prescale at the level of the input ciphertext
         # to ensure its rescaling is errorless
         elements = self.fhe_input_shape.numel()
-        curr_slots = 2 ** math.ceil(math.log2(elements))
+        # Prefer the producing layer's actual physical width over a value
+        # derived purely from this shape -- they can diverge (see
+        # BootstrapPlacer._create_bootstrapper), and prescale_ptxt must be
+        # encoded at the ciphertext's *real* width or the multiply in
+        # forward() silently misaligns.
+        curr_slots = self.physical_slots or (2 ** math.ceil(math.log2(elements)))
 
         prescale_vec = torch.zeros(curr_slots)
         prescale_vec[:elements] = self.prescale
 
         ql = self.scheme.encoder.get_moduli_chain()[self.input_level]
         self.prescale_ptxt = self.scheme.encoder.encode(
-            prescale_vec, level=self.input_level, scale=ql)
+            prescale_vec, level=self.input_level, scale=ql,
+            target_slots=curr_slots)
 
     @timer
     def forward(self, x):
