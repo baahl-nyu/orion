@@ -144,17 +144,22 @@ class CheddarLibrary:
         self._hoist_mode = self._HOIST_MODE_BY_NAME[hoist_mode]
         self._hoist_mode_name = hoist_mode
 
-        # ORION_CHEDDAR_POW2_ROTATE=1: instead of a dedicated native key per
-        # exact (per-layer, BSGS-derived) rotation distance, decompose every
-        # rotation into a chain over a fixed universal power-of-two key set
-        # (~log2(slots) keys total, shared by every layer and never
-        # regenerated). Trades a large chunk of resident key memory --
-        # ResNet20's per-layer keys are the dominant cost, see
-        # RESNET_MEMORY.md -- for more rotations per layer (up to
-        # log2(slots) native HRot calls instead of 1 per BSGS distance).
-        # Default off: unchanged exact-key behavior.
-        env = os.environ.get("ORION_CHEDDAR_POW2_ROTATE", "").lower()
-        self._pow2_rotate = env in ("1", "true", "yes", "on")
+        # ORION_CHEDDAR_SHARED_BS=<int>: use ONE fixed BSGS baby-step stride
+        # for every linear-transform block network-wide, instead of each
+        # layer independently picking bs = ceil(sqrt(num_diags*bsgs_ratio))
+        # (locally optimal per layer, but produces incommensurate giant-step
+        # distances -- multiples of a different bs per layer -- so distinct
+        # rotation keys almost never overlap across layers). A shared bs
+        # makes baby keys (0..bs-1, already cheap/shared) and giant keys
+        # (multiples of the SAME bs everywhere) both eligible for cross-layer
+        # reuse via the existing global key cache. Mathematically safe for
+        # any bs >= 1 (b, g = k % bs, k // bs always partitions correctly);
+        # this is a pure memory/reuse tradeoff, not a correctness knob.
+        # Measured on ResNet20 (exact-key mode): bs=64 cuts total distinct
+        # rotation keys network-wide from 362 to 134 (~2.7x). Default unset:
+        # unchanged per-layer-independent behavior.
+        shared_bs_env = os.environ.get("ORION_CHEDDAR_SHARED_BS", "").strip()
+        self._shared_bs = int(shared_bs_env) if shared_bs_env else None
 
         self._default_scale: int | None = None
         self._max_level: int | None = None
@@ -496,46 +501,23 @@ class CheddarLibrary:
         # Keys are generated lazily inside the native RotateNew.
         return _native.RotateNew(int(ct_id), int(k))
 
-    def _pow2_universal_keys(self) -> list[int]:
-        """Fixed key set used by _rotate_lt in pow2 mode: every power of
-        two up to (but not including) the full slot count. log2(slots)
-        keys total, shared by every layer -- never grows with network
-        depth or per-layer diagonal count, unlike exact BSGS distances."""
-        keys = []
-        p = 1
-        while p < self._slots:
-            keys.append(p)
-            p *= 2
-        return keys
-
     def _rotate_lt(self, ct_id: int, k: int) -> int:
-        """Rotate by k for linear-transform evaluation. Exact mode (default)
-        just calls RotateNew, which lazily generates a dedicated key for
-        this exact distance. Pow2 mode (ORION_CHEDDAR_POW2_ROTATE=1)
-        instead decomposes k into a chain of rotations over the fixed
-        universal power-of-two key set -- more native HRot calls per
-        logical rotation (up to log2(slots), one per set bit), but the
-        key set stops growing with network depth. See __init__.
+        """Rotate by k for linear-transform evaluation. RotateNew lazily
+        generates a dedicated key for this exact distance; cross-layer key
+        reuse comes from ORION_CHEDDAR_SHARED_BS (see __init__).
+
+        A POW2_ROTATE mode used to live here (decompose k into a chain of
+        rotations over a fixed universal power-of-two key set, trading up
+        to log2(slots) HRots per logical rotation for a tiny key set).
+        Removed after the 2026-07-29 runtime ablation: it had no runtime
+        benefit in any combination (28.9-29.7s, same band as exact-key),
+        and its memory advantage is moot since MANAGED_MEMORY is required
+        on this 24GB card either way -- exact-key + SHARED_BS=64 +
+        BOOT_MIN_KS=1 is both faster and small enough (41GB peak).
         """
         if k == 0:
             return ct_id
-        if not self._pow2_rotate:
-            return self.RotateNew(ct_id, k)
-
-        current = ct_id
-        owns_current = False
-        power = 1
-        remaining = k
-        while remaining:
-            if remaining & 1:
-                nxt = self.RotateNew(current, power)
-                if owns_current:
-                    self.DeleteCiphertext(current)
-                current = nxt
-                owns_current = True
-            remaining >>= 1
-            power *= 2
-        return current
+        return self.RotateNew(ct_id, k)
 
     def RotateBatchNew(self, ct_id: int, ks: Sequence[int]) -> list[int]:
         """N rotations of one ciphertext.
@@ -606,8 +588,11 @@ class CheddarLibrary:
             diags[int(idx)] = list(diags_data[start:start + values_per_diag])
 
         use_bsgs = bsgs_ratio not in ("none", None) and len(diags) > 1
-        bs = (max(1, math.ceil(math.sqrt(len(diags) * float(bsgs_ratio))))
-              if use_bsgs else None)
+        if use_bsgs:
+            bs = (self._shared_bs if self._shared_bs is not None else
+                  max(1, math.ceil(math.sqrt(len(diags) * float(bsgs_ratio)))))
+        else:
+            bs = None
 
         # Encode every diagonal's plaintext once, here at compile time,
         # instead of on every EvaluateLinearTransform call. Diagonal values
@@ -643,13 +628,6 @@ class CheddarLibrary:
         return self._transforms[lt_id]["bs"]
 
     def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
-        # Pow2 mode never needs per-layer exact distances -- _rotate_lt
-        # composes any rotation from the fixed universal set instead, so
-        # pre-generating the exact BSGS distances here would just waste
-        # memory on keys _eval_lt_{naive,bsgs} will never call RotateNew
-        # with directly.
-        if self._pow2_rotate:
-            return self._pow2_universal_keys()
         diags = self._transforms[lt_id]["diags"]
         if not self._lt_use_bsgs(lt_id):
             return sorted(k for k in diags if k != 0)
