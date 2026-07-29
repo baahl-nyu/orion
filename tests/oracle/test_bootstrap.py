@@ -114,13 +114,27 @@ def _normalize_and_bootstrap(scheme, ctxt, values, num_active_slots, margin=2.0)
     constant = -(low + high) / 2
 
     slots = scheme.params.get_slots()
-    prescale_vec = torch.zeros(slots, dtype=torch.float64)
-    prescale_vec[:num_active_slots] = prescale
+    if scheme.params.get_backend() == "cheddar":
+        # Encode the prescale mask at its own narrow width (mirroring
+        # nn.operations.Bootstrap.compile()) rather than the scheme's
+        # global max -- otherwise the mask's *physical* ciphertext width
+        # stays full-size regardless of num_active_slots, and the
+        # multiply below silently re-widens ctxt right before bootstrap,
+        # defeating the sparse circuit generate_bootstrapper(num_active_slots)
+        # explicitly prepared for it.
+        narrow_width = min(slots, max(256, 1 << math.ceil(math.log2(num_active_slots))))
+        prescale_vec = torch.zeros(narrow_width, dtype=torch.float64)
+        prescale_vec[:num_active_slots] = prescale
+    else:
+        narrow_width = None
+        prescale_vec = torch.zeros(slots, dtype=torch.float64)
+        prescale_vec[:num_active_slots] = prescale
 
     if constant != 0:
         ctxt = ctxt + constant
 
-    prescale_ptxt = scheme.encode(prescale_vec, level=ctxt.level())
+    prescale_ptxt = scheme.encode(
+        prescale_vec, level=ctxt.level(), target_slots=narrow_width)
     ctxt = ctxt * prescale_ptxt
 
     ctxt_btp = ctxt.bootstrap()
@@ -184,7 +198,14 @@ class TestBootstrap:
         scheme.bootstrapper.generate_bootstrapper(num_values)
 
         values = [float(i + 1) for i in range(num_values)]
-        ptxt = scheme.encode(values)
+        # Encode at the narrow width itself for cheddar -- mixing a
+        # narrow-encoded plaintext/ciphertext with a full-width one in
+        # the same op is its own mismatch (distinct from the prescale
+        # mask width handled in _normalize_and_bootstrap below); both
+        # operands must agree on physical width throughout.
+        target_slots = (num_values if scheme.params.get_backend() == "cheddar"
+                        else None)
+        ptxt = scheme.encode(values, target_slots=target_slots)
         ctxt = scheme.encrypt(ptxt)
 
         max_level = scheme.params.get_max_level()
