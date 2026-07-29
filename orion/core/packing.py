@@ -214,11 +214,22 @@ def propagate_physical_slots(network_dag, topo_sort):
             backend = module.scheme.params.get_backend()
 
         if backend != "cheddar":
-            # No-op path: preserve the exact pre-existing behavior for
-            # every other backend (always the scheme's global max).
-            if hasattr(module, "generate_diagonals"):
-                module.slots = max_slots
-            module.physical_slots = max_slots
+            # No-op path for every other backend: deliberately do NOT
+            # touch .slots/.physical_slots here, leaving them at their
+            # class-level None default. Every consumer already falls
+            # back correctly when they're None -- pack_conv2d/
+            # pack_linear/evaluate_transforms via `self.slots or
+            # get_slots()`, auto_bootstrap.get_bootstrap_slots via an
+            # explicit `is not None` check. Setting them to max_slots
+            # here would look equivalent for packing (those consumers
+            # already default to the global max) but would silently
+            # override nn.operations.Bootstrap.compile()'s own
+            # `self.physical_slots or <narrower elements-based calc>`
+            # fallback -- permanently forcing full-width bootstraps for
+            # lattigo/desilo instead of the narrower sparse bootstrap
+            # they already correctly compute on their own from a
+            # layer's logical shape. output_width still needs a value
+            # for this loop's own bookkeeping, just not exposed here.
             output_width[node] = max_slots
             if network_input_slots is None and hasattr(module, "generate_diagonals"):
                 network_input_slots = max_slots
