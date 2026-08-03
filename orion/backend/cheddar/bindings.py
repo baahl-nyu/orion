@@ -1027,13 +1027,34 @@ class CheddarLibrary:
         domain_min, domain_max = -1.0, 1.0
         current_gap = gap
 
+        # Each stage's fit interval is inflated beyond the previous
+        # stage's CLEAR output range: the actual FHE input to stage i+1
+        # is stage i's output plus accumulated ciphertext noise, and a
+        # least-squares Chebyshev fit is completely unconstrained
+        # outside its fitted interval -- a degree-27 tail can hit +-75
+        # within 10% past the edge. Measured on the 32-bit chain
+        # (word32 seed 5, ResNet20 layers_1_0_act1): stage-1 clear
+        # output +-1.0x, FHE input to stage 2 reached +-1.103 -> stage-2
+        # output exploded to [-57, +75] and corrupted the whole
+        # inference, deterministically per noise draw (~40% of draws).
+        # Fitting over 1.25x the clear range keeps every stage
+        # sign-like across the entire noise-reachable interval; costs a
+        # slightly coarser fit of the same degree (ResNet20 MAE 0.0003
+        # -> 0.0006), nothing at runtime. Applied in word32 mode only:
+        # 64-bit noise never approaches the cliff (no corruption in
+        # dozens of runs), so its fit -- and its documented benchmark
+        # numbers -- stay bit-identical.
+        noise_domain_margin = 1.25 if _WORD32 else 1.0
+
         coeffs_flat: list[float] = []
         for i, deg in enumerate(degrees):
             is_last = (i == len(degrees) - 1)
             n_pts = max(8 * deg, 500)
 
-            x_neg = np.linspace(domain_min, -current_gap, n_pts)
-            x_pos = np.linspace(current_gap, domain_max, n_pts)
+            fit_min = domain_min * noise_domain_margin
+            fit_max = domain_max * noise_domain_margin
+            x_neg = np.linspace(fit_min, -current_gap, n_pts)
+            x_pos = np.linspace(current_gap, fit_max, n_pts)
             x = np.concatenate([x_neg, x_pos])
             y = np.where(x > 0, 1.0, 0.0) if is_last else np.sign(x)
 
@@ -1041,8 +1062,10 @@ class CheddarLibrary:
             coeffs_flat.extend(coeffs[:deg + 1].tolist())
 
             if not is_last:
-                dense_neg = np.linspace(domain_min, -current_gap, 2000)
-                dense_pos = np.linspace(current_gap, domain_max, 2000)
+                # Next stage's domain = this stage's output over the
+                # whole noise-reachable (inflated) input interval.
+                dense_neg = np.linspace(fit_min, -current_gap, 2000)
+                dense_pos = np.linspace(current_gap, fit_max, 2000)
                 dense = np.concatenate([dense_neg, dense_pos])
                 output = self._eval_chebyshev_standard_basis(dense, coeffs)
 
