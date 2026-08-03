@@ -27,12 +27,25 @@ from typing import Sequence
 
 import numpy as np
 
+# ORION_CHEDDAR_WORD32=1: use the uint32_t twin module. ~30-bit primes,
+# rational rescaling -- Cheddar's native design point (its paper's 0.72s
+# ResNet numbers are 32-bit), halving the memory footprint of every
+# ciphertext/key/plaintext. Requires a pregenerated chain file (see
+# params32/ and ORION_CHEDDAR_PARAMS_JSON below); LogQ/LogP bit lists
+# cannot express these chains.
+_WORD32 = os.environ.get("ORION_CHEDDAR_WORD32", "").lower() in (
+    "1", "true", "yes", "on")
+
 try:
-    from . import _cheddar_native as _native
+    if _WORD32:
+        from . import _cheddar_native32 as _native
+    else:
+        from . import _cheddar_native as _native
 except ImportError as e:  # pragma: no cover - import-time diagnostic
     raise ImportError(
-        "Could not import _cheddar_native. Build the extension via the "
-        "CMake steps in orion/backend/cheddar/README.md. "
+        f"Could not import {'_cheddar_native32' if _WORD32 else '_cheddar_native'}. "
+        "Build the extension via the CMake steps in "
+        "orion/backend/cheddar/README.md. "
         f"Underlying error: {e}"
     ) from None
 
@@ -254,6 +267,10 @@ class CheddarLibrary:
         self._boot_log_message_ratio = (
             orion_params.get_boot_log_message_ratio() or 5)
 
+        if _WORD32:
+            self._setup_scheme_word32(logq, logp, logscale, logn)
+            return
+
         used: set[int] = set()
         main_primes = _gen_primes(logq, logn, used)
         default_enc_level = len(main_primes) - 1  # usable-chain top
@@ -315,6 +332,117 @@ class CheddarLibrary:
             setup_args["BootMinKs"] = env in ("1", "true", "yes", "on")
 
         self._generation = _native.setup_scheme(setup_args)
+
+    def _setup_scheme_word32(self, logq, logp, logscale, logn) -> None:
+        """32-bit-word setup from a pregenerated chain file.
+
+        ~2^40 scales cannot be one ~30-bit prime per level, so word32
+        chains use rational rescaling: each level's rescale divides by a
+        multi-prime product (main + rotating terminal primes) that only
+        approximates 2^LogScale, described by an explicit LevelConfig.
+        These are pregenerated (Cheddar ships reference chains in
+        parameters/; ours is vendored under params32/) and passed through
+        verbatim -- the YAML's LogQ/LogP entries are nominal placeholders
+        whose only meaningful property is their COUNT, which must match
+        the chain so Orion's level accounting (bootstrap placement, depth
+        budgeting) agrees with the native scheme.
+        """
+        import json
+
+        json_path = os.environ.get("ORION_CHEDDAR_PARAMS_JSON", "").strip()
+        if not json_path:
+            json_path = os.path.join(
+                os.path.dirname(__file__), "params32", "bootparam_40.json")
+        with open(json_path) as f:
+            chain = json.load(f)
+
+        if logn != chain["log_degree"]:
+            raise ValueError(
+                f"word32: YAML LogN={logn} != chain log_degree="
+                f"{chain['log_degree']} ({json_path})")
+        if logscale != chain["log_default_scale"]:
+            raise ValueError(
+                f"word32: YAML LogScale={logscale} != chain "
+                f"log_default_scale={chain['log_default_scale']} ({json_path})")
+        enc_level = int(chain["default_encryption_level"])
+        if len(logq) - 1 != enc_level:
+            raise ValueError(
+                f"word32: YAML LogQ has {len(logq)} entries (usable max "
+                f"level {len(logq) - 1}) but the chain's "
+                f"default_encryption_level is {enc_level}. The chain is "
+                f"rigid (boot circuit levels are baked in), so the YAML "
+                f"must declare exactly {enc_level + 1} LogQ entries "
+                f"({json_path}).")
+
+        chain_boot = bool(chain.get("boot", False))
+        if self._boot_enabled and not chain_boot:
+            raise ValueError(
+                f"word32: YAML requests bootstrap but chain {json_path} "
+                f"has boot=false.")
+        # Filled in after native setup (needs the live Parameter): see
+        # the GetCanonicalScales call below.
+        self._usable_primes = []
+
+        max_level = len(chain["level_config"]) - 1
+        print(f"[Cheddar] Creating CKKS context (word32): LogN={logn}, "
+              f"chain={os.path.basename(json_path)}, scale=2^{logscale}, "
+              f"slots={self._slots}, hoist_mode={self._hoist_mode_name}, "
+              f"boot={'on' if chain_boot else 'off'}, "
+              f"max_level={max_level}, default_enc_level={enc_level}")
+
+        setup_args = {
+            "LogN": logn,
+            "LogScale": logscale,
+            "MainPrimes": list(chain["main_primes"]),
+            "AuxPrimes": list(chain["auxiliary_primes"]),
+            "TerPrimes": list(chain.get("terminal_primes", [])),
+            "LevelConfig": [list(p) for p in chain["level_config"]],
+            "AdditionalBase": list(chain.get("additional_base", [0, 0])),
+            "DefaultEncryptionLevel": enc_level,
+        }
+        if "dense_hamming_weight" in chain:
+            setup_args["DenseHammingWeight"] = int(
+                chain["dense_hamming_weight"])
+        if "sparse_hamming_weight" in chain:
+            setup_args["SparseHammingWeight"] = int(
+                chain["sparse_hamming_weight"])
+
+        if chain_boot:
+            # Boot geometry comes from the chain (its reserved levels are
+            # part of the pregenerated structure); YAML knobs must agree
+            # if present.
+            cts = int(chain["num_cts_levels"])
+            stc = int(chain["num_stc_levels"])
+            if self._boot_enabled and (
+                    self._boot_num_cts_levels != cts
+                    or self._boot_num_stc_levels != stc):
+                raise ValueError(
+                    f"word32: YAML boot levels (cts="
+                    f"{self._boot_num_cts_levels}, stc="
+                    f"{self._boot_num_stc_levels}) != chain (cts={cts}, "
+                    f"stc={stc}) ({json_path}).")
+            self._boot_enabled = True
+            self._boot_num_cts_levels = cts
+            self._boot_num_stc_levels = stc
+            setup_args["BootNumCtsLevels"] = cts
+            setup_args["BootNumStcLevels"] = stc
+            setup_args["BootLogMessageRatio"] = self._boot_log_message_ratio
+            env = os.environ.get("ORION_CHEDDAR_BOOT_MIN_KS", "").lower()
+            setup_args["BootMinKs"] = env in ("1", "true", "yes", "on")
+
+        self._generation = _native.setup_scheme(setup_args)
+
+        # GetModuliChain feeds Orion's errorless-rescale idiom (nn layers
+        # encode plaintexts at moduli_chain[level] so mult-then-rescale
+        # stays scale-exact). With rational rescaling the value that
+        # achieves this is the level's CANONICAL scale, not any prime:
+        # canonical(l)^2 / rescale_prod(l) == canonical(l-1), so a
+        # plaintext at canonical(l) keeps the ciphertext on the
+        # trajectory through both ct-pt and ct-ct multiplies. Rounded to
+        # int here (GetModuliChain's contract); the native Encode snaps
+        # near-canonical requests onto the exact double.
+        self._usable_primes = [
+            int(round(s)) for s in _native.GetCanonicalScales()]
 
     def DeleteScheme(self) -> None:
         if self._generation is not None:
