@@ -84,22 +84,31 @@ find_package(pybind11 REQUIRED CONFIG)
 
 pybind11_add_module(_cheddar_native cheddar_pybind.cu)
 
-target_include_directories(_cheddar_native PRIVATE
-    "${CHEDDAR_SOURCE_DIR}/include"
-    "${RMM_INCLUDE_DIR}"
-    "${SPDLOG_INCLUDE_DIR}")
+# 32-bit-word twin: same source, ORION_CHEDDAR_WORD32 flips `word` to
+# uint32_t and the module name to _cheddar_native32. libcheddar.so already
+# contains both template instantiations, so no library rebuild is needed;
+# bindings.py selects the module at import time via the same env var.
+pybind11_add_module(_cheddar_native32 cheddar_pybind.cu)
+target_compile_definitions(_cheddar_native32 PRIVATE ORION_CHEDDAR_WORD32)
 
-# Conda's spdlog is compiled against an external fmt (no bundled copy),
-# matching how Cheddar itself was configured.
-target_compile_definitions(_cheddar_native PRIVATE SPDLOG_FMT_EXTERNAL)
+foreach(tgt _cheddar_native _cheddar_native32)
+    target_include_directories(${tgt} PRIVATE
+        "${CHEDDAR_SOURCE_DIR}/include"
+        "${RMM_INCLUDE_DIR}"
+        "${SPDLOG_INCLUDE_DIR}")
 
-target_link_libraries(_cheddar_native PRIVATE
-    "${CHEDDAR_BUILD_DIR}/libcheddar.so"
-    CUDA::cudart)
+    # Conda's spdlog is compiled against an external fmt (no bundled copy),
+    # matching how Cheddar itself was configured.
+    target_compile_definitions(${tgt} PRIVATE SPDLOG_FMT_EXTERNAL)
 
-set_target_properties(_cheddar_native PROPERTIES
-    # Find libcheddar.so at runtime without LD_LIBRARY_PATH.
-    BUILD_RPATH "${CHEDDAR_BUILD_DIR}"
-    INSTALL_RPATH "${CHEDDAR_BUILD_DIR}"
-    # Drop the .so alongside bindings.py (one level up).
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/..")
+    target_link_libraries(${tgt} PRIVATE
+        "${CHEDDAR_BUILD_DIR}/libcheddar.so"
+        CUDA::cudart)
+
+    set_target_properties(${tgt} PROPERTIES
+        # Find libcheddar.so at runtime without LD_LIBRARY_PATH.
+        BUILD_RPATH "${CHEDDAR_BUILD_DIR}"
+        INSTALL_RPATH "${CHEDDAR_BUILD_DIR}"
+        # Drop the .so alongside bindings.py (one level up).
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/..")
+endforeach()

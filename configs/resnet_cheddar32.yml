@@ -1,0 +1,35 @@
+comment: "ResNet Parameter Set (Cheddar backend, 32-bit word)"
+
+# 32-bit word mode (ORION_CHEDDAR_WORD32=1): the real chain comes from
+# orion/backend/cheddar/params32/bootparam_40.json (Cheddar's reference
+# 32-bit boot chain -- ~30-bit primes, rational rescaling, 16 usable
+# levels). The LogQ/LogP entries below are nominal placeholders: only
+# their COUNT matters (LogQ must have default_encryption_level + 1 = 17
+# entries so Orion's level accounting matches the chain; LogP count is
+# ignored in word32 mode). LogN/LogScale must match the chain and are
+# validated at setup.
+ckks_params:
+  LogN: 16
+  LogQ: [40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+  LogP: [31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+  LogScale: 40
+  H: 192
+  RingType: standard
+
+# Must agree with the chain file (validated at setup).
+boot_params:
+  num_cts_levels: 4
+  num_stc_levels: 3
+
+orion:
+  margin: 2 # >= 1
+  embedding_method: hybrid # [hybrid, square]
+  backend: cheddar
+  device: gpu # cheddar is GPU-only
+
+  fuse_modules: true
+  debug: false
+
+  diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
+  keys_path: ../data/keys.h5 # "path/to/keys" | ""
+  io_mode: none # "load" | "save" | "none"

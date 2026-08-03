@@ -131,6 +131,35 @@ Env knobs:
   resident at a time, evicting others before preparing a new one, instead
   of keeping every slot count a network needs simultaneously resident.
   Off by default.
+- `ORION_CHEDDAR_WORD32=1`: use the `_cheddar_native32` twin module
+  (word=uint32_t -- Cheddar's native design point; its paper's 0.72s
+  ResNet number is 32-bit). Requires a pregenerated rational-rescaling
+  chain file (default `params32/bootparam_40.json`, Cheddar's reference
+  32-bit boot chain: ~30-bit primes, 16 usable levels; override with
+  `ORION_CHEDDAR_PARAMS_JSON=<path>`). The YAML's LogQ must have exactly
+  `default_encryption_level + 1` entries -- values are nominal, only the
+  count feeds Orion's level accounting; see
+  `configs/resnet_cheddar32.yml`. Scale handling switches to the chain's
+  canonical per-level trajectory: rescale amounts stray up to ~13% off
+  2^LogScale, so `GetModuliChain` reports canonical scales and the
+  native `Encode`/`EvalPoly` snap near-canonical requests exactly onto
+  the trajectory (the unique convention where both ct-ct and ct-pt
+  mult-then-rescale stay scale-exact). Off by default.
+
+  Measured (ResNet20, RTX 3090, `MANAGED_MEMORY=1 SHARED_BS=64
+  BOOT_MIN_KS=1`, 3 trials): **21.4 +- 0.2s, 42.9GB peak, 15.9GB keys,
+  MAE 0.0006** vs 25.6 +- 0.8s / 41GB / MAE 0.0003 for 64-bit -- a 16%
+  latency win from halved per-limb bandwidth plus the deeper chain (16
+  usable levels vs 10 -> fewer bootstraps). Peak memory does NOT halve:
+  the chain carries more primes per level. Double-hoist at word32 is
+  still transfer-bound on this card (32.7s at bs=64, ~75GB peak). The
+  MAE 0.0006 (vs 0.0003) is the cost of the word32-only sign-composite
+  noise-margin fit -- see GenerateMinimaxSignCoeffs in bindings.py:
+  without it, ~40% of keygen noise draws push a mid-composite ReLU
+  input past its fitted domain and a degree-27 tail explodes,
+  corrupting the whole inference (root-caused via seed-pinned
+  bit-reproducible replays; fixed by fitting each stage over 1.25x the
+  previous stage's clear output range).
 - `ORION_CHEDDAR_DOUBLE_HOIST=1` (requires the `fused-dispatch-beta1`
   patch): evaluate every linear transform through Cheddar's native
   double-hoisted `HoistHandler` (fused baby-step KeyMult + fused

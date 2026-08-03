@@ -40,7 +40,19 @@ namespace py = pybind11;
 
 namespace {
 
+// Dual-word build: the same source compiles into _cheddar_native
+// (word=uint64_t, Orion LogQ/LogP bit-list chains) and _cheddar_native32
+// (word=uint32_t, pregenerated rational-rescaling chains passed as
+// explicit LevelConfig/TerPrimes -- Cheddar's native 25-30-prime design
+// point, ~half the memory footprint per object). bindings.py picks the
+// module at import time via ORION_CHEDDAR_WORD32.
+#ifdef ORION_CHEDDAR_WORD32
+using word = uint32_t;
+#define ORION_CHEDDAR_MODULE_NAME _cheddar_native32
+#else
 using word = uint64_t;
+#define ORION_CHEDDAR_MODULE_NAME _cheddar_native
+#endif
 using Ct = cheddar::Ciphertext<word>;
 using Pt = cheddar::Plaintext<word>;
 using Param = cheddar::Parameter<word>;
@@ -85,6 +97,14 @@ struct BackendState {
     double default_scale = 0.0;
     int max_level = 0;
     int slot_count = 0;
+    // Explicit-chain (rational-rescaling) mode: set when setup_scheme
+    // received a pregenerated LevelConfig instead of synthesizing the flat
+    // one-prime-per-level chain. Rescaling then divides by multi-prime
+    // products that only approximate 2^LogScale, so the exact scale a
+    // plaintext must carry at level L follows the chain's canonical
+    // trajectory (Parameter::GetScale) rather than the constant default
+    // scale -- see canonical_scale() below.
+    bool canonical_scales = false;
 
     // ID registries. next_*_id starts at 1; 0 is reserved for "invalid".
     std::map<int, std::unique_ptr<Pt>> plaintexts;
@@ -150,6 +170,21 @@ void replace_ct(int id, int from) {
 template <typename Container>
 int level_of(const Container& c) {
     return g_state.param->NPToLevel(c.GetNP());
+}
+
+// The scale fresh encodes should carry at `level`. Flat 64-bit chains:
+// the constant default scale (2^LogScale), today's behavior, unchanged.
+// Explicit rational-rescaling chains: the canonical per-level trajectory
+// -- Cheddar maintains GetScale(l) = GetScale(l+1)^2 / rescale_prod(l+1)
+// anchored at GetScale(0) == base_scale, and its ops assert scales
+// near-exactly, so encoding at the nominal 2^LogScale (up to ~4% off
+// trajectory mid-chain) would either trip those asserts or silently bias
+// values. Mirrors upstream's own Testbed::DetermineScale.
+double canonical_scale(int level) {
+    if (!g_state.canonical_scales) return g_state.default_scale;
+    if (level <= g_state.param->default_encryption_level_)
+        return g_state.param->GetScale(level);
+    return g_state.param->GetRescalePrimeProd(level);
 }
 
 // Cheddar's Add/Sub assert scale equality at 1e-12 relative and
@@ -220,12 +255,45 @@ int setup_scheme(py::dict params) {
     auto main_primes = params["MainPrimes"].cast<std::vector<word>>();
     auto aux_primes = params["AuxPrimes"].cast<std::vector<word>>();
 
-    int num_levels = static_cast<int>(main_primes.size());
-    // Flat chain: level i uses main primes 0..i, no terminal primes.
-    // Orion's level convention (level = index into LogQ) maps directly.
+    // Explicit chain (rational rescaling): Python passes the full
+    // pregenerated structure -- LevelConfig ((num_main, num_ter) per
+    // level), TerPrimes, AdditionalBase -- from a chain file like
+    // Cheddar's parameters/bootparam_40.json, instead of this wrapper
+    // synthesizing a flat one-prime-per-level chain from LogQ bit sizes.
+    // Required for word32 (a ~2^40 scale cannot be one ~30-bit prime per
+    // level) and enables canonical per-level scale handling everywhere.
+    std::vector<word> ter_primes;
+    std::pair<int, int> additional_base{0, 0};
     std::vector<std::pair<int, int>> level_config;
-    level_config.reserve(num_levels);
-    for (int i = 0; i < num_levels; ++i) level_config.emplace_back(i + 1, 0);
+    int num_levels;
+    g_state.canonical_scales = params.contains("LevelConfig");
+    if (g_state.canonical_scales) {
+        for (auto item : params["LevelConfig"].cast<py::list>()) {
+            auto pair = item.cast<std::vector<int>>();
+            if (pair.size() != 2)
+                throw std::runtime_error(
+                    "setup_scheme: LevelConfig entries must be "
+                    "(num_main, num_ter) pairs.");
+            level_config.emplace_back(pair[0], pair[1]);
+        }
+        num_levels = static_cast<int>(level_config.size());
+        if (params.contains("TerPrimes"))
+            ter_primes = params["TerPrimes"].cast<std::vector<word>>();
+        if (params.contains("AdditionalBase")) {
+            auto ab = params["AdditionalBase"].cast<std::vector<int>>();
+            if (ab.size() != 2)
+                throw std::runtime_error(
+                    "setup_scheme: AdditionalBase must be a pair.");
+            additional_base = {ab[0], ab[1]};
+        }
+    } else {
+        num_levels = static_cast<int>(main_primes.size());
+        // Flat chain: level i uses main primes 0..i, no terminal primes.
+        // Orion's level convention (level = index into LogQ) maps directly.
+        level_config.reserve(num_levels);
+        for (int i = 0; i < num_levels; ++i)
+            level_config.emplace_back(i + 1, 0);
+    }
 
     double base_scale = std::pow(2.0, logScale);
 
@@ -244,7 +312,17 @@ int setup_scheme(py::dict params) {
 
     g_state.param = std::make_unique<Param>(
         logN, base_scale, default_enc_level,
-        level_config, main_primes, aux_primes);
+        level_config, main_primes, aux_primes, ter_primes, additional_base);
+
+    // Hamming weights (secret sparsity). Chain files carry the values the
+    // chain's security analysis assumed; the flat path keeps Parameter's
+    // defaults, unchanged.
+    if (params.contains("DenseHammingWeight"))
+        g_state.param->SetDenseHammingWeight(
+            params["DenseHammingWeight"].cast<int>());
+    if (params.contains("SparseHammingWeight"))
+        g_state.param->SetSparseHammingWeight(
+            params["SparseHammingWeight"].cast<int>());
 
     // When bootstrap is configured (Python passes the boot level knobs),
     // build a BootContext and use it as *the* context -- BootContext
@@ -337,7 +415,21 @@ void NewDecryptor() { ensure_keys(); }
 
 int Encode(std::vector<double> values, int level, double scale) {
     ensure_setup();
-    double s = (scale > 0.0) ? scale : g_state.default_scale;
+    double s = (scale > 0.0) ? scale : canonical_scale(level);
+    // Explicit-chain mode: the canonical trajectory is the unique
+    // convention under which both ct-ct and ct-pt mult-then-rescale stay
+    // scale-exact (canonical(l)^2 / rescale_prod(l) == canonical(l-1)),
+    // so every plaintext at level l must sit at exactly canonical(l).
+    // Callers request it only approximately -- the nominal 2^LogScale
+    // (encoder.py, tests) or the moduli-chain entry (Orion's errorless-
+    // rescale idiom; GetModuliChain reports rounded canonical scales in
+    // this mode) -- so snap any request within the chain's wobble range
+    // (rescale products stray up to ~13% off nominal) onto the exact
+    // value. Requests further out are honored as passed.
+    if (g_state.canonical_scales) {
+        double canon = canonical_scale(level);
+        if (std::abs(s - canon) < 0.15 * canon) s = canon;
+    }
     std::vector<Complex> msg(values.size());
     for (size_t i = 0; i < values.size(); ++i) msg[i] = Complex(values[i], 0.0);
     auto pt = std::make_unique<Pt>();
@@ -654,7 +746,7 @@ int GenerateHoistLT(std::vector<int> diags_idxs, std::vector<double> diags_data,
 
     BackendState::HoistLT entry;
     entry.handler = std::make_unique<cheddar::HoistHandler<word>>(
-        g_state.context, hoist_map, level, g_state.default_scale);
+        g_state.context, hoist_map, level, canonical_scale(level));
     entry.pt_level = level;
     int id = g_state.next_hoist_lt_id++;
     g_state.hoist_lts[id] = std::move(entry);
@@ -1210,6 +1302,34 @@ int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
             "EvaluatePolynomialNative: relinearize before evaluating a "
             "polynomial.");
 
+    // Explicit-chain mode: a nominal (2^LogScale) target would strand the
+    // output off the canonical trajectory by up to the chain's per-level
+    // wobble (~2^0.1), far beyond the add-path drift tolerance. The output
+    // level is input_level - ceil(log2(degree+1)) (EvalPoly's BSGS-tree
+    // depth -- the same model orion/nn/activation.py schedules with);
+    // snap the target to that level's canonical scale and verify the
+    // depth model held afterwards.
+    int predicted_level = -1;
+    bool snapped = false;
+    if (g_state.canonical_scales) {
+        int degree = static_cast<int>(coeffs.size()) - 1;
+        int depth = static_cast<int>(std::ceil(std::log2(degree + 1)));
+        predicted_level = level_of(c) - depth;
+        if (predicted_level < 0)
+            throw std::runtime_error(
+                "EvaluatePolynomialNative: not enough levels for degree.");
+        // Callers pass either the nominal default scale or the output
+        // level's (rounded) canonical scale -- snap both onto the exact
+        // canonical value, same rationale as Encode above.
+        double canon = canonical_scale(predicted_level);
+        if (std::abs(target_scale - canon) < 0.15 * canon ||
+            std::abs(target_scale - g_state.default_scale) <
+                0.15 * g_state.default_scale) {
+            snapped = true;
+            target_scale = canon;
+        }
+    }
+
     cheddar::EvalPoly<word> poly(coeffs, level_of(c), c.GetScale(),
                                  target_scale, /*chebyshev=*/false);
     poly.Compile(g_state.context);
@@ -1217,6 +1337,12 @@ int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
     auto out = std::make_unique<Ct>();
     poly.Evaluate(g_state.context, *out, c,
                  g_state.iface->GetMultiplicationKey());
+    if (snapped && level_of(*out) != predicted_level)
+        throw std::runtime_error(
+            "EvaluatePolynomialNative: output level " +
+            std::to_string(level_of(*out)) + " != predicted " +
+            std::to_string(predicted_level) +
+            "; canonical target scale was chosen for the wrong level.");
     return g_state.put_ct(std::move(out));
 }
 
@@ -1228,6 +1354,36 @@ void DeleteBootstrappers() {
     // precompute). All boot state is released by delete_scheme() at scheme
     // teardown. This is also generation-safe: a stale bootstrapper
     // finalizer running after a new scheme is set up won't disturb it.
+}
+
+// Per-level rescale divisors, indexed by level 0..default_encryption_level
+// (index 0 holds base_scale as a placeholder -- there is no rescale from
+// level 0). This is what Orion's errorless-rescale idiom needs from
+// GetModuliChain: encode a plaintext at exactly the amount the next
+// rescale divides by, so mult-then-rescale returns the ciphertext to its
+// prior scale. On flat chains each entry is just that level's prime; on
+// rational-rescaling chains it is the (possibly non-integer) ratio of
+// consecutive level bases, which no prime list can express.
+std::vector<double> GetRescalePrimeProds() {
+    ensure_setup();
+    const int top = g_state.param->default_encryption_level_;
+    std::vector<double> out;
+    out.reserve(top + 1);
+    out.push_back(g_state.param->base_scale_);
+    for (int l = 1; l <= top; ++l)
+        out.push_back(g_state.param->GetRescalePrimeProd(l));
+    return out;
+}
+
+// Canonical per-level scale trajectory (diagnostics / scale planning).
+std::vector<double> GetCanonicalScales() {
+    ensure_setup();
+    const int top = g_state.param->default_encryption_level_;
+    std::vector<double> out;
+    out.reserve(top + 1);
+    for (int l = 0; l <= top; ++l)
+        out.push_back(g_state.param->GetScale(l));
+    return out;
 }
 
 // Number of levels EvalMod consumes in the boot circuit. Fixed by the
@@ -1296,7 +1452,7 @@ void SetPlaintextScale(int pt_id, double scale) {
 // pybind11 module
 // ---------------------------------------------------------------------------
 
-PYBIND11_MODULE(_cheddar_native, m) {
+PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     m.doc() = "Cheddar CKKS backend bindings for Orion.";
 
     // Lifecycle
@@ -1386,6 +1542,8 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("Bootstrap", &Bootstrap, py::arg("ct_id"), py::arg("slots"));
     m.def("DeleteBootstrappers", &DeleteBootstrappers);
     m.def("BootNumEvalModLevels", &BootNumEvalModLevels);
+    m.def("GetRescalePrimeProds", &GetRescalePrimeProds);
+    m.def("GetCanonicalScales", &GetCanonicalScales);
 
     // Polynomial evaluation
     m.def("EvaluatePolynomialNative", &EvaluatePolynomialNative,
