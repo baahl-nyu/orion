@@ -28,7 +28,6 @@ from argparse import ArgumentParser
 from os import makedirs
 from os.path import join
 
-os.environ.setdefault("ORION_CHEDDAR_POW2_ROTATE", "1")
 os.environ.setdefault("ORION_CHEDDAR_MANAGED_MEMORY", "1")
 os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "1")
 
@@ -56,19 +55,37 @@ def parse_args():
     parser.add_argument("--base", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="bench_results")
+    # word32: run on the uint32_t twin backend (ORION_CHEDDAR_WORD32=1 +
+    # the pregenerated rational-rescaling chain). The env var must also
+    # be set in the launching environment -- bindings.py reads it at
+    # import time -- so this flag only swaps in the word32-shaped CKKS
+    # params (17 nominal LogQ entries to match the chain's 16 usable
+    # levels; LogP count is ignored in word32 mode).
+    parser.add_argument("--word32", action="store_true")
     return parser.parse_args()
 
 
-def build_config():
-    return {
-        "ckks_params": {
+def build_config(word32=False):
+    if word32:
+        ckks = {
+            "LogN": 16,
+            "LogQ": [40] * 17,
+            "LogP": [31] * 12,
+            "LogScale": 40,
+            "H": 192,
+            "RingType": "standard",
+        }
+    else:
+        ckks = {
             "LogN": 16,
             "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
             "LogP": [61, 61, 61],
             "LogScale": 40,
             "H": 192,
             "RingType": "standard",
-        },
+        }
+    return {
+        "ckks_params": ckks,
         "boot_params": {
             "num_cts_levels": 4,
             "num_stc_levels": 3,
@@ -80,7 +97,7 @@ def build_config():
             "backend": "cheddar",
             "device": "gpu",
             "fuse_modules": True,
-            "debug": True,
+            "debug": False,
             "diags_path": "",
             "keys_path": "",
             "io_mode": "none",
@@ -104,7 +121,12 @@ def main():
     with torch.no_grad():
         clear_logit = model(dense_in, expanded_sparse)
 
-    orion.init_scheme(build_config())
+    if args.word32 and os.environ.get("ORION_CHEDDAR_WORD32", "") not in (
+            "1", "true", "yes", "on"):
+        raise SystemExit(
+            "--word32 requires ORION_CHEDDAR_WORD32=1 in the environment "
+            "(bindings.py selects the native module at import time).")
+    orion.init_scheme(build_config(word32=args.word32))
     orion.fit(model, [dense_in, expanded_sparse])
     input_level = orion.compile(model)
 
