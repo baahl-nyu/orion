@@ -784,6 +784,7 @@ class CheddarLibrary:
         self._transforms[lt_id] = {
             "diags": diags, "bsgs_ratio": bsgs_ratio,
             "use_bsgs": use_bsgs, "bs": bs, "pt_ids": pt_ids,
+            "level": int(level),
         }
         return lt_id
 
@@ -822,12 +823,35 @@ class CheddarLibrary:
         t = self._transforms[lt_id]
         if "hoist_id" in t:
             return _native.EvaluateHoistLT(t["hoist_id"], int(ct_id))
-        if t["use_bsgs"]:
-            return self._eval_lt_bsgs(ct_id, t["diags"], t["bs"], t["pt_ids"])
-        return self._eval_lt_naive(ct_id, t["diags"], t["pt_ids"])
+        # Align the input to the transform's plaintext level ONCE, before
+        # the baby-step rotations. Without this, every rotated operand of
+        # every MulPlaintextAccumNew call re-pays the same LevelDown walk
+        # natively (align_down), and cheddar's LevelDown is a per-level
+        # Mult+Rescale chain -- profiled at 89-98% of all ModDown-family
+        # kernel launches on HELRM@500k (60k/68k for w64, 253k/259k for
+        # w32 per forward). Aligning here also runs the rotations at the
+        # target level's limb count instead of the arrival level's.
+        src, owned = self._align_lt_input(ct_id, t["level"])
+        try:
+            if t["use_bsgs"]:
+                return self._eval_lt_bsgs(src, t["diags"], t["bs"],
+                                          t["pt_ids"])
+            return self._eval_lt_naive(src, t["diags"], t["pt_ids"])
+        finally:
+            if owned:
+                self.DeleteCiphertext(src)
 
     def _lt_encode(self, values, level: int) -> int:
         return self.Encode(values, level, self._default_scale)
+
+    def _align_lt_input(self, ct_id: int, level: int) -> tuple[int, bool]:
+        """(aligned_ct_id, caller_owns_it). Drops the input to `level`
+        via one native LevelDown when it arrives higher; inputs at or
+        below the transform level pass through untouched (the native MAC
+        re-encodes plaintexts downward for that case)."""
+        if self.GetCiphertextLevel(ct_id) <= level:
+            return int(ct_id), False
+        return _native.AlignToLevelNew(int(ct_id), int(level)), True
 
     def _rotate_lt_batch(self, ct_id: int, ks: list[int]) -> dict[int, int]:
         """Rotate one ciphertext by every distance in ks (nonzero, unique),
