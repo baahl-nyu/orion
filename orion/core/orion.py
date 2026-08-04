@@ -54,9 +54,12 @@ class Scheme:
     def __init__(self):
         self.backend = None
         self.trace = None
-        # Physical slot width the network's own input must be encoded at,
-        # set by compile()'s physical-width propagation pass (cheddar
-        # only need this be non-default; see packing.propagate_physical_slots).
+        # Sorted list of physical slot widths the network's inputs must
+        # be encoded at (one entry per distinct input-source
+        # requirement), set by compile()'s physical-width propagation
+        # pass (cheddar only needs this be non-default; see
+        # packing.propagate_physical_slots). encode() targets the
+        # smallest listed width that fits the tensor.
         self.compiled_input_slots = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
@@ -126,8 +129,16 @@ class Scheme:
         # for non-cheddar backends it's just the scheme's global max.
         # An explicit target_slots (e.g. a test encoding some other
         # narrow plaintext post-compile) always takes precedence.
-        if target_slots is None:
-            target_slots = self.compiled_input_slots
+        # compiled_input_slots is a per-input-source width list (a
+        # multi-input network's inputs can feed differently-narrow
+        # paths); target the smallest compiled width that fits this
+        # tensor. No fit -> None -> encoder's legacy full-width path.
+        if target_slots is None and self.compiled_input_slots:
+            n = tensor.numel() if hasattr(tensor, "numel") else len(tensor)
+            for w in self.compiled_input_slots:  # sorted ascending
+                if n <= w:
+                    target_slots = w
+                    break
         return self.encoder.encode(tensor, level, scale, target_slots=target_slots)
 
     def decode(self, ptxt):

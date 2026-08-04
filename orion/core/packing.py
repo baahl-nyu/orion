@@ -272,7 +272,55 @@ def propagate_physical_slots(network_dag, topo_sort):
         module.physical_slots = width
         output_width[node] = width
 
-    return network_input_slots
+    # Per-input required widths. network_input_slots (the first LT's
+    # width in topo order) is a single scalar and silently WRONG for
+    # multi-input networks whose inputs feed differently-narrow paths:
+    # HELRM's dense input feeds bottom_0 (width 512) while its sparse
+    # input feeds the compression LT (width 2048) -- encoding the sparse
+    # input against the dense path's 512 made Scheme.encode fall through
+    # to the legacy full-width path (1,067 elements > 512), and a
+    # 32768-wide ciphertext entering diagonals built mod 2048 loses
+    # every wraparound contribution (the deterministic thr500 precision
+    # regression: 5.98 vs 12.78 bits). For each DAG source, walk forward
+    # to the first LinearTransform(s) it reaches and require that width
+    # (max over branches). Scheme.encode then targets the smallest
+    # per-input width that fits the tensor being encoded.
+    # (Non-cheddar / narrow-disabled runs never set .slots, so the walk
+    # below finds nothing and falls back to {max_slots} -- same single
+    # global width as before.)
+    input_widths = set()
+    sources = [n for n in topo_sort
+               if not list(network_dag.predecessors(n))]
+    for s in sources:
+        seen = set()
+        frontier = [s]
+        found = set()
+        while frontier:
+            nxt = []
+            for n in frontier:
+                if n in seen:
+                    continue
+                seen.add(n)
+                mod = network_dag.nodes[n]["module"]
+                if mod is not None and hasattr(mod, "generate_diagonals") \
+                        and getattr(mod, "slots", None):
+                    found.add(mod.slots)
+                    continue  # stop at the first LT on this branch
+                nxt.extend(network_dag.successors(n))
+            frontier = nxt
+        if os.environ.get("ORION_DEBUG_INPUT_WIDTHS"):
+            print(f"[input-widths] source={s} found={sorted(found)}")
+        # Orion's network_dag merges every network input into ONE
+        # placeholder node, so a source may legitimately fan out to
+        # several entry LTs of different widths (HELRM: dense->512,
+        # sparse->2048) and per-source attribution is impossible here.
+        # Expose every entry width; Scheme.encode disambiguates by
+        # element count (smallest listed width that fits the tensor).
+        input_widths.update(found)
+    if not input_widths:
+        input_widths = {network_input_slots or max_slots}
+
+    return sorted(input_widths)
 
 def pack_conv2d(conv_layer: nn.Module, last: bool):
     slots = conv_layer.slots or conv_layer.scheme.params.get_slots()

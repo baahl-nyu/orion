@@ -1459,8 +1459,11 @@ double GetPeakDeviceMemoryMB() {
 
 int GetCiphertextLevel(int ct_id) { return level_of(g_state.ct(ct_id)); }
 int GetPlaintextLevel(int pt_id) { return level_of(g_state.pt(pt_id)); }
-int GetCiphertextSlots(int /*ct_id*/) { return g_state.slot_count; }
-int GetPlaintextSlots(int /*pt_id*/) { return g_state.slot_count; }
+// Real per-object widths (these were stubs returning the global
+// slot_count, which masked the enc_sparse full-width encode behind the
+// thr500 precision regression during debugging).
+int GetCiphertextSlots(int ct_id) { return g_state.ct(ct_id).GetNumSlots(); }
+int GetPlaintextSlots(int pt_id) { return g_state.pt(pt_id).GetNumSlots(); }
 
 double GetCiphertextScale(int ct_id) { return g_state.ct(ct_id).GetScale(); }
 double GetPlaintextScale(int pt_id) { return g_state.pt(pt_id).GetScale(); }
