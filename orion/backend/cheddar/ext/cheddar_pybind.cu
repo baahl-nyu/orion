@@ -229,6 +229,31 @@ const Ct* align_down(const Ct& c, int target_level,
     return tmp.get();
 }
 
+// Explicit caller-facing LevelDown: drop ct_id to target_level, returning
+// a NEW ciphertext id (input untouched). Lets the Python LT evaluator
+// align its input ONCE before the baby-step rotations instead of letting
+// MulPlaintextAccumNew re-align every rotated operand -- LevelDown is a
+// per-level Mult+Rescale walk in cheddar (Context::LevelDown), so the
+// per-operand policy cost O(num_operands * level_gap) rescales per
+// transform where O(level_gap) suffices. Rotating below the walk also
+// shrinks every rotation's ModUp/ModDown to the target level's limb
+// count. No-op gap (already at target) still returns a fresh copy so
+// callers own the result unconditionally.
+int AlignToLevelNew(int ct_id, int target_level) {
+    const Ct& c = g_state.ct(ct_id);
+    if (level_of(c) < target_level)
+        throw std::runtime_error(
+            "AlignToLevelNew: input level " + std::to_string(level_of(c)) +
+            " below target " + std::to_string(target_level) + ".");
+    auto out = std::make_unique<Ct>();
+    if (level_of(c) == target_level) {
+        g_state.context->Copy(*out, c);
+    } else {
+        g_state.context->LevelDown(*out, c, target_level);
+    }
+    return g_state.put_ct(std::move(out));
+}
+
 // ---------------------------------------------------------------------------
 // Setup / teardown
 // ---------------------------------------------------------------------------
@@ -1531,6 +1556,8 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
 
     // Rotations
     m.def("AddRotationKey", &AddRotationKey, py::arg("k"));
+    m.def("AlignToLevelNew", &AlignToLevelNew, py::arg("ct_id"),
+          py::arg("target_level"));
     m.def("RotateNew", &RotateNew, py::arg("ct_id"), py::arg("k"));
     m.def("RotateBatchNew", &RotateBatchNew, py::arg("ct_id"),
           py::arg("shifts"), py::arg("hoist_mode") = 0);
