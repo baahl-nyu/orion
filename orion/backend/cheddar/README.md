@@ -12,10 +12,14 @@ and bootstrap. `run_lola`/`run_mlp` run end to end;
 bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
 
 - `run_resnet.py configs/resnet_cheddar.yml` (ResNet20/CIFAR-10) runs end
-  to end: MAE 0.0003, 25.6 +/- 0.8s (3 trials) on a 24GB card, with
+  to end: MAE 0.0003, 21.1 +/- 1.6s (3 trials) on a 24GB card, with
   `ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_SHARED_BS=64
   ORION_CHEDDAR_BOOT_MIN_KS=1` (~41GB peak working set, paged via managed
-  memory -- see "Memory" below for the full env-knob ablation).
+  memory -- see "Memory" below for the env-knob ablation; that table's
+  runtimes predate the LT input-alignment fix, which took this headline
+  from 25.6 +/- 0.8s to 21.1s). Benchmarks MUST run `debug: false`:
+  debug decrypts + CPU-decodes every layer's input/output (~2x
+  end-to-end, 51.5s measured; both cheddar configs now ship false).
 - `examples/criteo/run_orion.py examples/criteo/params_cheddar.yaml`
   (Criteo HE-LRM) is verified against a synthetic (untrained) instance of
   the real architecture at `batch_size=16` (MAE 0.0004; 16 is a floor, not
@@ -147,10 +151,14 @@ Env knobs:
   mult-then-rescale stay scale-exact). Off by default.
 
   Measured (ResNet20, RTX 3090, `MANAGED_MEMORY=1 SHARED_BS=64
-  BOOT_MIN_KS=1`, 3 trials): **21.4 +- 0.2s, 42.9GB peak, 15.9GB keys,
-  MAE 0.0006** vs 25.6 +- 0.8s / 41GB / MAE 0.0003 for 64-bit -- a 16%
-  latency win from halved per-limb bandwidth plus the deeper chain (16
-  usable levels vs 10 -> fewer bootstraps). Peak memory does NOT halve:
+  BOOT_MIN_KS=1`, 3 trials, post-alignment-fix): **17.2 +- 0.1s, 42.9GB
+  peak, 15.9GB keys, MAE 0.0006** vs 21.1 +- 1.6s / 41GB / MAE 0.0003
+  for 64-bit -- an 18% latency win from halved per-limb bandwidth plus
+  the deeper chain (16 usable levels vs 10 -> fewer bootstraps).
+  (Pre-alignment-fix these were 21.4 vs 25.6s; the fix helps both word
+  sizes and slightly widens word32's edge. On HELRM word32 now wins
+  every compression threshold too -- see
+  `examples/criteo/HELRM_ABLATION.md` on the helrm branches.) Peak memory does NOT halve:
   the chain carries more primes per level. Double-hoist at word32 is
   still transfer-bound on this card (32.7s at bs=64, ~75GB peak). The
   MAE 0.0006 (vs 0.0003) is the cost of the word32-only sign-composite
@@ -168,8 +176,9 @@ Env knobs:
   0.0003) but **off by default: slower on a 24GB/64-bit setup** — the
   hoist-map plaintext cache lives in the extended (q+p) basis, ~40GB for
   ResNet20, and streaming it through UVM costs more than the fused
-  kernels save (measured 32.1s vs 25.6s at `SHARED_BS=64`; see the nsys
-  attribution in the ablation section). Expected to become profitable
+  kernels save (measured 32.1s vs 25.6s at `SHARED_BS=64`,
+  pre-alignment-fix numbers; see the nsys attribution in the ablation
+  section). Expected to become profitable
   with the 32-bit word build and/or cards the pt cache fits in. The
   hoist baby-step count follows `ORION_CHEDDAR_SHARED_BS` when set,
   else each LT's natural `ceil(sqrt(num_diags))`.
@@ -178,7 +187,10 @@ Env knobs:
 
 **All figures below are measured WITH narrow per-layer slot packing**
 (`orion/core/packing.py`'s `propagate_physical_slots`) and the
-`dnum=4` config (`LogP` x7 in `configs/resnet_cheddar.yml`) -- full
+`dnum=4` config (`LogP` x7 in `configs/resnet_cheddar.yml`). The
+runtime column predates the LT input-alignment fix (which moved the
+best row's 25.8s to the 21.1s headline above); the memory columns and
+the knob ranking are unaffected. Full
 ResNet20/CIFAR-10 runs (`debug: false`), solo sequential (never
 concurrent -- concurrent managed-memory runs contaminate each other's
 measurements), 2026-07-29. Peak/key mem via
