@@ -177,8 +177,17 @@ class NewEvaluator:
                     self.remove_rotation_keys()
                     self.remove_plaintext_diagonals(t_id)
             
-            # We know the output of this accumulation will just be one ciphertext
-            ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
+            # We know the output of this accumulation will just be one
+            # ciphertext. Backends whose EvaluateLinearTransform already
+            # returns a rescaled result (cheddar's double-hoisted path:
+            # the native final ModDown folds the rescale in for free)
+            # advertise it via lt_output_prerescaled; rescaling again
+            # would wrongly burn a second level.
+            if getattr(self.backend, "lt_output_prerescaled", False):
+                ct_out_rescaled = ct_out.ids[0]
+            else:
+                ct_out_rescaled = self.evaluator.rescale(
+                    ct_out.ids[0], in_place=False)
             cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)

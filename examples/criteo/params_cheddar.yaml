@@ -24,7 +24,9 @@ orion:
   device: gpu # cheddar is GPU-only
 
   fuse_modules: true
-  debug: true
+  # debug decrypts+decodes every layer's input/output on the CPU (~2x
+  # end-to-end on ResNet20) -- benchmarks MUST run false.
+  debug: false
 
   diags_path: ""
   keys_path: ""
