@@ -19,6 +19,7 @@
 #include <core/MemoryPool.h>
 #include <extension/BootContext.h>
 #include <extension/EvalPoly.h>
+#include <extension/Hoist.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -39,7 +40,19 @@ namespace py = pybind11;
 
 namespace {
 
+// Dual-word build: the same source compiles into _cheddar_native
+// (word=uint64_t, Orion LogQ/LogP bit-list chains) and _cheddar_native32
+// (word=uint32_t, pregenerated rational-rescaling chains passed as
+// explicit LevelConfig/TerPrimes -- Cheddar's native 25-30-prime design
+// point, ~half the memory footprint per object). bindings.py picks the
+// module at import time via ORION_CHEDDAR_WORD32.
+#ifdef ORION_CHEDDAR_WORD32
+using word = uint32_t;
+#define ORION_CHEDDAR_MODULE_NAME _cheddar_native32
+#else
 using word = uint64_t;
+#define ORION_CHEDDAR_MODULE_NAME _cheddar_native
+#endif
 using Ct = cheddar::Ciphertext<word>;
 using Pt = cheddar::Plaintext<word>;
 using Param = cheddar::Parameter<word>;
@@ -84,12 +97,30 @@ struct BackendState {
     double default_scale = 0.0;
     int max_level = 0;
     int slot_count = 0;
+    // Explicit-chain (rational-rescaling) mode: set when setup_scheme
+    // received a pregenerated LevelConfig instead of synthesizing the flat
+    // one-prime-per-level chain. Rescaling then divides by multi-prime
+    // products that only approximate 2^LogScale, so the exact scale a
+    // plaintext must carry at level L follows the chain's canonical
+    // trajectory (Parameter::GetScale) rather than the constant default
+    // scale -- see canonical_scale() below.
+    bool canonical_scales = false;
 
     // ID registries. next_*_id starts at 1; 0 is reserved for "invalid".
     std::map<int, std::unique_ptr<Pt>> plaintexts;
     std::map<int, std::unique_ptr<Ct>> ciphertexts;
     int next_pt_id = 1;
     int next_ct_id = 1;
+
+    // Double-hoisted linear transforms: native HoistHandler per LT block
+    // (see GenerateHoistLT below). pt_level recorded per handler because
+    // HoistHandler asserts its input arrives at exactly that level.
+    struct HoistLT {
+        std::unique_ptr<cheddar::HoistHandler<word>> handler;
+        int pt_level;
+    };
+    std::map<int, HoistLT> hoist_lts;
+    int next_hoist_lt_id = 1;
 
     int put_pt(std::unique_ptr<Pt> pt) {
         int id = next_pt_id++;
@@ -141,6 +172,21 @@ int level_of(const Container& c) {
     return g_state.param->NPToLevel(c.GetNP());
 }
 
+// The scale fresh encodes should carry at `level`. Flat 64-bit chains:
+// the constant default scale (2^LogScale), today's behavior, unchanged.
+// Explicit rational-rescaling chains: the canonical per-level trajectory
+// -- Cheddar maintains GetScale(l) = GetScale(l+1)^2 / rescale_prod(l+1)
+// anchored at GetScale(0) == base_scale, and its ops assert scales
+// near-exactly, so encoding at the nominal 2^LogScale (up to ~4% off
+// trajectory mid-chain) would either trip those asserts or silently bias
+// values. Mirrors upstream's own Testbed::DetermineScale.
+double canonical_scale(int level) {
+    if (!g_state.canonical_scales) return g_state.default_scale;
+    if (level <= g_state.param->default_encryption_level_)
+        return g_state.param->GetScale(level);
+    return g_state.param->GetRescalePrimeProd(level);
+}
+
 // Cheddar's Add/Sub assert scale equality at 1e-12 relative and
 // std::exit on failure. The kernels produce operands whose scales
 // drift apart by ~1e-7..1e-6 relative (2^LogScale-vs-actual-prime
@@ -183,6 +229,31 @@ const Ct* align_down(const Ct& c, int target_level,
     return tmp.get();
 }
 
+// Explicit caller-facing LevelDown: drop ct_id to target_level, returning
+// a NEW ciphertext id (input untouched). Lets the Python LT evaluator
+// align its input ONCE before the baby-step rotations instead of letting
+// MulPlaintextAccumNew re-align every rotated operand -- LevelDown is a
+// per-level Mult+Rescale walk in cheddar (Context::LevelDown), so the
+// per-operand policy cost O(num_operands * level_gap) rescales per
+// transform where O(level_gap) suffices. Rotating below the walk also
+// shrinks every rotation's ModUp/ModDown to the target level's limb
+// count. No-op gap (already at target) still returns a fresh copy so
+// callers own the result unconditionally.
+int AlignToLevelNew(int ct_id, int target_level) {
+    const Ct& c = g_state.ct(ct_id);
+    if (level_of(c) < target_level)
+        throw std::runtime_error(
+            "AlignToLevelNew: input level " + std::to_string(level_of(c)) +
+            " below target " + std::to_string(target_level) + ".");
+    auto out = std::make_unique<Ct>();
+    if (level_of(c) == target_level) {
+        g_state.context->Copy(*out, c);
+    } else {
+        g_state.context->LevelDown(*out, c, target_level);
+    }
+    return g_state.put_ct(std::move(out));
+}
+
 // ---------------------------------------------------------------------------
 // Setup / teardown
 // ---------------------------------------------------------------------------
@@ -209,12 +280,45 @@ int setup_scheme(py::dict params) {
     auto main_primes = params["MainPrimes"].cast<std::vector<word>>();
     auto aux_primes = params["AuxPrimes"].cast<std::vector<word>>();
 
-    int num_levels = static_cast<int>(main_primes.size());
-    // Flat chain: level i uses main primes 0..i, no terminal primes.
-    // Orion's level convention (level = index into LogQ) maps directly.
+    // Explicit chain (rational rescaling): Python passes the full
+    // pregenerated structure -- LevelConfig ((num_main, num_ter) per
+    // level), TerPrimes, AdditionalBase -- from a chain file like
+    // Cheddar's parameters/bootparam_40.json, instead of this wrapper
+    // synthesizing a flat one-prime-per-level chain from LogQ bit sizes.
+    // Required for word32 (a ~2^40 scale cannot be one ~30-bit prime per
+    // level) and enables canonical per-level scale handling everywhere.
+    std::vector<word> ter_primes;
+    std::pair<int, int> additional_base{0, 0};
     std::vector<std::pair<int, int>> level_config;
-    level_config.reserve(num_levels);
-    for (int i = 0; i < num_levels; ++i) level_config.emplace_back(i + 1, 0);
+    int num_levels;
+    g_state.canonical_scales = params.contains("LevelConfig");
+    if (g_state.canonical_scales) {
+        for (auto item : params["LevelConfig"].cast<py::list>()) {
+            auto pair = item.cast<std::vector<int>>();
+            if (pair.size() != 2)
+                throw std::runtime_error(
+                    "setup_scheme: LevelConfig entries must be "
+                    "(num_main, num_ter) pairs.");
+            level_config.emplace_back(pair[0], pair[1]);
+        }
+        num_levels = static_cast<int>(level_config.size());
+        if (params.contains("TerPrimes"))
+            ter_primes = params["TerPrimes"].cast<std::vector<word>>();
+        if (params.contains("AdditionalBase")) {
+            auto ab = params["AdditionalBase"].cast<std::vector<int>>();
+            if (ab.size() != 2)
+                throw std::runtime_error(
+                    "setup_scheme: AdditionalBase must be a pair.");
+            additional_base = {ab[0], ab[1]};
+        }
+    } else {
+        num_levels = static_cast<int>(main_primes.size());
+        // Flat chain: level i uses main primes 0..i, no terminal primes.
+        // Orion's level convention (level = index into LogQ) maps directly.
+        level_config.reserve(num_levels);
+        for (int i = 0; i < num_levels; ++i)
+            level_config.emplace_back(i + 1, 0);
+    }
 
     double base_scale = std::pow(2.0, logScale);
 
@@ -233,7 +337,17 @@ int setup_scheme(py::dict params) {
 
     g_state.param = std::make_unique<Param>(
         logN, base_scale, default_enc_level,
-        level_config, main_primes, aux_primes);
+        level_config, main_primes, aux_primes, ter_primes, additional_base);
+
+    // Hamming weights (secret sparsity). Chain files carry the values the
+    // chain's security analysis assumed; the flat path keeps Parameter's
+    // defaults, unchanged.
+    if (params.contains("DenseHammingWeight"))
+        g_state.param->SetDenseHammingWeight(
+            params["DenseHammingWeight"].cast<int>());
+    if (params.contains("SparseHammingWeight"))
+        g_state.param->SetSparseHammingWeight(
+            params["SparseHammingWeight"].cast<int>());
 
     // When bootstrap is configured (Python passes the boot level knobs),
     // build a BootContext and use it as *the* context -- BootContext
@@ -269,6 +383,7 @@ int setup_scheme(py::dict params) {
 void delete_scheme() {
     g_state.plaintexts.clear();
     g_state.ciphertexts.clear();
+    g_state.hoist_lts.clear();
     g_state.rot_keys.clear();
     g_state.boot_prepared_slots.clear();
     g_state.eval_mod_prepared = false;
@@ -325,7 +440,21 @@ void NewDecryptor() { ensure_keys(); }
 
 int Encode(std::vector<double> values, int level, double scale) {
     ensure_setup();
-    double s = (scale > 0.0) ? scale : g_state.default_scale;
+    double s = (scale > 0.0) ? scale : canonical_scale(level);
+    // Explicit-chain mode: the canonical trajectory is the unique
+    // convention under which both ct-ct and ct-pt mult-then-rescale stay
+    // scale-exact (canonical(l)^2 / rescale_prod(l) == canonical(l-1)),
+    // so every plaintext at level l must sit at exactly canonical(l).
+    // Callers request it only approximately -- the nominal 2^LogScale
+    // (encoder.py, tests) or the moduli-chain entry (Orion's errorless-
+    // rescale idiom; GetModuliChain reports rounded canonical scales in
+    // this mode) -- so snap any request within the chain's wobble range
+    // (rescale products stray up to ~13% off nominal) onto the exact
+    // value. Requests further out are honored as passed.
+    if (g_state.canonical_scales) {
+        double canon = canonical_scale(level);
+        if (std::abs(s - canon) < 0.15 * canon) s = canon;
+    }
     std::vector<Complex> msg(values.size());
     for (size_t i = 0; i < values.size(); ++i) msg[i] = Complex(values[i], 0.0);
     auto pt = std::make_unique<Pt>();
@@ -509,6 +638,186 @@ int MulPlaintext(int ct_id, int pt_id) {
     replace_ct(ct_id, MulPlaintextNew(ct_id, pt_id));
     return ct_id;
 }
+
+// Fused MAC: out = sum_i ct_i * pt_i in one ElementWiseHandler::PAccum
+// call instead of N ct-pt Mults + (N-1) Adds -- each of those is a
+// separate memory-bound elementwise pass over full ciphertexts, so
+// fusing them into one kernel (CPAccumWorker chunks internally by 8,
+// carrying partial sums through the trailing extra-ct slot, so any N
+// works) removes 2N-2 full-ciphertext memory round trips. Built purely
+// from public Context members (elem_handler_), same as
+// RotateBatchHoistedNew -- no cheddar source patch needed. Mirrors
+// HoistHandler::EvaluateSingleAccum's result setup (Hoist.cu).
+int MulPlaintextAccumNew(std::vector<int> ct_ids, std::vector<int> pt_ids) {
+    ensure_setup();
+    if (ct_ids.empty() || ct_ids.size() != pt_ids.size())
+        throw std::runtime_error(
+            "MulPlaintextAccumNew: ct_ids/pt_ids must be equal-length and "
+            "non-empty.");
+    if (ct_ids.size() == 1) return MulPlaintextNew(ct_ids[0], pt_ids[0]);
+
+    // Align everything to the lowest operand level (same policy as
+    // MulPlaintextNew: drop cts, re-encode pts).
+    int target = 1 << 30;
+    for (int id : ct_ids) target = std::min(target, level_of(g_state.ct(id)));
+    for (int id : pt_ids) target = std::min(target, level_of(g_state.pt(id)));
+
+    size_t n = ct_ids.size();
+    std::vector<std::unique_ptr<Ct>> tmp_cts(n);
+    std::vector<std::unique_ptr<Pt>> tmp_pts(n);
+    std::vector<const Ct*> cts(n);
+    std::vector<const Pt*> pts(n);
+    for (size_t i = 0; i < n; i++) {
+        const Ct& c = g_state.ct(ct_ids[i]);
+        if (c.HasRx())
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: operand is degree-2; relinearize "
+                "first.");
+        cts[i] = align_down(c, target, tmp_cts[i]);
+        const Pt& p = g_state.pt(pt_ids[i]);
+        pts[i] = (level_of(p) > target) ? align_pt(*cts[i], p, tmp_pts[i])
+                                        : &p;
+    }
+
+    const cheddar::NPInfo np = cts[0]->GetNP();
+    const double out_scale = cts[0]->GetScale() * pts[0]->GetScale();
+    int num_slots = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cts[i]->GetNP().GetNumQ() != np.GetNumQ() ||
+            cts[i]->GetNP().num_aux_ != np.num_aux_)
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: ciphertext NP mismatch after level "
+                "alignment.");
+        double s = cts[i]->GetScale() * pts[i]->GetScale();
+        if (std::abs(s - out_scale) > 1e-9 * out_scale)
+            throw std::runtime_error(
+                "MulPlaintextAccumNew: inconsistent ct*pt scale products "
+                "across pairs.");
+        num_slots = std::max(
+            num_slots, std::max(cts[i]->GetNumSlots(), pts[i]->GetNumSlots()));
+    }
+
+    auto out = std::make_unique<Ct>();
+    out->RemoveRx();
+    out->ModifyNP(np);
+    out->SetScale(out_scale);
+    out->SetNumSlots(num_slots);
+    std::vector<cheddar::DvView<word>> out_view = out->ViewVector();
+
+    std::vector<std::vector<cheddar::DvConstView<word>>> ct_views;
+    std::vector<cheddar::DvConstView<word>> pt_views;
+    ct_views.reserve(n);
+    pt_views.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        ct_views.push_back(cts[i]->ConstViewVector());
+        pt_views.push_back(pts[i]->ConstView());
+    }
+    g_state.context->elem_handler_.PAccum(out_view, np, ct_views, pt_views);
+    return g_state.put_ct(std::move(out));
+}
+
+// ---------------------------------------------------------------------------
+// Double-hoisted linear transform (native HoistHandler)
+// ---------------------------------------------------------------------------
+// Wraps cheddar's HoistHandler (extension/Hoist.h, the Bossuat et al.
+// EUROCRYPT'21 double-hoisting BSGS): baby-step rotations share one ModUp
+// AND stay fused (BSFusedKeyMult: KeyMult+MAC+automorphism in one kernel
+// when beta fits), giant-step accumulation runs GSFusedPAccum +
+// PermuteAccum, and the final ModDown folds the rescale in for free
+// (EvaluateFinalModDown -> ModDownAndRescale). The PlainHoistMap is built
+// directly from Orion's diagonals -- LinearTransform's square/power-of-two
+// factory constraint does NOT apply to HoistHandler itself.
+//
+// Conventions (match the Python BSGS path exactly): with HRot(ct,k)[i] =
+// ct[i+k], Evaluate computes res[i] = sum_gs sum_bs pt[gs][bs][i+gs] *
+// input[i+gs+bs]; we need res[i] = sum_k diag_k[i]*input[i+k] for
+// k = gs+bs, so pt[gs][bs] = roll(diag_k, +gs) -- the same giant-step
+// pre-roll GenerateLinearTransform bakes into its cached plaintexts.
+//
+// The output is ALREADY rescaled (level pt_level-1, scale
+// input_scale*pt_scale/q[pt_level]) -- callers must skip their usual
+// post-LT rescale (bindings.py advertises this via lt_output_prerescaled).
+//
+// Key set: read back from the constructed handler via
+// AddRequiredRotations, never recomputed externally -- the constructor
+// can swap bs/gs for single-giant-group maps (kOptimizeAutomorphism),
+// changing which distances it needs.
+
+int GenerateHoistLT(std::vector<int> diags_idxs, std::vector<double> diags_data,
+                    int level, int bs) {
+    ensure_setup();
+    const size_t num_diags = diags_idxs.size();
+    if (num_diags == 0 || diags_data.size() % num_diags != 0)
+        throw std::runtime_error(
+            "GenerateHoistLT: empty or ragged diagonal data.");
+    const size_t width = diags_data.size() / num_diags;
+    if (bs < 1) throw std::runtime_error("GenerateHoistLT: bs must be >= 1.");
+
+    cheddar::PlainHoistMap hoist_map;
+    for (size_t i = 0; i < num_diags; i++) {
+        int k = diags_idxs[i];
+        if (k < 0 || static_cast<size_t>(k) >= width)
+            throw std::runtime_error(
+                "GenerateHoistLT: diagonal index out of [0, width).");
+        int b = k % bs;
+        int g = k - b;
+        cheddar::Message msg(width, Complex(0.0, 0.0));
+        const double* src = diags_data.data() + i * width;
+        // pt[g][b][j'] = diag_k[j' - g]  (roll by +g)
+        for (size_t j = 0; j < width; j++)
+            msg[(j + g) % width] = Complex(src[j], 0.0);
+        hoist_map[g].emplace(b, std::move(msg));
+    }
+
+    BackendState::HoistLT entry;
+    entry.handler = std::make_unique<cheddar::HoistHandler<word>>(
+        g_state.context, hoist_map, level, canonical_scale(level));
+    entry.pt_level = level;
+    int id = g_state.next_hoist_lt_id++;
+    g_state.hoist_lts[id] = std::move(entry);
+    return id;
+}
+
+std::vector<int> GetHoistLTRotationKeys(int hlt_id) {
+    auto it = g_state.hoist_lts.find(hlt_id);
+    if (it == g_state.hoist_lts.end())
+        throw std::out_of_range("HoistLT id " + std::to_string(hlt_id) +
+                                " not found");
+    cheddar::EvkRequest req;
+    it->second.handler->AddRequiredRotations(req, /*min_ks=*/false);
+    std::vector<int> keys;
+    keys.reserve(req.size());
+    for (const auto& [rot, lvl] : req) keys.push_back(rot);
+    return keys;
+}
+
+int EvaluateHoistLT(int hlt_id, int ct_id) {
+    ensure_keys();
+    auto it = g_state.hoist_lts.find(hlt_id);
+    if (it == g_state.hoist_lts.end())
+        throw std::out_of_range("HoistLT id " + std::to_string(hlt_id) +
+                                " not found");
+    const Ct& c = g_state.ct(ct_id);
+    if (c.HasRx())
+        throw std::runtime_error(
+            "EvaluateHoistLT: input is degree-2; relinearize first.");
+    std::unique_ptr<Ct> tmp;
+    const Ct* input = align_down(c, it->second.pt_level, tmp);
+    if (level_of(*input) != it->second.pt_level)
+        throw std::runtime_error(
+            "EvaluateHoistLT: input level below the transform's pt_level.");
+    auto out = std::make_unique<Ct>();
+    // Shared max-level key map: BSFusedKeyMult handles key level >=
+    // input level fine (key_extra/num_accum_offset alignment) once the
+    // fused-dispatch-beta1 patch is in -- verified empirically at
+    // level 3 with max-level keys. No per-level key material needed.
+    it->second.handler->Evaluate(g_state.context, *out, *input,
+                                 g_state.iface->GetEvkMap(),
+                                 /*min_ks=*/false);
+    return g_state.put_ct(std::move(out));
+}
+
+void DeleteHoistLT(int hlt_id) { g_state.hoist_lts.erase(hlt_id); }
 
 int AddPlaintextNew(int ct_id, int pt_id) {
     ensure_setup();
@@ -1018,6 +1327,34 @@ int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
             "EvaluatePolynomialNative: relinearize before evaluating a "
             "polynomial.");
 
+    // Explicit-chain mode: a nominal (2^LogScale) target would strand the
+    // output off the canonical trajectory by up to the chain's per-level
+    // wobble (~2^0.1), far beyond the add-path drift tolerance. The output
+    // level is input_level - ceil(log2(degree+1)) (EvalPoly's BSGS-tree
+    // depth -- the same model orion/nn/activation.py schedules with);
+    // snap the target to that level's canonical scale and verify the
+    // depth model held afterwards.
+    int predicted_level = -1;
+    bool snapped = false;
+    if (g_state.canonical_scales) {
+        int degree = static_cast<int>(coeffs.size()) - 1;
+        int depth = static_cast<int>(std::ceil(std::log2(degree + 1)));
+        predicted_level = level_of(c) - depth;
+        if (predicted_level < 0)
+            throw std::runtime_error(
+                "EvaluatePolynomialNative: not enough levels for degree.");
+        // Callers pass either the nominal default scale or the output
+        // level's (rounded) canonical scale -- snap both onto the exact
+        // canonical value, same rationale as Encode above.
+        double canon = canonical_scale(predicted_level);
+        if (std::abs(target_scale - canon) < 0.15 * canon ||
+            std::abs(target_scale - g_state.default_scale) <
+                0.15 * g_state.default_scale) {
+            snapped = true;
+            target_scale = canon;
+        }
+    }
+
     cheddar::EvalPoly<word> poly(coeffs, level_of(c), c.GetScale(),
                                  target_scale, /*chebyshev=*/false);
     poly.Compile(g_state.context);
@@ -1025,6 +1362,12 @@ int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
     auto out = std::make_unique<Ct>();
     poly.Evaluate(g_state.context, *out, c,
                  g_state.iface->GetMultiplicationKey());
+    if (snapped && level_of(*out) != predicted_level)
+        throw std::runtime_error(
+            "EvaluatePolynomialNative: output level " +
+            std::to_string(level_of(*out)) + " != predicted " +
+            std::to_string(predicted_level) +
+            "; canonical target scale was chosen for the wrong level.");
     return g_state.put_ct(std::move(out));
 }
 
@@ -1036,6 +1379,36 @@ void DeleteBootstrappers() {
     // precompute). All boot state is released by delete_scheme() at scheme
     // teardown. This is also generation-safe: a stale bootstrapper
     // finalizer running after a new scheme is set up won't disturb it.
+}
+
+// Per-level rescale divisors, indexed by level 0..default_encryption_level
+// (index 0 holds base_scale as a placeholder -- there is no rescale from
+// level 0). This is what Orion's errorless-rescale idiom needs from
+// GetModuliChain: encode a plaintext at exactly the amount the next
+// rescale divides by, so mult-then-rescale returns the ciphertext to its
+// prior scale. On flat chains each entry is just that level's prime; on
+// rational-rescaling chains it is the (possibly non-integer) ratio of
+// consecutive level bases, which no prime list can express.
+std::vector<double> GetRescalePrimeProds() {
+    ensure_setup();
+    const int top = g_state.param->default_encryption_level_;
+    std::vector<double> out;
+    out.reserve(top + 1);
+    out.push_back(g_state.param->base_scale_);
+    for (int l = 1; l <= top; ++l)
+        out.push_back(g_state.param->GetRescalePrimeProd(l));
+    return out;
+}
+
+// Canonical per-level scale trajectory (diagnostics / scale planning).
+std::vector<double> GetCanonicalScales() {
+    ensure_setup();
+    const int top = g_state.param->default_encryption_level_;
+    std::vector<double> out;
+    out.reserve(top + 1);
+    for (int l = 0; l <= top; ++l)
+        out.push_back(g_state.param->GetScale(l));
+    return out;
 }
 
 // Number of levels EvalMod consumes in the boot circuit. Fixed by the
@@ -1104,7 +1477,7 @@ void SetPlaintextScale(int pt_id, double scale) {
 // pybind11 module
 // ---------------------------------------------------------------------------
 
-PYBIND11_MODULE(_cheddar_native, m) {
+PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     m.doc() = "Cheddar CKKS backend bindings for Orion.";
 
     // Lifecycle
@@ -1145,6 +1518,17 @@ PYBIND11_MODULE(_cheddar_native, m) {
     // ct - pt
     m.def("MulPlaintextNew", &MulPlaintextNew);
     m.def("MulPlaintext", &MulPlaintext);
+    m.def("MulPlaintextAccumNew", &MulPlaintextAccumNew, py::arg("ct_ids"),
+          py::arg("pt_ids"));
+
+    // Double-hoisted linear transform
+    m.def("GenerateHoistLT", &GenerateHoistLT, py::arg("diags_idxs"),
+          py::arg("diags_data"), py::arg("level"), py::arg("bs"));
+    m.def("GetHoistLTRotationKeys", &GetHoistLTRotationKeys,
+          py::arg("hlt_id"));
+    m.def("EvaluateHoistLT", &EvaluateHoistLT, py::arg("hlt_id"),
+          py::arg("ct_id"));
+    m.def("DeleteHoistLT", &DeleteHoistLT, py::arg("hlt_id"));
     m.def("AddPlaintextNew", &AddPlaintextNew);
     m.def("AddPlaintext", &AddPlaintext);
     m.def("SubPlaintextNew", &SubPlaintextNew);
@@ -1172,6 +1556,8 @@ PYBIND11_MODULE(_cheddar_native, m) {
 
     // Rotations
     m.def("AddRotationKey", &AddRotationKey, py::arg("k"));
+    m.def("AlignToLevelNew", &AlignToLevelNew, py::arg("ct_id"),
+          py::arg("target_level"));
     m.def("RotateNew", &RotateNew, py::arg("ct_id"), py::arg("k"));
     m.def("RotateBatchNew", &RotateBatchNew, py::arg("ct_id"),
           py::arg("shifts"), py::arg("hoist_mode") = 0);
@@ -1183,6 +1569,8 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("Bootstrap", &Bootstrap, py::arg("ct_id"), py::arg("slots"));
     m.def("DeleteBootstrappers", &DeleteBootstrappers);
     m.def("BootNumEvalModLevels", &BootNumEvalModLevels);
+    m.def("GetRescalePrimeProds", &GetRescalePrimeProds);
+    m.def("GetCanonicalScales", &GetCanonicalScales);
 
     // Polynomial evaluation
     m.def("EvaluatePolynomialNative", &EvaluatePolynomialNative,

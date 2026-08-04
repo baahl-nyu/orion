@@ -28,7 +28,10 @@ class TestLinearTransform:
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
 
         # Rescale after linear transform
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         # Decrypt the raw ciphertext ID
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
@@ -55,7 +58,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)
@@ -82,7 +88,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)
@@ -110,7 +119,10 @@ class TestLinearTransform:
 
         ctxt = encrypt_values(scheme, values, level=level)
         ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
-        ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+        # (backends whose LT output is already rescaled -- cheddar's
+        # double-hoisted path -- advertise it via lt_output_prerescaled)
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
 
         ptxt_out_id = scheme.backend.Decrypt(ctxt_out_id)
         result = scheme.backend.Decode(ptxt_out_id)
@@ -118,4 +130,70 @@ class TestLinearTransform:
         # output[i] = input[i] + input[(i+1) mod n]
         expected = [values[i] + values[(i + 1) % slots] for i in range(slots)]
         assert_fhe_close(result, expected, atol=5e-1, msg="multi-diagonal")
+        scheme.backend.DeleteLinearTransform(lt_id)
+
+    def test_input_above_transform_level(self, scheme, slots, max_level):
+        """Input ciphertext arrives ABOVE the transform's level.
+
+        This is the normal mid-network case (a ciphertext descends into a
+        transform whose plaintexts were encoded lower) and exercises the
+        backend's input alignment: the cheddar backend drops the input to
+        the transform level once, before its rotations, instead of
+        re-aligning every rotated operand per accumulation
+        (bindings.EvaluateLinearTransform -> _align_lt_input).
+        """
+        if max_level < 2:
+            pytest.skip("needs at least one level of headroom")
+        values = [float(i % 7) - 3.0 for i in range(slots)]
+        lt_level = 1  # transform low, input at the top of the chain
+
+        diags_idxs = [0, 1]
+        diags_data = [2.0] * slots + [1.0] * slots
+        lt_id = scheme.backend.GenerateLinearTransform(
+            diags_idxs, diags_data, lt_level, 1.0, "none")
+
+        for key in scheme.backend.GetLinearTransformRotationKeys(lt_id):
+            scheme.backend.GenerateLinearTransformRotationKey(key)
+
+        ctxt = encrypt_values(scheme, values, level=max_level)
+        ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+
+        result = scheme.backend.Decode(scheme.backend.Decrypt(ctxt_out_id))
+        expected = [2.0 * values[i] + values[(i + 1) % slots]
+                    for i in range(slots)]
+        assert_fhe_close(result, expected, atol=5e-1,
+                         msg="input above transform level")
+        scheme.backend.DeleteLinearTransform(lt_id)
+
+    def test_input_above_transform_level_bsgs(self, scheme, slots, max_level):
+        """Same gap case through the BSGS path (bsgs_ratio=2, several
+        diagonals -> baby-step batch + giant-step rotations all run at
+        the transform level after the single input alignment)."""
+        if max_level < 2:
+            pytest.skip("needs at least one level of headroom")
+        values = [float((i * 5) % 11) - 5.0 for i in range(slots)]
+        lt_level = 1
+
+        diags_idxs = [0, 1, 2, 5, 8]
+        diags_data = []
+        for d in diags_idxs:
+            diags_data += [float(d + 1)] * slots
+        lt_id = scheme.backend.GenerateLinearTransform(
+            diags_idxs, diags_data, lt_level, 2.0, "none")
+
+        for key in scheme.backend.GetLinearTransformRotationKeys(lt_id):
+            scheme.backend.GenerateLinearTransformRotationKey(key)
+
+        ctxt = encrypt_values(scheme, values, level=max_level)
+        ctxt_out_id = scheme.backend.EvaluateLinearTransform(lt_id, ctxt.ids[0])
+        if not getattr(scheme.backend, "lt_output_prerescaled", False):
+            ctxt_out_id = scheme.backend.Rescale(ctxt_out_id)
+
+        result = scheme.backend.Decode(scheme.backend.Decrypt(ctxt_out_id))
+        expected = [sum((d + 1.0) * values[(i + d) % slots]
+                        for d in diags_idxs) for i in range(slots)]
+        assert_fhe_close(result, expected, atol=5e-1,
+                         msg="input above transform level (bsgs)")
         scheme.backend.DeleteLinearTransform(lt_id)

@@ -27,12 +27,25 @@ from typing import Sequence
 
 import numpy as np
 
+# ORION_CHEDDAR_WORD32=1: use the uint32_t twin module. ~30-bit primes,
+# rational rescaling -- Cheddar's native design point (its paper's 0.72s
+# ResNet numbers are 32-bit), halving the memory footprint of every
+# ciphertext/key/plaintext. Requires a pregenerated chain file (see
+# params32/ and ORION_CHEDDAR_PARAMS_JSON below); LogQ/LogP bit lists
+# cannot express these chains.
+_WORD32 = os.environ.get("ORION_CHEDDAR_WORD32", "").lower() in (
+    "1", "true", "yes", "on")
+
 try:
-    from . import _cheddar_native as _native
+    if _WORD32:
+        from . import _cheddar_native32 as _native
+    else:
+        from . import _cheddar_native as _native
 except ImportError as e:  # pragma: no cover - import-time diagnostic
     raise ImportError(
-        "Could not import _cheddar_native. Build the extension via the "
-        "CMake steps in orion/backend/cheddar/README.md. "
+        f"Could not import {'_cheddar_native32' if _WORD32 else '_cheddar_native'}. "
+        "Build the extension via the CMake steps in "
+        "orion/backend/cheddar/README.md. "
         f"Underlying error: {e}"
     ) from None
 
@@ -161,6 +174,18 @@ class CheddarLibrary:
         shared_bs_env = os.environ.get("ORION_CHEDDAR_SHARED_BS", "").strip()
         self._shared_bs = int(shared_bs_env) if shared_bs_env else None
 
+        # ORION_CHEDDAR_DOUBLE_HOIST=1: evaluate every linear-transform
+        # block through the native HoistHandler (Bossuat et al.
+        # EUROCRYPT'21 double hoisting: fused baby-step
+        # KeyMult+MAC+automorphism sharing one ModUp, fused giant-step
+        # accumulation, final ModDown with the rescale folded in) instead
+        # of the Python-orchestrated BSGS loop. The native output is
+        # already rescaled -- lt_output_prerescaled tells lt_evaluator to
+        # skip its usual post-LT rescale. Off by default until verified.
+        dh_env = os.environ.get("ORION_CHEDDAR_DOUBLE_HOIST", "").lower()
+        self._double_hoist = dh_env in ("1", "true", "yes", "on")
+        self.lt_output_prerescaled = self._double_hoist
+
         self._default_scale: int | None = None
         self._max_level: int | None = None
         self._slots: int | None = None
@@ -242,6 +267,10 @@ class CheddarLibrary:
         self._boot_log_message_ratio = (
             orion_params.get_boot_log_message_ratio() or 5)
 
+        if _WORD32:
+            self._setup_scheme_word32(logq, logp, logscale, logn)
+            return
+
         used: set[int] = set()
         main_primes = _gen_primes(logq, logn, used)
         default_enc_level = len(main_primes) - 1  # usable-chain top
@@ -303,6 +332,117 @@ class CheddarLibrary:
             setup_args["BootMinKs"] = env in ("1", "true", "yes", "on")
 
         self._generation = _native.setup_scheme(setup_args)
+
+    def _setup_scheme_word32(self, logq, logp, logscale, logn) -> None:
+        """32-bit-word setup from a pregenerated chain file.
+
+        ~2^40 scales cannot be one ~30-bit prime per level, so word32
+        chains use rational rescaling: each level's rescale divides by a
+        multi-prime product (main + rotating terminal primes) that only
+        approximates 2^LogScale, described by an explicit LevelConfig.
+        These are pregenerated (Cheddar ships reference chains in
+        parameters/; ours is vendored under params32/) and passed through
+        verbatim -- the YAML's LogQ/LogP entries are nominal placeholders
+        whose only meaningful property is their COUNT, which must match
+        the chain so Orion's level accounting (bootstrap placement, depth
+        budgeting) agrees with the native scheme.
+        """
+        import json
+
+        json_path = os.environ.get("ORION_CHEDDAR_PARAMS_JSON", "").strip()
+        if not json_path:
+            json_path = os.path.join(
+                os.path.dirname(__file__), "params32", "bootparam_40.json")
+        with open(json_path) as f:
+            chain = json.load(f)
+
+        if logn != chain["log_degree"]:
+            raise ValueError(
+                f"word32: YAML LogN={logn} != chain log_degree="
+                f"{chain['log_degree']} ({json_path})")
+        if logscale != chain["log_default_scale"]:
+            raise ValueError(
+                f"word32: YAML LogScale={logscale} != chain "
+                f"log_default_scale={chain['log_default_scale']} ({json_path})")
+        enc_level = int(chain["default_encryption_level"])
+        if len(logq) - 1 != enc_level:
+            raise ValueError(
+                f"word32: YAML LogQ has {len(logq)} entries (usable max "
+                f"level {len(logq) - 1}) but the chain's "
+                f"default_encryption_level is {enc_level}. The chain is "
+                f"rigid (boot circuit levels are baked in), so the YAML "
+                f"must declare exactly {enc_level + 1} LogQ entries "
+                f"({json_path}).")
+
+        chain_boot = bool(chain.get("boot", False))
+        if self._boot_enabled and not chain_boot:
+            raise ValueError(
+                f"word32: YAML requests bootstrap but chain {json_path} "
+                f"has boot=false.")
+        # Filled in after native setup (needs the live Parameter): see
+        # the GetCanonicalScales call below.
+        self._usable_primes = []
+
+        max_level = len(chain["level_config"]) - 1
+        print(f"[Cheddar] Creating CKKS context (word32): LogN={logn}, "
+              f"chain={os.path.basename(json_path)}, scale=2^{logscale}, "
+              f"slots={self._slots}, hoist_mode={self._hoist_mode_name}, "
+              f"boot={'on' if chain_boot else 'off'}, "
+              f"max_level={max_level}, default_enc_level={enc_level}")
+
+        setup_args = {
+            "LogN": logn,
+            "LogScale": logscale,
+            "MainPrimes": list(chain["main_primes"]),
+            "AuxPrimes": list(chain["auxiliary_primes"]),
+            "TerPrimes": list(chain.get("terminal_primes", [])),
+            "LevelConfig": [list(p) for p in chain["level_config"]],
+            "AdditionalBase": list(chain.get("additional_base", [0, 0])),
+            "DefaultEncryptionLevel": enc_level,
+        }
+        if "dense_hamming_weight" in chain:
+            setup_args["DenseHammingWeight"] = int(
+                chain["dense_hamming_weight"])
+        if "sparse_hamming_weight" in chain:
+            setup_args["SparseHammingWeight"] = int(
+                chain["sparse_hamming_weight"])
+
+        if chain_boot:
+            # Boot geometry comes from the chain (its reserved levels are
+            # part of the pregenerated structure); YAML knobs must agree
+            # if present.
+            cts = int(chain["num_cts_levels"])
+            stc = int(chain["num_stc_levels"])
+            if self._boot_enabled and (
+                    self._boot_num_cts_levels != cts
+                    or self._boot_num_stc_levels != stc):
+                raise ValueError(
+                    f"word32: YAML boot levels (cts="
+                    f"{self._boot_num_cts_levels}, stc="
+                    f"{self._boot_num_stc_levels}) != chain (cts={cts}, "
+                    f"stc={stc}) ({json_path}).")
+            self._boot_enabled = True
+            self._boot_num_cts_levels = cts
+            self._boot_num_stc_levels = stc
+            setup_args["BootNumCtsLevels"] = cts
+            setup_args["BootNumStcLevels"] = stc
+            setup_args["BootLogMessageRatio"] = self._boot_log_message_ratio
+            env = os.environ.get("ORION_CHEDDAR_BOOT_MIN_KS", "").lower()
+            setup_args["BootMinKs"] = env in ("1", "true", "yes", "on")
+
+        self._generation = _native.setup_scheme(setup_args)
+
+        # GetModuliChain feeds Orion's errorless-rescale idiom (nn layers
+        # encode plaintexts at moduli_chain[level] so mult-then-rescale
+        # stays scale-exact). With rational rescaling the value that
+        # achieves this is the level's CANONICAL scale, not any prime:
+        # canonical(l)^2 / rescale_prod(l) == canonical(l-1), so a
+        # plaintext at canonical(l) keeps the ciphertext on the
+        # trajectory through both ct-pt and ct-ct multiplies. Rounded to
+        # int here (GetModuliChain's contract); the native Encode snaps
+        # near-canonical requests onto the exact double.
+        self._usable_primes = [
+            int(round(s)) for s in _native.GetCanonicalScales()]
 
     def DeleteScheme(self) -> None:
         if self._generation is not None:
@@ -436,6 +576,14 @@ class CheddarLibrary:
 
     def MulPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintextNew(int(ct_id), int(pt_id))
+
+    def MulPlaintextAccumNew(self, ct_ids: Sequence[int],
+                             pt_ids: Sequence[int]) -> int:
+        """Fused MAC: sum_i ct_i * pt_i in one native PAccum kernel chain
+        instead of N ct-pt mults + N-1 adds (each a separate memory-bound
+        pass over full ciphertexts)."""
+        return _native.MulPlaintextAccumNew(
+            [int(c) for c in ct_ids], [int(p) for p in pt_ids])
 
     def MulPlaintext(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintext(int(ct_id), int(pt_id))
@@ -594,6 +742,24 @@ class CheddarLibrary:
         else:
             bs = None
 
+        # Double-hoisted path: hand the raw diagonals to the native
+        # HoistHandler (it pre-encodes its own per-(gs,bs) plaintexts with
+        # the giant-step roll baked in, so the Python-side pt cache below
+        # is skipped entirely). ALL blocks route through it when enabled --
+        # mixing native (pre-rescaled) and Python (unrescaled) blocks in
+        # one accumulation row would mismatch scales.
+        if self._double_hoist:
+            hoist_bs = bs if bs is not None else max(
+                1, math.ceil(math.sqrt(max(1, len(diags)))))
+            hoist_id = _native.GenerateHoistLT(
+                [int(k) for k in diags],
+                [float(v) for vals in diags.values() for v in vals],
+                int(level), int(hoist_bs))
+            lt_id = self._next_lt_id
+            self._next_lt_id += 1
+            self._transforms[lt_id] = {"hoist_id": hoist_id}
+            return lt_id
+
         # Encode every diagonal's plaintext once, here at compile time,
         # instead of on every EvaluateLinearTransform call. Diagonal values
         # are the model's fixed trained weights -- they never depend on the
@@ -618,6 +784,7 @@ class CheddarLibrary:
         self._transforms[lt_id] = {
             "diags": diags, "bsgs_ratio": bsgs_ratio,
             "use_bsgs": use_bsgs, "bs": bs, "pt_ids": pt_ids,
+            "level": int(level),
         }
         return lt_id
 
@@ -628,7 +795,15 @@ class CheddarLibrary:
         return self._transforms[lt_id]["bs"]
 
     def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
-        diags = self._transforms[lt_id]["diags"]
+        t = self._transforms[lt_id]
+        if "hoist_id" in t:
+            # Ask the constructed handler -- it may have swapped bs/gs
+            # internally (single-giant-group optimization), changing
+            # which distances it needs. Keys land in the shared
+            # max-level map via the normal AddRotationKey flow; the
+            # fused kernels handle key level >= input level.
+            return list(_native.GetHoistLTRotationKeys(t["hoist_id"]))
+        diags = t["diags"]
         if not self._lt_use_bsgs(lt_id):
             return sorted(k for k in diags if k != 0)
         bs = self._lt_bsgs_stride(lt_id)
@@ -646,22 +821,60 @@ class CheddarLibrary:
 
     def EvaluateLinearTransform(self, lt_id: int, ct_id: int) -> int:
         t = self._transforms[lt_id]
-        if t["use_bsgs"]:
-            return self._eval_lt_bsgs(ct_id, t["diags"], t["bs"], t["pt_ids"])
-        return self._eval_lt_naive(ct_id, t["diags"], t["pt_ids"])
+        if "hoist_id" in t:
+            return _native.EvaluateHoistLT(t["hoist_id"], int(ct_id))
+        # Align the input to the transform's plaintext level ONCE, before
+        # the baby-step rotations. Without this, every rotated operand of
+        # every MulPlaintextAccumNew call re-pays the same LevelDown walk
+        # natively (align_down), and cheddar's LevelDown is a per-level
+        # Mult+Rescale chain -- profiled at 89-98% of all ModDown-family
+        # kernel launches on HELRM@500k (60k/68k for w64, 253k/259k for
+        # w32 per forward). Aligning here also runs the rotations at the
+        # target level's limb count instead of the arrival level's.
+        src, owned = self._align_lt_input(ct_id, t["level"])
+        try:
+            if t["use_bsgs"]:
+                return self._eval_lt_bsgs(src, t["diags"], t["bs"],
+                                          t["pt_ids"])
+            return self._eval_lt_naive(src, t["diags"], t["pt_ids"])
+        finally:
+            if owned:
+                self.DeleteCiphertext(src)
 
     def _lt_encode(self, values, level: int) -> int:
         return self.Encode(values, level, self._default_scale)
 
+    def _align_lt_input(self, ct_id: int, level: int) -> tuple[int, bool]:
+        """(aligned_ct_id, caller_owns_it). Drops the input to `level`
+        via one native LevelDown when it arrives higher; inputs at or
+        below the transform level pass through untouched (the native MAC
+        re-encodes plaintexts downward for that case)."""
+        if self.GetCiphertextLevel(ct_id) <= level:
+            return int(ct_id), False
+        return _native.AlignToLevelNew(int(ct_id), int(level)), True
+
+    def _rotate_lt_batch(self, ct_id: int, ks: list[int]) -> dict[int, int]:
+        """Rotate one ciphertext by every distance in ks (nonzero, unique),
+        as a single hoisted batch. All these rotations share the same
+        input, so RotateBatchNew (hoist_mode="single") pays the ModUp once
+        for the whole batch -- measured 1.5-1.6x over an equivalent solo
+        RotateNew loop at real baby-step batch sizes (n=8..63). Caller
+        owns (and must delete) the returned ciphertexts."""
+        if len(ks) < 2:
+            return {k: self.RotateNew(ct_id, k) for k in ks}
+        return dict(zip(ks, self.RotateBatchNew(ct_id, ks)))
+
     def _eval_lt_naive(self, ct_id: int, diags: dict[int, list[float]],
                        pt_ids: dict[int, int]) -> int:
-        result = None
-        for k in diags:
-            rotated = self._rotate_lt(ct_id, k)
-            prod = self.MulPlaintextNew(rotated, pt_ids[k])
-            if rotated != ct_id:
-                self.DeleteCiphertext(rotated)
-            result = prod if result is None else self._lt_accumulate(result, prod)
+        # Every diagonal rotates the same input ct -- hoist them as one
+        # batch (k=0 uses the input directly), then fold the whole
+        # rotate*diag sum into one fused MAC call.
+        rots = self._rotate_lt_batch(ct_id, [k for k in diags if k != 0])
+        ks = list(diags)
+        result = self.MulPlaintextAccumNew(
+            [rots.get(k, ct_id) for k in ks], [pt_ids[k] for k in ks])
+        for rot in rots.values():
+            self.DeleteCiphertext(rot)
         return result
 
     def _eval_lt_bsgs(self, ct_id: int, diags: dict[int, list[float]],
@@ -671,16 +884,23 @@ class CheddarLibrary:
             b, g = k % bs, k // bs
             giant_groups.setdefault(g, []).append((b, k))
 
+        # Baby-step rotations all share the input ct -> one hoisted batch.
+        # Giant-step rotations (below) each apply to a different
+        # accumulated ciphertext, so they can't join the batch.
         needed_babies = sorted({b for group in giant_groups.values()
                                 for b, _ in group})
-        baby_rots = {b: self._rotate_lt(ct_id, b) for b in needed_babies}
+        baby_rots = self._rotate_lt_batch(
+            ct_id, [b for b in needed_babies if b != 0])
+        if needed_babies and needed_babies[0] == 0:
+            baby_rots[0] = ct_id
 
         result = None
         for g, group in giant_groups.items():
-            inner = None
-            for b, k in group:
-                prod = self.MulPlaintextNew(baby_rots[b], pt_ids[k])
-                inner = prod if inner is None else self._lt_accumulate(inner, prod)
+            # One fused MAC per giant group: sum_b baby_rots[b] * diag_k
+            # replaces len(group) mults + len(group)-1 adds.
+            inner = self.MulPlaintextAccumNew(
+                [baby_rots[b] for b, _ in group],
+                [pt_ids[k] for _, k in group])
 
             partial = self._rotate_lt(inner, g * bs)
             if partial is not inner:
@@ -700,9 +920,13 @@ class CheddarLibrary:
 
     def DeleteLinearTransform(self, lt_id: int) -> None:
         t = self._transforms.pop(lt_id, None)
-        if t is not None:
-            for pt_id in t["pt_ids"].values():
-                self.DeletePlaintext(pt_id)
+        if t is None:
+            return
+        if "hoist_id" in t:
+            _native.DeleteHoistLT(t["hoist_id"])
+            return
+        for pt_id in t["pt_ids"].values():
+            self.DeletePlaintext(pt_id)
 
     def RemoveRotationKeys(self) -> None:
         """No-op. Cheddar caches rotation keys natively; no release path."""
@@ -827,13 +1051,34 @@ class CheddarLibrary:
         domain_min, domain_max = -1.0, 1.0
         current_gap = gap
 
+        # Each stage's fit interval is inflated beyond the previous
+        # stage's CLEAR output range: the actual FHE input to stage i+1
+        # is stage i's output plus accumulated ciphertext noise, and a
+        # least-squares Chebyshev fit is completely unconstrained
+        # outside its fitted interval -- a degree-27 tail can hit +-75
+        # within 10% past the edge. Measured on the 32-bit chain
+        # (word32 seed 5, ResNet20 layers_1_0_act1): stage-1 clear
+        # output +-1.0x, FHE input to stage 2 reached +-1.103 -> stage-2
+        # output exploded to [-57, +75] and corrupted the whole
+        # inference, deterministically per noise draw (~40% of draws).
+        # Fitting over 1.25x the clear range keeps every stage
+        # sign-like across the entire noise-reachable interval; costs a
+        # slightly coarser fit of the same degree (ResNet20 MAE 0.0003
+        # -> 0.0006), nothing at runtime. Applied in word32 mode only:
+        # 64-bit noise never approaches the cliff (no corruption in
+        # dozens of runs), so its fit -- and its documented benchmark
+        # numbers -- stay bit-identical.
+        noise_domain_margin = 1.25 if _WORD32 else 1.0
+
         coeffs_flat: list[float] = []
         for i, deg in enumerate(degrees):
             is_last = (i == len(degrees) - 1)
             n_pts = max(8 * deg, 500)
 
-            x_neg = np.linspace(domain_min, -current_gap, n_pts)
-            x_pos = np.linspace(current_gap, domain_max, n_pts)
+            fit_min = domain_min * noise_domain_margin
+            fit_max = domain_max * noise_domain_margin
+            x_neg = np.linspace(fit_min, -current_gap, n_pts)
+            x_pos = np.linspace(current_gap, fit_max, n_pts)
             x = np.concatenate([x_neg, x_pos])
             y = np.where(x > 0, 1.0, 0.0) if is_last else np.sign(x)
 
@@ -841,8 +1086,10 @@ class CheddarLibrary:
             coeffs_flat.extend(coeffs[:deg + 1].tolist())
 
             if not is_last:
-                dense_neg = np.linspace(domain_min, -current_gap, 2000)
-                dense_pos = np.linspace(current_gap, domain_max, 2000)
+                # Next stage's domain = this stage's output over the
+                # whole noise-reachable (inflated) input interval.
+                dense_neg = np.linspace(fit_min, -current_gap, 2000)
+                dense_pos = np.linspace(current_gap, fit_max, 2000)
                 dense = np.concatenate([dense_neg, dense_pos])
                 output = self._eval_chebyshev_standard_basis(dense, coeffs)
 
