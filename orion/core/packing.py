@@ -1,3 +1,4 @@
+import os
 import math
 import time
 
@@ -213,7 +214,14 @@ def propagate_physical_slots(network_dag, topo_sort):
             max_slots = module.scheme.params.get_slots()
             backend = module.scheme.params.get_backend()
 
-        if backend != "cheddar":
+        # ORION_CHEDDAR_DISABLE_NARROW_PACKING=1: diagnostic escape hatch
+        # -- route cheddar through the same no-op path as every other
+        # backend, restoring the pre-narrow-packing global-width
+        # behavior (every ciphertext packed/booted at max_slots). Used
+        # to A/B the HELRM threshold-500 precision regression.
+        narrow_disabled = bool(os.environ.get(
+            "ORION_CHEDDAR_DISABLE_NARROW_PACKING", ""))
+        if backend != "cheddar" or narrow_disabled:
             # No-op path for every other backend: deliberately do NOT
             # touch .slots/.physical_slots here, leaving them at their
             # class-level None default. Every consumer already falls
