@@ -198,8 +198,27 @@ def propagate_physical_slots(network_dag, topo_sort):
     """
     max_slots = None
     backend = None
+    embed_method = None
     output_width = {}
     network_input_slots = None
+
+    # ORION_CHEDDAR_DISABLE_FOLD_RETAG=1: A/B escape hatch for the
+    # fold-retag narrowing below -- restores the old monotone
+    # width-only-grows behavior (pack AND runtime read the same flag,
+    # so compile-time widths and runtime retags always stay consistent
+    # within a process).
+    fold_retag_off = bool(os.environ.get(
+        "ORION_CHEDDAR_DISABLE_FOLD_RETAG", ""))
+
+    # The last LinearTransform in topo order is packed with the square
+    # method (orion.py forces last=True: no output fold), so it never
+    # narrows -- mirror that exclusion here.
+    last_lt_node = None
+    for _n in reversed(topo_sort):
+        _m = network_dag.nodes[_n]["module"]
+        if _m is not None and hasattr(_m, "generate_diagonals"):
+            last_lt_node = _n
+            break
 
     for node in topo_sort:
         module = network_dag.nodes[node]["module"]
@@ -213,6 +232,7 @@ def propagate_physical_slots(network_dag, topo_sort):
         if max_slots is None:
             max_slots = module.scheme.params.get_slots()
             backend = module.scheme.params.get_backend()
+            embed_method = module.scheme.params.get_embedding_method()
 
         # ORION_CHEDDAR_DISABLE_NARROW_PACKING=1: diagnostic escape hatch
         # -- route cheddar through the same no-op path as every other
@@ -266,11 +286,48 @@ def propagate_physical_slots(network_dag, topo_sort):
                 # produced wrong rotation wraparound (caught by
                 # test_cheddar_narrow_packing.py's MAE assertion).
                 network_input_slots = width
+
+            # Fold-retag width narrowing: the hybrid method's output
+            # fold (LinearTransform.evaluate_transforms's rotate-and-add
+            # over slots/2^i) leaves the output genuinely periodic with
+            # period slots >> output_rotations ~= pow2ceil(out_elements)
+            # -- verified numerically on HELRM@500k (sparse_to_top's
+            # 32768-wide output matches itself mod 512 to the noise
+            # floor, ~2.6e-7). A periodic dense ciphertext IS a valid
+            # sparse ciphertext, so evaluate_transforms retags it down
+            # to `folded_slots` (pure metadata via SetCiphertextSlots)
+            # and everything downstream -- including bootstrap circuit
+            # selection -- runs at the narrow width. This is the resize
+            # primitive the module docstring said didn't exist (yet).
+            # Restricted to plain Linear (Embedding/Conv2d have their
+            # own fold/layout conventions), non-last (the last LT uses
+            # the square method, no fold), hybrid embedding method only.
+            # Runtime cross-checks the prediction against the actual
+            # output_rotations and refuses to retag on mismatch.
+            module.folded_slots = None
+            out_width = width
+            if (not fold_retag_off
+                    and type(module).__name__ == "Linear"
+                    and node != last_lt_node
+                    and embed_method == "hybrid"):
+                folded = round_up_slots(own_output_elements, max_slots)
+                # Floor at 512, not round_up_slots' 256: a 256-wide
+                # min-KS bootstrap on the word32 chain hits cheddar's
+                # "Hoist: min_ks should be false for bs == 1" abort (its
+                # stride decomposition degenerates to a single-rotation
+                # hoist group). 512-wide boots are verified fine on both
+                # word sizes, and boot cost is width-flat, so the extra
+                # width is free.
+                folded = max(folded, 512)
+                if folded and folded < width:
+                    module.folded_slots = folded
+                    out_width = folded
         else:
             width = input_width
+            out_width = width
 
         module.physical_slots = width
-        output_width[node] = width
+        output_width[node] = out_width
 
     # Per-input required widths. network_input_slots (the first LT's
     # width in topo order) is a single scalar and silently WRONG for

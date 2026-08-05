@@ -1465,6 +1465,26 @@ int GetPlaintextLevel(int pt_id) { return level_of(g_state.pt(pt_id)); }
 int GetCiphertextSlots(int ct_id) { return g_state.ct(ct_id).GetNumSlots(); }
 int GetPlaintextSlots(int pt_id) { return g_state.pt(pt_id).GetNumSlots(); }
 
+// Narrowing-only slot retag. ONLY valid when the caller guarantees the
+// ciphertext's slot values are already periodic with period `slots`
+// (e.g. after the hybrid method's rotate-and-add output fold, whose
+// result is genuinely slots/2^r-periodic across the full width) -- a
+// periodic dense ciphertext IS bit-for-bit a valid sparse (narrow)
+// ciphertext, so this is pure metadata, no homomorphic work. Retagging
+// a NON-periodic ciphertext silently corrupts rotation wraparound and
+// bootstrap (the failure mode that killed the Phase-2 boot-resize
+// attempt), hence the divisibility/narrowing guards.
+void SetCiphertextSlots(int ct_id, int slots) {
+    auto &ct = g_state.ct(ct_id);
+    int cur = ct.GetNumSlots();
+    if (slots <= 0 || slots > cur || cur % slots != 0)
+        throw std::invalid_argument(
+            "SetCiphertextSlots: target must be a positive divisor of the "
+            "current width (narrowing only); got " + std::to_string(slots) +
+            " from " + std::to_string(cur));
+    ct.SetNumSlots(slots);
+}
+
 double GetCiphertextScale(int ct_id) { return g_state.ct(ct_id).GetScale(); }
 double GetPlaintextScale(int pt_id) { return g_state.pt(pt_id).GetScale(); }
 void SetCiphertextScale(int ct_id, double scale) {
@@ -1589,6 +1609,8 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     m.def("GetCiphertextLevel", &GetCiphertextLevel, py::arg("ct_id"));
     m.def("GetPlaintextLevel", &GetPlaintextLevel, py::arg("pt_id"));
     m.def("GetCiphertextSlots", &GetCiphertextSlots, py::arg("ct_id"));
+    m.def("SetCiphertextSlots", &SetCiphertextSlots, py::arg("ct_id"),
+          py::arg("slots"));
     m.def("GetPlaintextSlots", &GetPlaintextSlots, py::arg("pt_id"));
     m.def("GetCiphertextScale", &GetCiphertextScale, py::arg("ct_id"));
     m.def("GetPlaintextScale", &GetPlaintextScale, py::arg("pt_id"));
