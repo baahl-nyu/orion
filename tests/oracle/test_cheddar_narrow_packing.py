@@ -11,9 +11,12 @@ wrong rotation wraparound rather than a crash. Two scenarios are covered:
 
   1. A layer whose output is narrower than its input (forces
      output_rotations > 0 under the hybrid embedding method).
-  2. A residual-style two-branch merge (Add) followed by another layer,
-     which must inherit the *wider* of the two branches' physical widths,
-     not just its own logical input shape.
+  2. A residual-style two-branch merge (Add) followed by another layer.
+     With fold-retag narrowing active (the default), both branches'
+     folded outputs are retagged down to their common 512-periodic
+     width and the downstream layer packs at that folded width; the
+     end-to-end MAE assertion is what verifies the merge stays correct
+     across the retag.
 
 Run explicitly with:  pytest -m slow tests/oracle/test_cheddar_narrow_packing.py
 """
@@ -104,10 +107,24 @@ class TestCheddarNarrowPacking:
             "expected fc2a to hit the hybrid output-rotation fold "
             "(narrower own-output than inherited physical input width)")
         assert net.fc2b.output_rotations > 0
-        assert net.fc3.slots == net.fc2a.slots == net.fc2b.slots, (
-            "fc3 must inherit the branches' physical width from the Add "
-            "merge, not recompute a narrower one from its own logical "
-            "512-element input shape")
+        # Fold-retag narrowing (see propagate_physical_slots): both
+        # branches' hybrid folds leave their outputs 512-periodic, so
+        # their ciphertexts are retagged down to 512 at runtime and fc3
+        # correctly packs at that *folded* width -- narrower than the
+        # branches' own 1024 pack width. (Before the fold-retag resize
+        # primitive existed, the invariant here was the opposite: fc3
+        # had to inherit the full 1024 because nothing could narrow a
+        # ciphertext mid-network. ORION_CHEDDAR_DISABLE_FOLD_RETAG=1
+        # restores that behavior.)
+        assert net.fc2a.folded_slots == net.fc2b.folded_slots == 512, (
+            "expected both branches to be marked for fold-retag "
+            "narrowing to 512")
+        assert net.fc3.slots == 512, (
+            "fc3 must pack at the branches' folded (retagged) width, "
+            "which the Add merge carries forward")
+        assert net.fc3.folded_slots is None, (
+            "the last LinearTransform uses the square method (no fold) "
+            "and must never be marked for retag")
 
         vec_ptxt = orion.encode(inp, input_level)
         vec_ctxt = orion.encrypt(vec_ptxt)
