@@ -28,6 +28,11 @@ class LinearTransform(Module):
         # packing width has always been the global constant.
         self.slots = None
         self.physical_slots = None
+        # Post-fold physical width this layer's OUTPUT retags down to
+        # (None = no narrowing). Set by packing.propagate_physical_slots
+        # for plain hybrid Linear layers whose fold leaves the output
+        # slots/2^r-periodic; consumed at the end of evaluate_transforms.
+        self.folded_slots = None
 
     def __del__(self):
         if 'sys' in globals() and sys.modules and self.scheme:
@@ -83,6 +88,26 @@ class LinearTransform(Module):
         slots = self.slots or self.scheme.params.get_slots()
         for i in range(1, self.output_rotations+1):
             out += out.roll(slots // (2**i))
+
+        # Fold-retag narrowing (cheddar): the fold above left the output
+        # (slots >> output_rotations)-periodic, which is bit-for-bit a
+        # valid sparse ciphertext at any multiple of that period -- so
+        # narrowing to folded_slots is pure metadata. Downstream layers
+        # were packed against folded_slots by propagate_physical_slots;
+        # a mismatch here means the compile-time fold prediction was
+        # wrong and retagging would corrupt rotation wraparound, so
+        # refuse loudly instead.
+        if self.folded_slots and self.folded_slots < slots:
+            period = slots >> self.output_rotations
+            if self.output_rotations == 0 or self.folded_slots % period != 0:
+                raise RuntimeError(
+                    f"fold-retag mismatch in {type(self).__name__}: packed "
+                    f"width {slots} with {self.output_rotations} output "
+                    f"rotations gives period {period}, which does not "
+                    f"divide the predicted folded width {self.folded_slots}")
+            for ct_id in out.ids:
+                self.scheme.backend.SetCiphertextSlots(
+                    int(ct_id), int(self.folded_slots))
 
         out += self.on_bias_ptxt
         return out
@@ -144,8 +169,14 @@ class Linear(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_linear_bias(self)
+        # The bias is added AFTER the output fold (and after the
+        # fold-retag narrowing, when active) -- encode it at the width
+        # the output actually has at that point, else a wide bias
+        # plaintext would re-widen the narrowed ciphertext via the
+        # native Max(operand widths) rule.
         self.on_bias_ptxt = self.scheme.encoder.encode(
-            bias, self.level-self.depth, target_slots=self.slots)
+            bias, self.level-self.depth,
+            target_slots=self.folded_slots or self.slots)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
     
     def forward(self, x):

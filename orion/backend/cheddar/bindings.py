@@ -1141,6 +1141,14 @@ class CheddarLibrary:
     def GetCiphertextSlots(self, ct_id: int) -> int:
         return _native.GetCiphertextSlots(int(ct_id))
 
+    def SetCiphertextSlots(self, ct_id: int, slots: int) -> None:
+        """Narrowing-only slot retag (pure metadata). Only valid when
+        the ciphertext's slot values are already `slots`-periodic --
+        e.g. after the hybrid output fold. The native side enforces
+        narrowing + divisibility; periodicity is the caller's contract
+        (see LinearTransform.evaluate_transforms)."""
+        _native.SetCiphertextSlots(int(ct_id), int(slots))
+
     def GetPlaintextSlots(self, pt_id: int) -> int:
         return _native.GetPlaintextSlots(int(pt_id))
 
