@@ -26,7 +26,9 @@ import os
 import time
 from argparse import ArgumentParser
 from os import makedirs
-from os.path import join
+from os.path import abspath, dirname, join
+
+import yaml
 
 os.environ.setdefault("ORION_CHEDDAR_MANAGED_MEMORY", "1")
 os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "1")
@@ -105,8 +107,36 @@ def build_config(word32=False):
     }
 
 
+def assert_params_match_yaml():
+    """Fail loudly if the benchmark's pinned word64 CKKS/boot params
+    drift from the shared example config (params_cheddar.yaml).
+
+    The params are deliberately hard-coded here (batch_size=1, debug
+    off, plus the word32 twin set no yaml expresses) so a table row is
+    fully determined by this script's git hash -- but that pin means an
+    intentional parameter change in the yaml would NOT propagate here.
+    This guard turns that silent divergence into an immediate error.
+    (The word32 set has no yaml counterpart; it is checked against
+    nothing and changes only with the pregenerated rescaling chain.)
+    """
+    path = join(dirname(abspath(__file__)), "params_cheddar.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        ref = yaml.safe_load(f)
+    pinned = build_config(word32=False)
+    for key in ("ckks_params", "boot_params"):
+        if ref.get(key) != pinned[key]:
+            raise SystemExit(
+                f"bench_sweep.py's pinned {key} no longer match "
+                f"params_cheddar.yaml.\n  yaml:   {ref.get(key)}\n"
+                f"  pinned: {pinned[key]}\n"
+                "If the yaml change is intentional, update build_config "
+                "(and re-run the ablation tables); if not, revert the "
+                "yaml.")
+
+
 def main():
     args = parse_args()
+    assert_params_match_yaml()
     torch.manual_seed(args.seed)
 
     model = HELRM(SPARSE_SIZES, args.compress_threshold, args.base)
