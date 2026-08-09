@@ -30,8 +30,21 @@ from os.path import abspath, dirname, join
 
 import yaml
 
+# Default knob set, re-tuned on the 24GB RTX 3090 AFTER fold-retag
+# narrowing (full MIN_KS x SHARED_BS grid, every threshold, both word
+# sizes -- see HELRM_ABLATION.md's knob re-sweep): MIN_KS=0 + no
+# SHARED_BS wins or ties every cell. The old MIN_KS=1 + SHARED_BS=64
+# defaults were tuned pre-fold-retag, when the inflated working set
+# (wide top path + 32768-wide boot circuit) made key memory the binding
+# constraint; fold-retag removed that, so both memory knobs' compute tax
+# (chained boot rotations / ~30-55% extra LT rotations) became pure
+# loss. MANAGED_MEMORY=1 remains mandatory on 24GB (thr500 alone peaks
+# 23.9GB w32 / 32.5GB w64 at keygen). The memory knobs still exist for
+# tighter-memory cards: export ORION_CHEDDAR_BOOT_MIN_KS=1 and/or
+# ORION_CHEDDAR_SHARED_BS=64 -- setdefault means any exported env var
+# wins over these defaults.
 os.environ.setdefault("ORION_CHEDDAR_MANAGED_MEMORY", "1")
-os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "1")
+os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "0")
 
 import torch
 
