@@ -55,6 +55,13 @@ if(NOT DEFINED SPDLOG_INCLUDE_DIR)
     set(SPDLOG_INCLUDE_DIR "$ENV{HOME}/miniconda3/include")
 endif()
 
+# How that spdlog expects to get fmt. Conda's spdlog is built against an
+# external fmt (the default, matching Cheddar's own configure). The copy
+# vendored by Cheddar's FetchContent
+# (<CHEDDAR_BUILD_DIR>/_deps/spdlog-src/include, spdlog 1.8.5) bundles fmt
+# instead, so pointing SPDLOG_INCLUDE_DIR there needs -D SPDLOG_EXTERNAL_FMT=OFF.
+option(SPDLOG_EXTERNAL_FMT "spdlog headers expect an external fmt" ON)
+
 find_package(CUDAToolkit 11.8 REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -99,7 +106,9 @@ foreach(tgt _cheddar_native _cheddar_native32)
 
     # Conda's spdlog is compiled against an external fmt (no bundled copy),
     # matching how Cheddar itself was configured.
-    target_compile_definitions(${tgt} PRIVATE SPDLOG_FMT_EXTERNAL)
+    if(SPDLOG_EXTERNAL_FMT)
+        target_compile_definitions(${tgt} PRIVATE SPDLOG_FMT_EXTERNAL)
+    endif()
 
     target_link_libraries(${tgt} PRIVATE
         "${CHEDDAR_BUILD_DIR}/libcheddar.so"
