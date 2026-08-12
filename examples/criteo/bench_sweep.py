@@ -200,6 +200,29 @@ def main():
     mae = float((clear_logit - fhe_logit).abs().mean())
     precision = None if mae == 0 else -math.log2(mae)
 
+    # Memory counters. peak_device_mb is the true *logical* peak from the
+    # managed-memory patch's statistics adaptor -- it counts bytes allocated
+    # regardless of whether they were physically resident or paged to host
+    # RAM by UVM, so it stays meaningful under MANAGED_MEMORY=1. Without it
+    # a memory ablation can't distinguish "fits in VRAM" from "fits only
+    # because UVM paged it out". Cheddar-only; None on other backends.
+    peak_device_mb = key_memory_mb = None
+    try:
+        from orion.core.orion import scheme as _scheme
+        _backend = _scheme.backend
+        if hasattr(_backend, "GetPeakDeviceMemoryMB"):
+            peak_device_mb = _backend.GetPeakDeviceMemoryMB()
+            key_memory_mb = _backend.GetKeyMemoryMB()
+    except Exception as exc:  # never fail a timed run over instrumentation
+        print(f"[mem] counters unavailable: {exc}", flush=True)
+
+    # Record the knobs actually in effect so each JSON is self-describing
+    # and a grid cell can be identified from its output alone.
+    env_knobs = {
+        k: v for k, v in sorted(os.environ.items())
+        if k.startswith("ORION_CHEDDAR_")
+    }
+
     result = {
         "compress_threshold": args.compress_threshold,
         "base": args.base,
@@ -210,6 +233,9 @@ def main():
         "precision": precision,
         "runtime_seconds": runtime,  # mean of warm trials
         "runtime_seconds_trials": trial_times,
+        "peak_device_mb": peak_device_mb,
+        "key_memory_mb": key_memory_mb,
+        "env_knobs": env_knobs,
     }
 
     makedirs(args.out_dir, exist_ok=True)
