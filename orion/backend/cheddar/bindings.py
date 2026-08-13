@@ -533,6 +533,14 @@ class CheddarLibrary:
     def Decode(self, pt_id: int):
         return _native.Decode(int(pt_id))
 
+    def EncodeComplex(self, interleaved, level: int, scale) -> int:
+        """`interleaved` is [re0, im0, re1, im1, ...]."""
+        return _native.EncodeComplex(
+            list(interleaved), int(level), float(scale))
+
+    def DecodeComplex(self, pt_id: int):
+        return _native.DecodeComplex(int(pt_id))
+
     def Encrypt(self, pt_id: int) -> int:
         return _native.Encrypt(int(pt_id))
 
@@ -569,6 +577,19 @@ class CheddarLibrary:
 
     def Negate(self, ct_id: int) -> int:
         return _native.Negate(int(ct_id))
+
+    def Conjugate(self, ct_id: int) -> int:
+        return _native.Conjugate(int(ct_id))
+
+    def ConjugateNew(self, ct_id: int) -> int:
+        return _native.ConjugateNew(int(ct_id))
+
+    def MulImaginaryUnit(self, ct_id: int) -> int:
+        """Slot-wise multiply by sqrt(-1). Key-free, no level consumed."""
+        return _native.MulImaginaryUnit(int(ct_id))
+
+    def MulImaginaryUnitNew(self, ct_id: int) -> int:
+        return _native.MulImaginaryUnitNew(int(ct_id))
 
     # ------------------------------------------------------------------
     # ct - pt arithmetic
@@ -982,13 +1003,18 @@ class CheddarLibrary:
 
     def EvaluatePolynomial(self, ct_id: int, poly_id: int, scale) -> int:
         coeffs, kind = self._polynomials[poly_id]
-        if kind == "chebyshev":
-            coeffs = np.polynomial.chebyshev.cheb2poly(coeffs).tolist()
         # EvalPoly (native, log-depth) requires degree >= 2; below that
         # Horner's method is already both cheap and exact.
         if len(coeffs) - 1 >= 2:
+            # Chebyshev coefficients are evaluated natively in Chebyshev
+            # basis -- converting via cheb2poly loses all precision past
+            # degree ~30 (monomial coefficients grow like 2^degree).
             return _native.EvaluatePolynomialNative(
-                int(ct_id), coeffs, float(scale))
+                int(ct_id), coeffs, float(scale),
+                chebyshev=(kind == "chebyshev"))
+        if kind == "chebyshev":
+            # Degree <= 1: T0 = 1, T1 = x, so the conversion is exact.
+            coeffs = np.polynomial.chebyshev.cheb2poly(coeffs).tolist()
         return self._eval_monomial(ct_id, coeffs)
 
     def _eval_monomial(self, ct_id: int, coeffs: list[float]) -> int:
