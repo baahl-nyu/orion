@@ -462,12 +462,45 @@ int Encode(std::vector<double> values, int level, double scale) {
     return g_state.put_pt(std::move(pt));
 }
 
+// Complex-lane variant: `interleaved` is [re0, im0, re1, im1, ...].
+// Cheddar's encoder is natively complex, so this is the same call as Encode minus the
+// imaginary-part zeroing.
+int EncodeComplex(std::vector<double> interleaved, int level, double scale) {
+    ensure_setup();
+    if (interleaved.size() % 2 != 0)
+        throw std::runtime_error(
+            "EncodeComplex: expected interleaved [re, im, ...] pairs.");
+    double s = (scale > 0.0) ? scale : canonical_scale(level);
+    if (g_state.canonical_scales) {
+        double canon = canonical_scale(level);
+        if (std::abs(s - canon) < 0.15 * canon) s = canon;
+    }
+    std::vector<Complex> msg(interleaved.size() / 2);
+    for (size_t i = 0; i < msg.size(); ++i)
+        msg[i] = Complex(interleaved[2 * i], interleaved[2 * i + 1]);
+    auto pt = std::make_unique<Pt>();
+    g_state.context->encoder_.Encode(*pt, level, s, msg);
+    return g_state.put_pt(std::move(pt));
+}
+
 std::vector<double> Decode(int pt_id) {
     ensure_setup();
     std::vector<Complex> msg;
     g_state.context->encoder_.Decode(msg, g_state.pt(pt_id));
     std::vector<double> out(msg.size());
     for (size_t i = 0; i < msg.size(); ++i) out[i] = msg[i].real();
+    return out;
+}
+
+std::vector<double> DecodeComplex(int pt_id) {
+    ensure_setup();
+    std::vector<Complex> msg;
+    g_state.context->encoder_.Decode(msg, g_state.pt(pt_id));
+    std::vector<double> out(2 * msg.size());
+    for (size_t i = 0; i < msg.size(); ++i) {
+        out[2 * i] = msg[i].real();
+        out[2 * i + 1] = msg[i].imag();
+    }
     return out;
 }
 
@@ -950,6 +983,40 @@ int Negate(int ct_id) {
     return g_state.put_ct(std::move(out));
 }
 
+// Homomorphic complex conjugation (slot-wise conj). The conjugation key
+// is prepared unconditionally by UserInterface's constructor
+// (PrepareBasicEvks), so unlike rotations there is no per-distance key
+// to add first.
+int ConjugateNew(int ct_id) {
+    ensure_keys();
+    const Ct& in = g_state.ct(ct_id);
+    if (in.HasRx())
+        throw std::runtime_error(
+            "ConjugateNew: input is degree-2; relinearize first.");
+    auto out = std::make_unique<Ct>();
+    g_state.context->HConj(*out, in, g_state.iface->GetConjugationKey());
+    return g_state.put_ct(std::move(out));
+}
+
+int Conjugate(int ct_id) {
+    replace_ct(ct_id, ConjugateNew(ct_id));
+    return ct_id;
+}
+
+// Slot-wise multiply by sqrt(-1). Key-free (a plain polynomial
+// permutation), consumes no level.
+int MulImaginaryUnitNew(int ct_id) {
+    ensure_setup();
+    auto out = std::make_unique<Ct>();
+    g_state.context->MultImaginaryUnit(*out, g_state.ct(ct_id));
+    return g_state.put_ct(std::move(out));
+}
+
+int MulImaginaryUnit(int ct_id) {
+    replace_ct(ct_id, MulImaginaryUnitNew(ct_id));
+    return ct_id;
+}
+
 // ---------------------------------------------------------------------------
 // Rescale
 // ---------------------------------------------------------------------------
@@ -1319,7 +1386,7 @@ int Bootstrap(int ct_id, int slots) {
 // degree >= 2 (asserts otherwise), so bindings.py keeps the Horner path
 // for degree < 2.
 int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
-                             double target_scale) {
+                             double target_scale, bool chebyshev) {
     ensure_keys();
     const Ct& c = g_state.ct(ct_id);
     if (c.HasRx())
@@ -1355,8 +1422,12 @@ int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
         }
     }
 
+    // `chebyshev` interprets coeffs as sum_j c_j * T_j(x) and evaluates
+    // in Chebyshev basis natively (same BSGS tree/depth model). This is
+    // the only numerically viable route for high-degree approximations
+    // (cheb2poly blows up past degree ~30).
     cheddar::EvalPoly<word> poly(coeffs, level_of(c), c.GetScale(),
-                                 target_scale, /*chebyshev=*/false);
+                                 target_scale, chebyshev);
     poly.Compile(g_state.context);
 
     auto out = std::make_unique<Ct>();
@@ -1523,6 +1594,9 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     m.def("Encode", &Encode, py::arg("values"), py::arg("level"),
           py::arg("scale") = 0.0);
     m.def("Decode", &Decode, py::arg("pt_id"));
+    m.def("EncodeComplex", &EncodeComplex, py::arg("interleaved"),
+          py::arg("level"), py::arg("scale") = 0.0);
+    m.def("DecodeComplex", &DecodeComplex, py::arg("pt_id"));
 
     // Encrypt / Decrypt
     m.def("Encrypt", &Encrypt, py::arg("pt_id"));
@@ -1572,6 +1646,10 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
 
     // Negate
     m.def("Negate", &Negate, py::arg("ct_id"));
+    m.def("Conjugate", &Conjugate, py::arg("ct_id"));
+    m.def("ConjugateNew", &ConjugateNew, py::arg("ct_id"));
+    m.def("MulImaginaryUnit", &MulImaginaryUnit, py::arg("ct_id"));
+    m.def("MulImaginaryUnitNew", &MulImaginaryUnitNew, py::arg("ct_id"));
 
     // Rescale
     m.def("RescaleNew", &RescaleNew);
@@ -1597,7 +1675,8 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
 
     // Polynomial evaluation
     m.def("EvaluatePolynomialNative", &EvaluatePolynomialNative,
-          py::arg("ct_id"), py::arg("coeffs"), py::arg("target_scale"));
+          py::arg("ct_id"), py::arg("coeffs"), py::arg("target_scale"),
+          py::arg("chebyshev") = false);
 
     // Lifecycle: ID deletion
     m.def("DeleteCiphertext", &DeleteCiphertext, py::arg("ct_id"));
