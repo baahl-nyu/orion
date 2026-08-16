@@ -49,7 +49,7 @@ os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "0")
 import torch
 
 import orion
-from dlrm import HELRM
+from dlrm import HELRM, embedding_features
 
 # Well-known Criteo Kaggle categorical field cardinalities (26 fields).
 # Matches Table 2's slot counts almost exactly at each threshold below
@@ -74,18 +74,86 @@ def parse_args():
     # the pregenerated rational-rescaling chain). The env var must also
     # be set in the launching environment -- bindings.py reads it at
     # import time -- so this flag only swaps in the word32-shaped CKKS
-    # params (17 nominal LogQ entries to match the chain's 16 usable
-    # levels; LogP count is ignored in word32 mode).
+    # params. The LogQ entries are nominal placeholders whose COUNT must
+    # match the chain's usable levels (see _word32_num_logq); LogP count
+    # is ignored in word32 mode.
     parser.add_argument("--word32", action="store_true")
     return parser.parse_args()
 
 
+def _word32_logq_logp_counts():
+    """Nominal LogQ/LogP entry counts for the word32 path.
+
+    Neither list's VALUES reach the backend -- _setup_scheme_word32 takes
+    every prime from the chain JSON and never reads logp at all. But two
+    count constraints bind:
+
+      * len(LogQ) must equal default_encryption_level + 1, or
+        _setup_scheme_word32 raises (Orion's level accounting has to agree
+        with the native scheme's).
+      * len(LogP) <= len(LogQ), enforced by CKKSParameters.__post_init__
+        before any backend runs. The historical [31]*12 was fine only
+        because the shipped chain declares 17 LogQ entries; against an
+        11-entry chain it fails. Deriving it from the chain's auxiliary
+        prime count keeps it both legal and meaningful.
+
+    The shipped bootparam_40.json gives (17, 12) -- the previous
+    hardcoded pair -- so existing results are unaffected.
+    """
+    path = os.environ.get("ORION_CHEDDAR_PARAMS_JSON", "").strip()
+    if not path:
+        return 17, 12
+    with open(path) as f:
+        chain = json.load(f)
+    num_logq = int(chain["default_encryption_level"]) + 1
+    num_logp = min(len(chain["auxiliary_primes"]), num_logq)
+    return num_logq, num_logp
+
+
+def _impose_block_diagonal(model, compress_threshold, base):
+    """Give the synthetic model the sparsity the real one has.
+
+    HELRM's sparse layer evaluates all 26 embedding lookups as one
+    matrix multiply, so its weight is block-diagonal by construction --
+    field f's columns feed only field f's 16 output rows, and export()
+    builds exactly that with torch.block_diag(*tables).T.
+
+    Constructing HELRM directly, as this script does to avoid needing
+    the dataset, instead leaves Linear's kaiming_uniform_ init covering
+    every entry. Same shape and therefore the same plaintext count,
+    latency and memory -- which is why the ablation numbers are
+    unaffected -- but the structure is wrong: a dense matrix has every
+    output row live in every column block, and any packing that keys off
+    per-block row support sees nothing to exploit.
+
+    Fill the blocks in place (rather than building a second full-size
+    tensor) and match FullTable/RadixTable's own init, uniform over
+    +-1/sqrt(categories).
+    """
+    from dlrm import expanded_width
+
+    weight = model.sparse.weight.data          # (sparse_output, sparse_width)
+    weight.zero_()
+    row = col = 0
+    for size in model.sparse_sizes:
+        width = expanded_width(size, compress_threshold, base)
+        bound = 1.0 / math.sqrt(size)
+        weight[row:row + embedding_features,
+               col:col + width].uniform_(-bound, bound)
+        row += embedding_features
+        col += width
+    assert row == weight.shape[0] and col == weight.shape[1], (
+        f"block-diagonal fill covered {row}x{col}, expected "
+        f"{tuple(weight.shape)}")
+
+
 def build_config(word32=False):
     if word32:
+        _nq, _np = _word32_logq_logp_counts()
         ckks = {
             "LogN": 16,
-            "LogQ": [40] * 17,
-            "LogP": [31] * 12,
+            "LogQ": [40] * _nq,
+            "LogP": [31] * _np,
             "LogScale": 40,
             "H": 192,
             "RingType": "standard",
@@ -153,6 +221,7 @@ def main():
     torch.manual_seed(args.seed)
 
     model = HELRM(SPARSE_SIZES, args.compress_threshold, args.base)
+    _impose_block_diagonal(model, args.compress_threshold, args.base)
     model.eval()
 
     dense = torch.rand(13)
@@ -184,12 +253,27 @@ def main():
     # threshold 500: cold 24s vs warm 3-4s on the same code). Trials
     # report the warm steady state, matching the protocol used for every
     # other benchmark in this repo.
+    # Profiling only: ORION_BENCH_FORWARDS=2 runs warmup + one timed
+    # forward so nsys can capture a single steady-state pass instead of
+    # four (at threshold 5,000,000 a full four-pass UVM trace is
+    # unusably large). Unset means 4 -- the protocol every recorded
+    # result in HELRM_ABLATION.md was measured under. Anything below 2
+    # would leave no warm trial at all.
+    n_forwards = max(2, int(os.environ.get("ORION_BENCH_FORWARDS", "4")))
+
     trial_times = []
-    for i in range(4):
+    for i in range(n_forwards):
+        label = "warmup" if i == 0 else f"trial{i}"
+        # NVTX ranges let nsys --capture-range=nvtx profile exactly one
+        # forward, excluding compile/keygen/encrypt and the warmup pass
+        # that absorbs first-touch paging. No colon in the name: nsys
+        # parses --nvtx-capture as range@domain, so a colon can be
+        # misread and the range then never matches.
+        torch.cuda.nvtx.range_push(f"forward_{label}")
         t0 = time.time()
         out = model(encrypted_dense, encrypted_sparse)
         t1 = time.time()
-        label = "warmup" if i == 0 else f"trial{i}"
+        torch.cuda.nvtx.range_pop()
         print(f"[timing] {label}: {t1 - t0:.3f}s", flush=True)
         if i > 0:
             trial_times.append(t1 - t0)
