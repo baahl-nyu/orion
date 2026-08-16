@@ -388,7 +388,7 @@ def pack_conv2d(conv_layer: nn.Module, last: bool):
         weight = resolve_grouped_conv(conv_layer)
 
     toeplitz = construct_conv2d_toeplitz(conv_layer, weight)
-    diagonals, output_rotations = diagonalize(
+    diagonals, output_rotations, slice_meta = diagonalize(
         toeplitz,
         slots,
         embed_method,
@@ -396,8 +396,8 @@ def pack_conv2d(conv_layer: nn.Module, last: bool):
         debug=conv_layer.scheme.params.get_debug_status(),
         layer_name=getattr(conv_layer, "name", "Conv2d"),
     )
-    
-    return diagonals, output_rotations
+
+    return diagonals, output_rotations, slice_meta
 
 def construct_conv2d_toeplitz(conv_layer, weight):
     N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
@@ -497,7 +497,7 @@ def pack_linear(linear_layer: nn.Module, last: bool):
     embed_method = linear_layer.scheme.params.get_embedding_method()
 
     weight = construct_linear_matrix(linear_layer)
-    diagonals, output_rotations = diagonalize(
+    diagonals, output_rotations, slice_meta = diagonalize(
         weight,
         slots,
         embed_method,
@@ -505,7 +505,7 @@ def pack_linear(linear_layer: nn.Module, last: bool):
         debug=linear_layer.scheme.params.get_debug_status(),
         layer_name=getattr(linear_layer, "name", "Linear"),
     )
-    return diagonals, output_rotations
+    return diagonals, output_rotations, slice_meta
 
 def construct_linear_matrix(linear_layer):
     if len(linear_layer.input_shape) == 2:
@@ -558,6 +558,70 @@ def resolve_grouped_conv(conv_layer):
              i*Ci_per_group:(i+1)*Ci_per_group, ...] = 1
 
     return on_weight * mask
+
+def _slice_heights(matrix, num_slots, num_block_cols, block_height):
+    """Per-column-block ``{block_col: (row_offset, height, out_rotations)}``.
+
+    A column block only needs to be as tall as the rows actually nonzero
+    inside it. Blocks whose live rows already span the layer's padded
+    height are left out, so a fully dense layer returns ``{}`` and
+    nothing changes.
+
+    Two constraints fix the window:
+
+    * ``height`` is a power of two, because the fold halves the
+      replication at each step.
+    * ``offset`` is a MULTIPLE of ``height``. After the fold, slot k
+      carries matrix row ``offset + (k mod height)``, so slot k is in its
+      correct place exactly when ``offset`` is a multiple of ``height``
+      and ``k`` falls in ``[offset, offset+height)``. Align the window
+      and the right copy already sits at the right slots -- the only
+      thing left to do is mask away the other copies, with no placement
+      rotation. Grow the height until the aligned window covers the live
+      rows.
+    """
+    csc = matrix.tocsc()
+    meta = {}
+    for bc in range(num_block_cols):
+        sub = csc[:, bc * num_slots:(bc + 1) * num_slots]
+        rows = sub.nonzero()[0]
+        if rows.size == 0:
+            # An all-zero block contributes nothing; diagonalize() emits
+            # its usual single zero diagonal on the uniform path.
+            continue
+        lo, hi = int(rows.min()), int(rows.max())
+        height = 1 << max(0, (hi - lo).bit_length())
+        while height < block_height and (lo // height) * height + height <= hi:
+            height <<= 1
+        if height >= block_height:
+            continue
+        meta[bc] = ((lo // height) * height, height,
+                    int(math.log2(num_slots // height)))
+
+    # Shrinking costs one multiplicative level: each window's repeats
+    # have to be masked away before the windows are summed. That is only
+    # worth paying when the plaintexts saved are substantial. Measured on
+    # HE-LRM at threshold 500, where the sparse layer is a single slice
+    # spanning every output row and so is untouched, the only layer that
+    # shrinks is a 16->432 placement whose 496 saved plaintexts bought a
+    # level and 2 bits of precision -- a clear loss. Returning {} keeps
+    # the layer on the uniform path at depth 1.
+    saved = sum(block_height - h for _, h, _ in meta.values())
+    floor = int(os.environ.get("ORION_SLICE_MIN_SAVING", "4096"))
+    if os.environ.get("ORION_SLICE_DEBUG", "") == "1":
+        spans = []
+        for bc in range(min(num_block_cols, 6)):
+            sub = csc[:, bc * num_slots:(bc + 1) * num_slots]
+            r = sub.nonzero()[0]
+            spans.append("empty" if r.size == 0
+                         else f"{int(r.min())}-{int(r.max())}")
+        print(f"[slice-heights] nnz={matrix.nnz} bh={block_height} "
+              f"shrunk={len(meta)}/{num_block_cols} saved={saved} floor={floor} "
+              f"first_spans={spans}", flush=True)
+    if saved < floor:
+        return {}
+    return meta
+
 
 def diagonalize(
     matrix: sp.csr_matrix,
@@ -623,10 +687,64 @@ def diagonalize(
         block_height = num_slots
         output_rotations = 0
 
-    # Inflate dimensions of the sparse matrix
-    matrix.resize(num_block_rows * block_height, num_block_cols * num_slots)
+    # ORION_SLICE_HEIGHT=1: size each column block by the rows actually
+    # live in it instead of by the layer's padded output height.
+    #
+    # The number of diagonals a block yields IS its height, and every
+    # diagonal is a full num_slots plaintext regardless of how much of it
+    # is nonzero. For a block-diagonal weight matrix (26 independent
+    # embedding tables concatenated into one transform, say) a given
+    # column block touches only one table's rows -- 16 of 416 -- yet is
+    # read at the padded full height 512, so it emits 512 diagonals that
+    # are each 1/32 nonzero rather than 16 that are full. Measured on
+    # HE-LRM@500,000: the sparse layer's 18 column blocks span 16 to 160
+    # live rows each, 17 of them shrink, and peak device memory falls
+    # 40.8 -> 28.8GB at matching MAE (0.000496 -> 0.000494).
+    #
+    # Self-disabling: a dense block's live rows span every output row, so
+    # its height is unchanged and extraction is bit-identical. Only
+    # block-structured layers (grouped conv, per-head projections, banked
+    # embeddings) see any difference.
+    #
+    # Cost: a shorter block replicates the input further, so it needs
+    # log2(num_slots/h) fold rotations rather than the layer-wide
+    # log2(num_slots/block_height). That stays cheap because the fold is
+    # amortised per distinct height, not per block: placement and fold
+    # are both cyclic rotations, so they commute, letting the evaluator
+    # place each block, accumulate everything sharing a height, and fold
+    # each height group once -- a handful of folds for a layer with tens
+    # of blocks.
+    per_slice = (os.environ.get("ORION_SLICE_HEIGHT", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
+    slice_meta = None
+    eligible = (per_slice and num_block_rows == 1
+                and embed_method == "hybrid" and not is_last_layer)
+    if eligible:
+        slice_meta = _slice_heights(
+            matrix, num_slots, num_block_cols, block_height)
+    if per_slice and os.environ.get("ORION_SLICE_DEBUG", "") == "1":
+        print(f"[slice-pack] {layer_name}: shape={matrix.shape} "
+              f"slots={num_slots} bh={block_height} "
+              f"blocks=({num_block_rows},{num_block_cols}) "
+              f"last={is_last_layer} embed={embed_method} "
+              f"eligible={eligible} sliced={len(slice_meta) if slice_meta else 0}",
+              flush=True)
 
-    # Prepare indices for diagonal extraction 
+    # Inflate dimensions of the sparse matrix. With per-block heights a
+    # block reads rows [offset, offset+h), which can reach past the
+    # layer's padded height, so make room for the deepest one.
+    row_extent = num_block_rows * block_height
+    if slice_meta:
+        row_extent = max(row_extent,
+                         max(m[0] + m[1] for m in slice_meta.values()))
+        # The evaluator needs the layer's natural output period to build
+        # each group's mask: a shrunk block's result repeats every
+        # `height` slots, and the mask keeps the one copy per `period`
+        # window that is in its correct place.
+        slice_meta = {"period": block_height, "blocks": slice_meta}
+    matrix.resize(row_extent, num_block_cols * num_slots)
+
+    # Prepare indices for diagonal extraction
     row_idx = torch.arange(block_height).repeat(num_slots // block_height)
     col_idx = torch.arange(block_height)[:, None] + torch.arange(num_slots)[None, :]
     col_idx = torch.where(col_idx >= num_slots, col_idx - num_slots, col_idx)
@@ -683,18 +801,28 @@ def diagonalize(
     # Main compute loop (no tqdm fallback)
     for block_row in range(num_block_rows):
         for block_col in range(num_block_cols):
+            # Uniform path unless this block was shrunk; the index
+            # tensors above are reused whenever the height matches so the
+            # default route allocates nothing extra.
+            bh, r_idx, c_idx = block_height, row_idx, col_idx
             row_start = num_slots * block_row
+            if slice_meta and block_col in slice_meta["blocks"]:
+                row_start, bh, _ = slice_meta["blocks"][block_col]
+                r_idx = torch.arange(bh).repeat(num_slots // bh)
+                c_idx = torch.arange(bh)[:, None] + torch.arange(num_slots)[None, :]
+                c_idx = torch.where(c_idx >= num_slots, c_idx - num_slots, c_idx)
+
             col_start = num_slots * block_col
             block_sparse = matrix[
-                row_start: row_start + block_height,
+                row_start: row_start + bh,
                 col_start: col_start + num_slots,
             ]
             block_dense = torch.tensor(block_sparse.todense(), dtype=torch.float32)
-            block_diagonals = block_dense[row_idx, col_idx]
+            block_diagonals = block_dense[r_idx, c_idx]
 
             # Collect non-zero diagonals
             nonzero_diagonals = {}
-            for i in range(block_height):
+            for i in range(bh):
                 if torch.any(block_diagonals[i]):
                     nonzero_diagonals[i] = block_diagonals[i].tolist()
 
@@ -734,7 +862,7 @@ def diagonalize(
                 _PACKING_LIVE = None
             _PACKING_CARDS.clear()
 
-    return diagonals_by_block, output_rotations
+    return diagonals_by_block, output_rotations, slice_meta
 
 def plot_toeplitz(matrix, save_path=""):
     if isinstance(matrix, sp.csr_matrix):
