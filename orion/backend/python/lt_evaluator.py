@@ -1,3 +1,6 @@
+import math
+import os
+
 import h5py
 import torch
 import numpy as np
@@ -50,7 +53,81 @@ class NewEvaluator:
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
 
+        linear_layer.slice_masks = self._build_slice_masks(linear_layer)
         return lintransf_ids
+
+    def _build_slice_masks(self, linear_layer):
+        """One 0/1 plaintext per distinct (offset, height) window.
+
+        A block read at a reduced height produces a result that repeats
+        every `height` slots, so the copy sitting in its correct place is
+        accompanied by period/height - 1 copies squatting on other
+        groups' slots. Blocks are summed, so those have to be cleared
+        before accumulation or the sum is garbage.
+
+        The mask keeps slots whose position within the layer's natural
+        output period falls in [offset, offset+height). Because
+        _slice_heights aligns offset to a multiple of height, that
+        surviving copy is already in the right place -- masking is the
+        whole correction, no placement rotation.
+
+        Groups that were never shrunk get an all-ones mask. It is a
+        no-op numerically, but it keeps every group at the same level so
+        they can be added; mixing masked and unmasked groups would leave
+        them one level apart.
+        """
+        sm = getattr(linear_layer, "slice_meta", None)
+        if not sm:
+            return None
+
+        slots = linear_layer.slots or self.scheme.params.get_slots()
+        period = sm["period"]
+        pos = torch.arange(slots) % period
+
+        # The mask multiplies the transform output *after* its rescale,
+        # so the ciphertext sits one level below the transform. Encode at
+        # that level with scale = that level's modulus (the same idiom as
+        # TableMultConsolidate in nn/embedding.py): the product lands at
+        # scale*q, and the rescale that follows divides q back out,
+        # returning the ciphertext to the scale everything else is at.
+        # Encoding with the default scale instead leaves the branch a
+        # whole modulus light and the network fails at the next add.
+        mask_level = linear_layer.level - 1
+        q = self.scheme.encoder.get_moduli_chain()[mask_level]
+
+        masks = {}
+        for key in self._slice_groups(linear_layer, sm):
+            if key in masks:
+                continue
+            if key is None:
+                values = torch.ones(slots)
+            else:
+                r0, h = key
+                values = ((pos >= r0) & (pos < r0 + h)).to(torch.float32)
+            masks[key] = self.scheme.encoder.encode(values, mask_level, q)
+
+        # The shorter periods need fold distances the uniform path never
+        # asked for (slots/2 .. slots/height). Register them up front so
+        # backends that do not generate keys lazily still work.
+        for key in masks:
+            h = period if key is None else key[1]
+            for t in range(1, int(math.log2(slots // h)) + 1):
+                self.backend.AddRotationKey(slots // (2 ** t))
+        return masks
+
+    @staticmethod
+    def _slice_groups(linear_layer, sm):
+        """Every (offset, height) group this layer evaluates, `None` for
+        blocks left on the uniform full-height path."""
+        blocks = sm["blocks"]
+        seen = []
+        num_cols = max(blocks) + 1 if blocks else 0
+        for bc in range(max(num_cols, 1)):
+            m = blocks.get(bc)
+            key = (m[0], m[1]) if m else None
+            if key not in seen:
+                seen.append(key)
+        return seen
     
     def get_required_rotation_keys(self, transform_id):
         return self.backend.GetLinearTransformRotationKeys(transform_id)
@@ -157,6 +234,11 @@ class NewEvaluator:
 
         # Now we can perform a blocked linear transform
         transform_ids = transform_ids.reshape(rows, cols)
+
+        if getattr(linear_layer, "slice_meta", None):
+            return self._evaluate_sliced(
+                linear_layer, in_ctensor, transform_ids, rows, cols)
+
         cts_out = []
         for i in range(rows):
             ct_out = None
@@ -192,6 +274,104 @@ class NewEvaluator:
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
             
+    def _evaluate_sliced(self, linear_layer, in_ctensor, transform_ids,
+                         rows, cols):
+        """Blocked linear transform with per-block heights.
+
+        Differs from the uniform path in three ways:
+
+        * blocks are bucketed by their (offset, height) window instead of
+          all being summed together, because each window needs its own
+          fold depth;
+        * the fold runs here, per window, rather than once for the whole
+          layer in LinearTransform.evaluate_transforms -- a block read at
+          height h replicates slots/h times, not slots/block_height;
+        * each window is masked before it joins the accumulation, which
+          is what makes the shortened heights correct at all.
+
+        Fold and mask both distribute over addition, so bucketing first
+        and folding once per bucket is equivalent to folding each block
+        -- and far cheaper, since a layer's many column blocks fall into
+        only a handful of distinct windows (18 blocks, 5 windows on
+        HE-LRM's sparse layer at threshold 500,000).
+        """
+        sm = linear_layer.slice_meta
+        blocks = sm["blocks"]
+        period = sm["period"]
+        slots = linear_layer.slots or self.scheme.params.get_slots()
+        layer_name = linear_layer.name
+        out_shape = linear_layer.output_shape
+        fhe_out_shape = linear_layer.fhe_output_shape
+        masks = linear_layer.slice_masks
+
+        cts_out = []
+        for i in range(rows):
+            groups = {}
+            for j in range(cols):
+                t_id = transform_ids[i][j]
+                if self.io_mode != "none":
+                    self.load_rotation_keys(t_id)
+                    self.load_plaintext_diagonals(layer_name, i, j, t_id)
+
+                res = self.backend.EvaluateLinearTransform(
+                    t_id, in_ctensor.ids[j])
+                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+
+                m = blocks.get(j)
+                key = (m[0], m[1]) if m else None
+                groups[key] = ct if key not in groups else groups[key] + ct
+
+                if self.io_mode != "none":
+                    self.remove_rotation_keys()
+                    self.remove_plaintext_diagonals(t_id)
+
+            total = None
+            dbg = os.environ.get("ORION_SLICE_DEBUG", "") == "1"
+            for key, ct in groups.items():
+                height = period if key is None else key[1]
+
+                if dbg:
+                    print(f"[slice] {layer_name} key={key} h={height} "
+                          f"post-LT scale={self.backend.GetCiphertextScale(ct.ids[0]):.6g} "
+                          f"level={self.backend.GetCiphertextLevel(ct.ids[0])}",
+                          flush=True)
+
+                # Sum this window's slots/height replicas.
+                for t in range(1, int(math.log2(slots // height)) + 1):
+                    ct = ct + ct.roll(slots // (2 ** t))
+
+                ct_id = self.evaluator.rescale(ct.ids[0], in_place=False)
+                ct = CipherTensor(self.scheme, ct_id, out_shape, fhe_out_shape)
+
+                if dbg:
+                    print(f"[slice]   post-rescale scale="
+                          f"{self.backend.GetCiphertextScale(ct.ids[0]):.6g} "
+                          f"level={self.backend.GetCiphertextLevel(ct.ids[0])} "
+                          f"| mask scale={self.backend.GetPlaintextScale(masks[key].ids[0]):.6g} "
+                          f"level={self.backend.GetPlaintextLevel(masks[key].ids[0])}",
+                          flush=True)
+
+                # Clear the copies that landed on other windows' slots.
+                # This is the extra level the reduced heights cost.
+                # ct * plaintext already rescales -- this codebase keeps
+                # ct-pt multiply mult-then-rescale scale-exact, so the
+                # mask consumes the level itself. Rescaling again here
+                # drops a second level and divides the scale away, which
+                # is what the first attempt did (final scale 0.99 against
+                # the dense branch's 2^40).
+                ct = ct * masks[key]
+                if dbg:
+                    print(f"[slice]   post-mask scale="
+                          f"{self.backend.GetCiphertextScale(ct.ids[0]):.6g} "
+                          f"level={self.backend.GetCiphertextLevel(ct.ids[0])}",
+                          flush=True)
+
+                total = ct if total is None else total + ct
+
+            cts_out.append(total.ids[0])
+
+        return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
+
     def delete_transforms(self, transform_ids: dict):
         for tid in transform_ids.values():
             self.backend.DeleteLinearTransform(tid)
