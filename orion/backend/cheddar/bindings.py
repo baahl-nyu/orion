@@ -1177,6 +1177,18 @@ class CheddarLibrary:
     def GetAuxModuliChain(self) -> list[int]:
         return []
 
+    def GetCiphertextBytes(self, ct_id: int) -> float:
+        """Measured wire size of a ciphertext (both polynomials).
+
+        Read from the polynomial buffers, not inferred from the level:
+        the level -> limb map is a table, so limbs != level+1 in general.
+        """
+        return _native.GetCiphertextBytes(int(ct_id))
+
+    def GetCiphertextBxBytes(self, ct_id: int) -> float:
+        """Measured size of b alone -- what a seeded upload transmits."""
+        return _native.GetCiphertextBxBytes(int(ct_id))
+
     def GetCiphertextLevel(self, ct_id: int) -> int:
         return _native.GetCiphertextLevel(int(ct_id))
 
