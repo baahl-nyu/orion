@@ -99,6 +99,12 @@ def parse_args():
     # bootstrap per uploaded ciphertext.
     parser.add_argument("--low-level-upload", type=int, default=None,
                         metavar="LEVEL")
+    # Upload at an explicit level WITHOUT bootstrapping. Useful because
+    # the compiled input level is set by the whole network, while the
+    # selector's own consumer (the sparse layer) may run far lower --
+    # any limb above that is uploaded only to be dropped.
+    parser.add_argument("--upload-level", type=int, default=None,
+                        metavar="LEVEL")
     return parser.parse_args()
 
 
@@ -170,22 +176,24 @@ def _impose_block_diagonal(model, compress_threshold, base):
 
 
 def _upload_bytes(backend, ct_ids, log_n, seeded=False):
-    """Wire size of an uploaded ciphertext list.
+    """Wire size of an uploaded ciphertext list, measured.
 
-    A degree-1 CKKS ciphertext at level L is two polynomials of
-    (L+1) residue limbs, each 2^LogN coefficients of one machine word.
-    Read the level per ciphertext rather than assuming, since the
-    word32 chain's level accounting differs from the 64-bit one.
+    Sizes come from the ciphertext's own polynomial buffers, NOT from
+    2*(level+1)*2^LogN*word. That formula holds on the 64-bit chain but
+    is wrong on the word32 rational-rescaling chain, where the
+    level -> limb map is a lookup table (Parameter::level_config_) and a
+    level can carry more than one prime: measured limb counts there are
+    2 / 3 / 9 / 11 / 23 at levels 0 / 1 / 5 / 7 / 16, against the
+    formula's 1 / 2 / 6 / 8 / 17. A seeded upload transmits only b, so
+    it is measured separately rather than assumed to be exactly half.
     """
-    word_bytes = 4 if _WORD32_ACTIVE else 8
-    polys = 1 if seeded else 2   # seeded: only b is transmitted
     total = 0
     for ct_id in ct_ids:
-        limbs = backend.GetCiphertextLevel(ct_id) + 1
-        total += polys * limbs * (1 << log_n) * word_bytes
         if seeded:
-            total += _SEED_BYTES
-    return total
+            total += backend.GetCiphertextBxBytes(ct_id) + _SEED_BYTES
+        else:
+            total += backend.GetCiphertextBytes(ct_id)
+    return int(total)
 
 
 def build_config(word32=False):
@@ -295,7 +303,12 @@ def main():
 
     _vec = expanded_sparse
     low_level = args.low_level_upload
-    _upload_level = input_level if low_level is None else low_level
+    if low_level is not None:
+        _upload_level = low_level
+    elif args.upload_level is not None:
+        _upload_level = args.upload_level
+    else:
+        _upload_level = input_level
     _plain = orion.encode(_vec, _upload_level)
 
     if seeded:
@@ -352,7 +365,8 @@ def main():
     upload_bytes = _upload_bytes(_scheme.backend, uploaded_sparse.ids,
                                  _log_n, seeded=seeded)
     _tags = (([" seeded"] if seeded else [])
-             + ([f" level {_upload_level}"] if low_level is not None else []))
+             + ([f" level {_upload_level}"]
+                if _upload_level != input_level else []))
     print(f"[upload] selector: {upload_cts} ciphertext(s), "
           f"{upload_bytes/2**20:.1f} MiB"
           f"{(' (' + ','.join(t.strip() for t in _tags) + ')') if _tags else ''}",
