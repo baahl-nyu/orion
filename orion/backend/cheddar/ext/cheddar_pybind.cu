@@ -14,12 +14,16 @@
 // the conditions Cheddar asserts (same NP, same scale) and throws
 // std::runtime_error instead, so misuse surfaces as a Python exception.
 
+#include <Random.h>
 #include <UserInterface.h>
 #include <core/Context.h>
 #include <core/MemoryPool.h>
 #include <extension/BootContext.h>
 #include <extension/EvalPoly.h>
 #include <extension/Hoist.h>
+
+#include <thrust/execution_policy.h>
+#include <thrust/fill.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -525,6 +529,40 @@ int Encrypt(int pt_id) {
     auto ct = std::make_unique<Ct>();
     g_state.iface->Encrypt(*ct, g_state.pt(pt_id));
     return g_state.put_ct(std::move(ct));
+}
+
+// ---------------------------------------------------------------------------
+// Seeded ("compressed") ciphertexts
+//
+// A fresh RLWE ciphertext is (b, a) with a uniform and independent of
+// the message and secret, so a client can derive a from a seed and send
+// only (b, seed) -- halving upload. The server rebuilds a with
+// ExpandSeededAx. Seeds must be fresh per ciphertext; reusing one a
+// across two messages under one key leaks their difference.
+// ---------------------------------------------------------------------------
+
+int EncryptSeeded(int pt_id, std::uint64_t seed) {
+    ensure_keys();
+    auto ct = std::make_unique<Ct>();
+    // Seeding here fixes the `a` draw that Encrypt makes first; the
+    // error term drawn afterwards is then also deterministic, which is
+    // fine because only the client ever sees it.
+    cheddar::Random::SetSeed(seed);
+    g_state.iface->Encrypt(*ct, g_state.pt(pt_id));
+    return g_state.put_ct(std::move(ct));
+}
+
+// Emulates "only b crossed the wire": drop a, keeping b and metadata.
+void DropAx(int ct_id) {
+    ensure_setup();
+    Ct& c = g_state.ct(ct_id);
+    thrust::fill(thrust::device, c.ax_.begin(), c.ax_.end(),
+                 static_cast<word>(0));
+}
+
+void ExpandSeededAx(int ct_id, std::uint64_t seed) {
+    ensure_keys();
+    g_state.iface->ExpandSeededAx(g_state.ct(ct_id), seed);
 }
 
 int Decrypt(int ct_id) {
@@ -1646,6 +1684,9 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
 
     // Negate
     m.def("Negate", &Negate, py::arg("ct_id"));
+    m.def("EncryptSeeded", &EncryptSeeded, py::arg("pt_id"), py::arg("seed"));
+    m.def("DropAx", &DropAx, py::arg("ct_id"));
+    m.def("ExpandSeededAx", &ExpandSeededAx, py::arg("ct_id"), py::arg("seed"));
     m.def("Conjugate", &Conjugate, py::arg("ct_id"));
     m.def("ConjugateNew", &ConjugateNew, py::arg("ct_id"));
     m.def("MulImaginaryUnit", &MulImaginaryUnit, py::arg("ct_id"));
