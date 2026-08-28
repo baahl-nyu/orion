@@ -19,7 +19,11 @@ class NewEncoder:
                 f"Expected 'values' passed to encode() to be a either a list "
                 f"or a torch.Tensor, but got {type(values)}.")
 
-        if not level:
+        # `is None`, not falsiness: level 0 is a legitimate request (the
+        # bottom of the chain, e.g. a deliberately low-level upload that
+        # the server bootstraps back up) and `not level` silently
+        # promoted it to the top of the chain instead.
+        if level is None:
             level = self.params.get_max_level()
         if not scale:
             scale = self.params.get_default_scale()
