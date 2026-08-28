@@ -390,29 +390,57 @@ note below), not from `std::mt19937`.
 across two messages under the same key gives
 `b1 - b2 = m1 - m2 + e1 - e2`, leaking the message difference outright.
 
-**Runtime note.** Upstream `SampleRandomPolynomial` generates on the
-host with `std::uniform_int_distribution` and then copies to device, so
-expansion costs ~6.5 ms per ciphertext at LogN=16 -- fine for a handful
-of ciphertexts, but it dominates at high selector widths (+557 ms at
-threshold 5,000,000, where 85 ciphertexts are uploaded). A device-side
-CSPRNG would remove essentially all of that; the measured numbers in
-`examples/criteo/PAPER_NUMBERS.md` should be read as an upper bound on
-the cost of this technique, not its floor.
+**Runtime note.** Upstream `SampleRandomPolynomial` draws every word
+through a single `std::uniform_int_distribution` over one sequential
+generator, then copies the result to device. That cost ~3.8 ns per
+word, i.e. ~6.1 ms per ciphertext at LogN=16 / 23 limbs, and an nsys
+trace at threshold 5,000,000 attributed 101.8 ms of a 342.5 ms forward
+to seed expansion with the GPU idle for 96% of it -- server-side
+latency that was entirely host RNG.
+
+This patch replaces that draw with a counter-based keyed sampler
+(SplitMix64 stream, Lemire multiply-shift with the exact rejection
+bound, so the result is uniform rather than near-uniform). Because the
+output depends only on `(key, index)` and not on generator state, each
+prime's slice fills independently and the primes run in parallel.
+`Random::NextStreamKey()` gives every call its own key while keeping
+the *first* call after `SetSeed` a function of the seed alone -- the
+property the client's encrypt and the server's expansion rely on to
+agree on `a`.
+
+Measured at threshold 5,000,000 on the RTX PRO 6000 (w32, 85
+ciphertexts, 1 warmup + 3 timed):
+
+| configuration | before | after |
+|---|---:|---:|
+| seeded, level 16 | 0.760 s | 0.313 s |
+| baseline (control, no seeding) | 0.239 s | 0.241 s |
+
+Precision is unchanged at 11.143 bits in both rows, and the control
+that does no seed expansion moves by 2 ms, which is this machine's
+noise floor. In the nsys trace the expansion
+region falls from 101.8 ms to 22.7 ms; what remains is ~4 ms of
+host-to-device copy and per-call thread setup, so a device-side
+sampler writing straight into the ciphertext buffer would still remove
+most of the remainder.
 
 ```diff
 diff --git a/include/Random.h b/include/Random.h
-index eb0cc3d..7b905c7 100644
+index eb0cc3d..2b0ad47 100644
 --- a/include/Random.h
 +++ b/include/Random.h
-@@ -2,6 +2,7 @@
+@@ -2,8 +2,10 @@
  
  #include <algorithm>
  #include <cmath>
 +#include <cstdint>
  #include <iostream>
  #include <random>
++#include <type_traits>
  
-@@ -15,7 +16,18 @@ namespace cheddar {
+ #include "core/Type.h"
+ 
+@@ -15,7 +17,18 @@ namespace cheddar {
   * production.
   *
   */
@@ -431,7 +459,7 @@ index eb0cc3d..7b905c7 100644
   public:
    Random() = default;
    Random(const Random &) = delete;
-@@ -58,6 +70,25 @@ class Random {
+@@ -58,6 +71,80 @@ class Random {
      });
    }
  
@@ -452,11 +480,96 @@ index eb0cc3d..7b905c7 100644
 +   *
 +   * @param seed the seed value
 +   */
-+  static void SetSeed(uint64_t seed) { gen_.seed(seed); }
++  static void SetSeed(uint64_t seed) {
++    gen_.seed(seed);
++    stream_seed_ = seed;
++    stream_call_ = 0;
++  }
++
++  /**
++   * @brief ORION_PATCH (seeded-ciphertext): claim the next keyed
++   * sampling stream.
++   *
++   * SampleUniformWordKeyed below is a counter-based generator: its
++   * output depends only on (key, element index), with no sequential
++   * state. That is what makes seeded ciphertexts cheap -- each prime's
++   * slice of the polynomial can be filled independently, so the draw
++   * parallelises -- but it also means two calls sharing a key would
++   * produce the same polynomial, which is fatal for key generation.
++   * This counter gives each call its own key while keeping the *first*
++   * call after SetSeed deterministic in the seed alone, which is the
++   * property the client's encrypt and the server's expansion rely on
++   * to agree.
++   */
++  static uint64_t NextStreamKey() {
++    return Mix(stream_seed_ ^ 0x9e3779b97f4a7c15ull, stream_call_++);
++  }
++
++  /**
++   * @brief Uniform in [0, range_max] from a key, without generator
++   * state.
++   *
++   * Lemire's multiply-shift reduction with the exact rejection bound,
++   * so the result is uniform, not merely near-uniform. Replaces a
++   * std::uniform_int_distribution loop that cost ~3.8 ns per word --
++   * at LogN=16 and 23 limbs that was ~6 ms of host time per
++   * ciphertext, which dominated seeded upload expansion.
++   */
++  template <typename word>
++  static void SampleUniformWordKeyed(word *ptr, int length, word range_max,
++                                     uint64_t key) {
++    using wide =
++        typename std::conditional<sizeof(word) <= 4, uint64_t, __uint128_t>::type;
++    constexpr int kBits = 8 * sizeof(word);
++    const word range = range_max + 1;
++    // Rejection bound 2^kBits mod range, in word arithmetic: draws whose
++    // low half falls below it would bias the mapping, so they are
++    // redrawn. Every prime here is far below the word's max, so
++    // range_max + 1 cannot wrap.
++    const word threshold = static_cast<word>(0u - range) % range;
++    uint64_t ctr = 0;
++    for (int i = 0; i < length; i++) {
++      wide m;
++      do {
++        m = static_cast<wide>(Draw<word>(key, ctr++)) * range;
++      } while (static_cast<word>(m) < threshold);
++      ptr[i] = static_cast<word>(m >> kBits);
++    }
++  }
 +
    template <typename T>
    static void SampleDiscreteNormal(T *ptr, int length, double mean,
                                     double stddev, double max_sigma = 6) {
+@@ -75,9 +162,28 @@ class Random {
+   }
+ 
+  private:
++  // ORION_PATCH (seeded-ciphertext): SplitMix64 finalizer, used both to
++  // derive stream keys and as the stream itself. Counter-based, so the
++  // n-th word of a stream is computable without producing the first
++  // n-1.
++  static uint64_t Mix(uint64_t a, uint64_t b) {
++    uint64_t z = a + 0x9e3779b97f4a7c15ull * (b + 1);
++    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
++    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
++    return z ^ (z >> 31);
++  }
++
++  // One word-sized uniform draw from (key, ctr).
++  template <typename word>
++  static word Draw(uint64_t key, uint64_t ctr) {
++    return static_cast<word>(Mix(key, ctr));
++  }
++
+   static inline std::random_device rd_{};
+   static inline std::mt19937_64 gen_{rd_()};
+   // static inline std::mt19937_64 gen_{0};
++  static inline uint64_t stream_seed_{0};
++  static inline uint64_t stream_call_{0};
+ };
+ 
+ }  // namespace cheddar
+\ No newline at end of file
 diff --git a/include/UserInterface.h b/include/UserInterface.h
 index 2ff294d..9d2728e 100644
 --- a/include/UserInterface.h
@@ -490,10 +603,17 @@ index 2ff294d..9d2728e 100644
     * @brief Prepare rotation keys for the given EvkRequest.
     *
 diff --git a/src/UserInterface.cu b/src/UserInterface.cu
-index 7b6f79b..c091f11 100644
+index 7b6f79b..c0140ee 100644
 --- a/src/UserInterface.cu
 +++ b/src/UserInterface.cu
-@@ -459,6 +459,12 @@ void UserInterface<word>::PrepareEvk(int key_idx, const NPInfo &np,
+@@ -1,3 +1,6 @@
++#include <thread>
++#include <vector>
++
+ #include "UserInterface.h"
+ #include "common/Basic.cuh"
+ #include "common/CommonUtils.h"
+@@ -459,6 +462,12 @@ void UserInterface<word>::PrepareEvk(int key_idx, const NPInfo &np,
  
  // We can regard this random polynomial as having any form we want
  // It can be regarded to be NTT-applied or not (with or without Montgomery form)
@@ -506,6 +626,45 @@ index 7b6f79b..c091f11 100644
  template <typename word>
  void UserInterface<word>::SampleRandomPolynomial(Dv &poly,
                                                   const NPInfo &np) const {
+@@ -472,14 +481,35 @@ void UserInterface<word>::SampleRandomPolynomial(Dv &poly,
+   int prime_offset = max_num_ter - np.num_ter_;
+ 
+   HostVector<word> poly_host(num_total_primes * degree, 0);
+-  for (int i = 0; i < num_total_primes; i++) {
++  // ORION_PATCH (seeded-ciphertext): one keyed stream per prime instead
++  // of one sequential std::uniform_int_distribution over the whole
++  // polynomial. The streams are independent, so the primes fill in
++  // parallel; the key comes from the shared counter so that the first
++  // draw after Random::SetSeed still depends on the seed alone, which
++  // is what lets a seeded upload's client and server agree on `a`.
++  const uint64_t stream_key = Random::NextStreamKey();
++  auto fill = [&](int i) {
+     int prime_index = i + prime_offset;
+     if (i >= num_q) {
+       prime_index = L + i - num_q;
+     }
+     word prime = all_primes_[prime_index];
+-    Random::SampleUniformWord<word>(poly_host.data() + i * degree, degree, 0,
+-                                    prime - 1);
++    Random::SampleUniformWordKeyed<word>(poly_host.data() + i * degree, degree,
++                                         prime - 1, stream_key + i);
++  };
++  unsigned int hw = std::thread::hardware_concurrency();
++  int workers = std::min<int>(num_total_primes, hw ? hw : 1);
++  if (workers <= 1) {
++    for (int i = 0; i < num_total_primes; i++) fill(i);
++  } else {
++    std::vector<std::thread> pool;
++    pool.reserve(workers);
++    for (int w = 0; w < workers; w++) {
++      pool.emplace_back([&, w] {
++        for (int i = w; i < num_total_primes; i += workers) fill(i);
++      });
++    }
++    for (auto &t : pool) t.join();
+   }
+   CopyHostToDevice(poly, poly_host);
+ }
 ```
 
 ## Not used on `cheddar-backend`
