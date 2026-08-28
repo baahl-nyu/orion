@@ -544,6 +544,25 @@ class CheddarLibrary:
     def Encrypt(self, pt_id: int) -> int:
         return _native.Encrypt(int(pt_id))
 
+    def EncryptSeeded(self, pt_id: int, seed: int) -> int:
+        """Encrypt with the `a` polynomial drawn from `seed`.
+
+        A fresh ciphertext is (b, a) with a uniform and independent of
+        message and secret, so the client can transmit only (b, seed)
+        and let the server rebuild a with ExpandSeededAx -- half the
+        upload bytes. The seed must be fresh per ciphertext: reusing an
+        a across two messages under one key leaks m1-m2 from b1-b2.
+        """
+        return _native.EncryptSeeded(int(pt_id), int(seed))
+
+    def DropAx(self, ct_id: int) -> None:
+        """Zero the `a` polynomial -- emulates only `b` crossing the wire."""
+        _native.DropAx(int(ct_id))
+
+    def ExpandSeededAx(self, ct_id: int, seed: int) -> None:
+        """Server side: regenerate `a` from the client's seed, in place."""
+        _native.ExpandSeededAx(int(ct_id), int(seed))
+
     def Decrypt(self, ct_id: int) -> int:
         return _native.Decrypt(int(ct_id))
 

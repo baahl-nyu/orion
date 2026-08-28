@@ -355,9 +355,162 @@ index f561b66..35f6d3e 100644
          ax_d_ptrs.data(), mx_d_ptrs.data(), num_bs, num_gs, primes, inv_primes);
 ```
 
+### 5. `seeded-ciphertext`
+
+Required for `bench_sweep.py --seeded-upload` (and nothing else -- it is
+inert unless those bindings are called).
+
+A fresh RLWE ciphertext is `(b, a)` with `a` uniform in R_q and
+`b = -a*s + m + e`. Because `a` is uniform and independent of both the
+message and the secret, a client can derive it from a seed and transmit
+only `(b, seed)`, letting the server rebuild `a`. That halves upload
+bytes for every fresh ciphertext. (It is upload-only: after any
+homomorphic operation `a` is no longer seed-derived, so results coming
+back cannot be compressed this way.)
+
+Upstream samples `a` inside `UserInterface::Encrypt` through a static
+generator with no way to seed it, and `SampleRandomPolynomial` is
+private. This patch adds:
+
+- `Random::SetSeed(uint64_t)` to reseed that generator, with default
+  ELF visibility on the class so Orion's `-fvisibility=hidden`
+  extension shares the one generator rather than linking a private copy
+  (identical to the `keygen-seed` patch used by the multi-GPU work --
+  apply either one, not both).
+- `UserInterface::ExpandSeededAx(Ct&, uint64_t)`, a public entry point
+  that reseeds and resamples a ciphertext's `ax_` in place.
+
+Both make key generation and error sampling reproducible when used,
+which is acceptable only because `UserInterface` is already documented
+upstream as test-only and not a secure implementation. A deployment
+would expand `a` from a CSPRNG (ideally on device -- see the runtime
+note below), not from `std::mt19937`.
+
+**Security note.** Seeds must be fresh per ciphertext. Reusing one `a`
+across two messages under the same key gives
+`b1 - b2 = m1 - m2 + e1 - e2`, leaking the message difference outright.
+
+**Runtime note.** Upstream `SampleRandomPolynomial` generates on the
+host with `std::uniform_int_distribution` and then copies to device, so
+expansion costs ~6.5 ms per ciphertext at LogN=16 -- fine for a handful
+of ciphertexts, but it dominates at high selector widths (+557 ms at
+threshold 5,000,000, where 85 ciphertexts are uploaded). A device-side
+CSPRNG would remove essentially all of that; the measured numbers in
+`examples/criteo/PAPER_NUMBERS.md` should be read as an upper bound on
+the cost of this technique, not its floor.
+
+```diff
+diff --git a/include/Random.h b/include/Random.h
+index eb0cc3d..7b905c7 100644
+--- a/include/Random.h
++++ b/include/Random.h
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <iostream>
+ #include <random>
+ 
+@@ -15,7 +16,18 @@ namespace cheddar {
+  * production.
+  *
+  */
++// Default visibility is deliberate. gen_ below is a static inline
++// member, i.e. a STB_GNU_UNIQUE symbol that the dynamic linker unifies
++// across shared objects -- but only if every object exports it. Orion's
++// pybind extension is built -fvisibility=hidden, so without this
++// attribute it links its own private copy and SetSeed() would reseed a
++// generator that nothing samples from, silently leaving shards with
++// different secrets.
++#if defined(__GNUC__)
++class __attribute__((visibility("default"))) Random {
++#else
+ class Random {
++#endif
+  public:
+   Random() = default;
+   Random(const Random &) = delete;
+@@ -58,6 +70,25 @@ class Random {
+     });
+   }
+ 
++  /**
++   * @brief Reseed the shared generator deterministically.
++   *
++   * Multi-GPU shards run as separate processes and must share one key
++   * space (see examples/hydia/MULTI-GPU.md): secrets and evaluation
++   * keys are sampled through this generator, so seeding every shard
++   * identically before UserInterface construction makes them generate
++   * the same keys without any key material crossing the process
++   * boundary. Leaving it unseeded keeps the previous
++   * nondeterministic behaviour.
++   *
++   * This makes key generation fully reproducible, error sampling
++   * included, which is acceptable only because UserInterface is
++   * already documented as test-only and not a secure implementation.
++   *
++   * @param seed the seed value
++   */
++  static void SetSeed(uint64_t seed) { gen_.seed(seed); }
++
+   template <typename T>
+   static void SampleDiscreteNormal(T *ptr, int length, double mean,
+                                    double stddev, double max_sigma = 6) {
+diff --git a/include/UserInterface.h b/include/UserInterface.h
+index 2ff294d..9d2728e 100644
+--- a/include/UserInterface.h
++++ b/include/UserInterface.h
+@@ -78,6 +78,27 @@ class UserInterface {
+    */
+   void PrepareRotationKey(int rot_idx, int max_level = -1);
+ 
++  /**
++   * @brief Regenerate a ciphertext's `a` polynomial from a seed.
++   *
++   * A fresh RLWE ciphertext is (b, a) with a uniform in R_q and
++   * b = -a*s + m + e. Because a is uniform and independent of both the
++   * message and the secret, a client may derive it from a seed and
++   * transmit only (b, seed); the server calls this to rebuild a and
++   * recover the full ciphertext. Halves upload size.
++   *
++   * The seed MUST be fresh per ciphertext: reusing one a across two
++   * messages under the same key leaks m1-m2 directly from b1-b2.
++   *
++   * Reseeds the shared generator, so any sampling that follows is also
++   * deterministic until reseeded -- acceptable only because
++   * UserInterface is already documented as test-only.
++   *
++   * @param ctxt ciphertext whose ax_ is overwritten
++   * @param seed the seed the client used
++   */
++  void ExpandSeededAx(Ct &ctxt, uint64_t seed) const;
++
+   /**
+    * @brief Prepare rotation keys for the given EvkRequest.
+    *
+diff --git a/src/UserInterface.cu b/src/UserInterface.cu
+index 7b6f79b..c091f11 100644
+--- a/src/UserInterface.cu
++++ b/src/UserInterface.cu
+@@ -459,6 +459,12 @@ void UserInterface<word>::PrepareEvk(int key_idx, const NPInfo &np,
+ 
+ // We can regard this random polynomial as having any form we want
+ // It can be regarded to be NTT-applied or not (with or without Montgomery form)
++template <typename word>
++void UserInterface<word>::ExpandSeededAx(Ct &ctxt, uint64_t seed) const {
++  Random::SetSeed(seed);
++  SampleRandomPolynomial(ctxt.ax_, ctxt.GetNP());
++}
++
+ template <typename word>
+ void UserInterface<word>::SampleRandomPolynomial(Dv &poly,
+                                                  const NPInfo &np) const {
+```
+
 ## Not used on `cheddar-backend`
 
-### 5. `fused-rotate`
+### 6. `fused-rotate`
 
 Makes `HoistHandler::BSFusedKeyMult` public and static (plus adds
 `PopulateCM`) so an external caller can run a fused hoisted N-way rotation
