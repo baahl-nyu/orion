@@ -23,6 +23,7 @@ Usage (run one threshold at a time, sequentially -- see BENCH_SWEEP.md):
 import json
 import math
 import os
+import random
 import time
 from argparse import ArgumentParser
 from os import makedirs
@@ -46,9 +47,18 @@ import yaml
 os.environ.setdefault("ORION_CHEDDAR_MANAGED_MEMORY", "1")
 os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "0")
 
+_WORD32_ACTIVE = os.environ.get("ORION_CHEDDAR_WORD32", "").lower() in (
+    "1", "true", "yes", "on")
+
+# Wire cost of one seed. The binding takes a 64-bit seed; a deployment
+# wanting 256-bit security margin would send 32 B. Either is negligible
+# against a multi-MiB polynomial, so the choice does not move any total.
+_SEED_BYTES = 8
+
 import torch
 
 import orion
+from orion.backend.python.tensors import CipherTensor
 from dlrm import HELRM, embedding_features
 
 # Well-known Criteo Kaggle categorical field cardinalities (26 fields).
@@ -78,6 +88,23 @@ def parse_args():
     # match the chain's usable levels (see _word32_num_logq); LogP count
     # is ignored in word32 mode.
     parser.add_argument("--word32", action="store_true")
+    # Seeded ("compressed") upload: transmit only the b polynomial plus
+    # the 8-byte seed its a was drawn from, and regenerate a server-side.
+    # Halves the bytes of every uploaded ciphertext.
+    parser.add_argument("--seeded-upload", action="store_true")
+    # Upload the selector at a low level and have the server bootstrap
+    # it back up before anything else runs. A ciphertext at level L
+    # carries L+1 residue limbs, so uploading at level 0 instead of the
+    # compiled input level cuts bytes by that ratio -- paid for with one
+    # bootstrap per uploaded ciphertext.
+    parser.add_argument("--low-level-upload", type=int, default=None,
+                        metavar="LEVEL")
+    # Upload at an explicit level WITHOUT bootstrapping. Useful because
+    # the compiled input level is set by the whole network, while the
+    # selector's own consumer (the sparse layer) may run far lower --
+    # any limb above that is uploaded only to be dropped.
+    parser.add_argument("--upload-level", type=int, default=None,
+                        metavar="LEVEL")
     return parser.parse_args()
 
 
@@ -145,6 +172,28 @@ def _impose_block_diagonal(model, compress_threshold, base):
     assert row == weight.shape[0] and col == weight.shape[1], (
         f"block-diagonal fill covered {row}x{col}, expected "
         f"{tuple(weight.shape)}")
+
+
+
+def _upload_bytes(backend, ct_ids, log_n, seeded=False):
+    """Wire size of an uploaded ciphertext list, measured.
+
+    Sizes come from the ciphertext's own polynomial buffers, NOT from
+    2*(level+1)*2^LogN*word. That formula holds on the 64-bit chain but
+    is wrong on the word32 rational-rescaling chain, where the
+    level -> limb map is a lookup table (Parameter::level_config_) and a
+    level can carry more than one prime: measured limb counts there are
+    2 / 3 / 9 / 11 / 23 at levels 0 / 1 / 5 / 7 / 16, against the
+    formula's 1 / 2 / 6 / 8 / 17. A seeded upload transmits only b, so
+    it is measured separately rather than assumed to be exactly half.
+    """
+    total = 0
+    for ct_id in ct_ids:
+        if seeded:
+            total += backend.GetCiphertextBxBytes(ct_id) + _SEED_BYTES
+        else:
+            total += backend.GetCiphertextBytes(ct_id)
+    return int(total)
 
 
 def build_config(word32=False):
@@ -243,7 +292,85 @@ def main():
     input_level = orion.compile(model)
 
     encrypted_dense = orion.encrypt(orion.encode(dense_in, input_level))
-    encrypted_sparse = orion.encrypt(orion.encode(expanded_sparse, input_level))
+
+    # ---- selector upload -------------------------------------------
+    # One ciphertext per `slots` selector entries.
+    from orion.core.orion import scheme as _scheme
+    _slots = _scheme.params.get_slots()
+    _log_n = build_config(word32=args.word32)["ckks_params"]["LogN"]
+
+    seeded = args.seeded_upload
+
+    _vec = expanded_sparse
+    low_level = args.low_level_upload
+    if low_level is not None:
+        _upload_level = low_level
+    elif args.upload_level is not None:
+        _upload_level = args.upload_level
+    else:
+        _upload_level = input_level
+    _plain = orion.encode(_vec, _upload_level)
+
+    if seeded:
+        # Fixed RNG so a benchmark cell is reproducible. A real client
+        # MUST use a CSPRNG and a fresh seed per ciphertext: reusing an
+        # `a` across two messages under one key leaks their difference.
+        _seed_rng = random.Random(args.seed)
+        upload_seeds = [_seed_rng.getrandbits(63) for _ in _plain.ids]
+        _ct_ids = [_scheme.backend.EncryptSeeded(_pid, _sd)
+                   for _pid, _sd in zip(_plain.ids, upload_seeds)]
+        uploaded_sparse = CipherTensor(_scheme, _ct_ids, _vec.shape)
+        # Only b crossed the wire: drop a so the timed region has to
+        # rebuild it, and so a bug there cannot silently pass.
+        for _cid in _ct_ids:
+            _scheme.backend.DropAx(_cid)
+    else:
+        upload_seeds = None
+        uploaded_sparse = orion.encrypt(_plain)
+
+    for _pid in _plain.ids:
+        _scheme.backend.DeletePlaintext(_pid)
+
+    encrypted_sparse = None if seeded else uploaded_sparse
+
+    # ORION_LANE_DEBUG=1: decrypt the received selector and compare it to
+    # the plaintext one, isolating upload-path error from model error.
+    if os.environ.get("ORION_LANE_DEBUG"):
+        _flat = expanded_sparse.flatten().to(torch.float64)
+        if seeded:
+            for _cid, _sd in zip(uploaded_sparse.ids, upload_seeds):
+                _scheme.backend.ExpandSeededAx(_cid, _sd)
+        _probe = uploaded_sparse
+        _err = 0.0
+        for _i, _cid in enumerate(_probe.ids):
+            _got = torch.tensor(_scheme.backend.Decode(
+                _scheme.backend.Decrypt(_cid)), dtype=torch.float64)
+            _want = _flat[_i*_slots:(_i+1)*_slots]
+            _got = _got[:_want.numel()]
+            _err = max(_err, (_got - _want).abs().max().item())
+        print(f"[lane-debug] input_level={input_level} "
+              f"selector max abs err={_err:.3e}", flush=True)
+        if seeded:  # re-drop: the probe expanded them
+            for _cid in uploaded_sparse.ids:
+                _scheme.backend.DropAx(_cid)
+
+    if low_level is not None:
+        # One-time, outside the timed region: the network's own
+        # bootstrappers are prepared for its internal widths only, and
+        # the selector is uploaded at the full slot width.
+        _boot_slots = _scheme.backend.GetCiphertextSlots(uploaded_sparse.ids[0])
+        _scheme.backend.NewBootstrapper(0, _boot_slots)
+
+    upload_cts = len(uploaded_sparse.ids)
+    upload_bytes = _upload_bytes(_scheme.backend, uploaded_sparse.ids,
+                                 _log_n, seeded=seeded)
+    _tags = (([" seeded"] if seeded else [])
+             + ([f" level {_upload_level}"]
+                if _upload_level != input_level else []))
+    print(f"[upload] selector: {upload_cts} ciphertext(s), "
+          f"{upload_bytes/2**20:.1f} MiB"
+          f"{(' (' + ','.join(t.strip() for t in _tags) + ')') if _tags else ''}",
+          flush=True)
 
     model.he()
     # 1 warmup + 3 timed trials in the SAME process. The warmup forward
@@ -271,9 +398,35 @@ def main():
         # misread and the range then never matches.
         torch.cuda.nvtx.range_push(f"forward_{label}")
         t0 = time.time()
-        out = model(encrypted_dense, encrypted_sparse)
+        # Seed expansion is server-side work on the received upload, so
+        # it is timed with the forward.
+        if seeded:
+            # Server rebuilds each a from its seed. Overwrites ax in
+            # place, so it is idempotent across trials.
+            torch.cuda.nvtx.range_push("upload_seed_expand")
+            for _cid, _sd in zip(uploaded_sparse.ids, upload_seeds):
+                _scheme.backend.ExpandSeededAx(_cid, _sd)
+            torch.cuda.nvtx.range_pop()
+        if low_level is not None:
+            torch.cuda.nvtx.range_push("upload_bootstrap")
+            # Bootstrap back up to a usable level. Returns fresh
+            # handles, so keep them separate from the uploaded ones
+            # (which every trial re-reads).
+            _booted = [_scheme.backend.Bootstrap(_cid, _boot_slots)
+                       for _cid in uploaded_sparse.ids]
+            _received = CipherTensor(_scheme, _booted, uploaded_sparse.shape)
+            torch.cuda.nvtx.range_pop()
+        else:
+            _received = uploaded_sparse
+        sparse_in = _received
+        torch.cuda.nvtx.range_push("model_forward")
+        out = model(encrypted_dense, sparse_in)
+        torch.cuda.nvtx.range_pop()
         t1 = time.time()
         torch.cuda.nvtx.range_pop()
+        if low_level is not None:
+            for _cid in _received.ids:
+                _scheme.backend.DeleteCiphertext(_cid)
         print(f"[timing] {label}: {t1 - t0:.3f}s", flush=True)
         if i > 0:
             trial_times.append(t1 - t0)
@@ -317,6 +470,11 @@ def main():
         "precision": precision,
         "runtime_seconds": runtime,  # mean of warm trials
         "runtime_seconds_trials": trial_times,
+        "seeded_upload": seeded,
+        "low_level_upload": low_level,
+        "upload_level": _upload_level,
+        "upload_ciphertexts": upload_cts,
+        "upload_bytes": upload_bytes,
         "peak_device_mb": peak_device_mb,
         "key_memory_mb": key_memory_mb,
         "env_knobs": env_knobs,
