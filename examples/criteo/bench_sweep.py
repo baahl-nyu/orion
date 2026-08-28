@@ -92,6 +92,13 @@ def parse_args():
     # the 8-byte seed its a was drawn from, and regenerate a server-side.
     # Halves the bytes of every uploaded ciphertext.
     parser.add_argument("--seeded-upload", action="store_true")
+    # Upload the selector at a low level and have the server bootstrap
+    # it back up before anything else runs. A ciphertext at level L
+    # carries L+1 residue limbs, so uploading at level 0 instead of the
+    # compiled input level cuts bytes by that ratio -- paid for with one
+    # bootstrap per uploaded ciphertext.
+    parser.add_argument("--low-level-upload", type=int, default=None,
+                        metavar="LEVEL")
     return parser.parse_args()
 
 
@@ -287,7 +294,9 @@ def main():
     seeded = args.seeded_upload
 
     _vec = expanded_sparse
-    _plain = orion.encode(_vec, input_level)
+    low_level = args.low_level_upload
+    _upload_level = input_level if low_level is None else low_level
+    _plain = orion.encode(_vec, _upload_level)
 
     if seeded:
         # Fixed RNG so a benchmark cell is reproducible. A real client
@@ -332,10 +341,18 @@ def main():
             for _cid in uploaded_sparse.ids:
                 _scheme.backend.DropAx(_cid)
 
+    if low_level is not None:
+        # One-time, outside the timed region: the network's own
+        # bootstrappers are prepared for its internal widths only, and
+        # the selector is uploaded at the full slot width.
+        _boot_slots = _scheme.backend.GetCiphertextSlots(uploaded_sparse.ids[0])
+        _scheme.backend.NewBootstrapper(0, _boot_slots)
+
     upload_cts = len(uploaded_sparse.ids)
     upload_bytes = _upload_bytes(_scheme.backend, uploaded_sparse.ids,
                                  _log_n, seeded=seeded)
-    _tags = [" seeded"] if seeded else []
+    _tags = (([" seeded"] if seeded else [])
+             + ([f" level {_upload_level}"] if low_level is not None else []))
     print(f"[upload] selector: {upload_cts} ciphertext(s), "
           f"{upload_bytes/2**20:.1f} MiB"
           f"{(' (' + ','.join(t.strip() for t in _tags) + ')') if _tags else ''}",
@@ -374,10 +391,22 @@ def main():
             # place, so it is idempotent across trials.
             for _cid, _sd in zip(uploaded_sparse.ids, upload_seeds):
                 _scheme.backend.ExpandSeededAx(_cid, _sd)
-        sparse_in = uploaded_sparse
+        if low_level is not None:
+            # Bootstrap back up to a usable level. Returns fresh
+            # handles, so keep them separate from the uploaded ones
+            # (which every trial re-reads).
+            _booted = [_scheme.backend.Bootstrap(_cid, _boot_slots)
+                       for _cid in uploaded_sparse.ids]
+            _received = CipherTensor(_scheme, _booted, uploaded_sparse.shape)
+        else:
+            _received = uploaded_sparse
+        sparse_in = _received
         out = model(encrypted_dense, sparse_in)
         t1 = time.time()
         torch.cuda.nvtx.range_pop()
+        if low_level is not None:
+            for _cid in _received.ids:
+                _scheme.backend.DeleteCiphertext(_cid)
         print(f"[timing] {label}: {t1 - t0:.3f}s", flush=True)
         if i > 0:
             trial_times.append(t1 - t0)
@@ -422,6 +451,8 @@ def main():
         "runtime_seconds": runtime,  # mean of warm trials
         "runtime_seconds_trials": trial_times,
         "seeded_upload": seeded,
+        "low_level_upload": low_level,
+        "upload_level": _upload_level,
         "upload_ciphertexts": upload_cts,
         "upload_bytes": upload_bytes,
         "peak_device_mb": peak_device_mb,
