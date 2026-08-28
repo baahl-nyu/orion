@@ -403,19 +403,25 @@ def main():
         if seeded:
             # Server rebuilds each a from its seed. Overwrites ax in
             # place, so it is idempotent across trials.
+            torch.cuda.nvtx.range_push("upload_seed_expand")
             for _cid, _sd in zip(uploaded_sparse.ids, upload_seeds):
                 _scheme.backend.ExpandSeededAx(_cid, _sd)
+            torch.cuda.nvtx.range_pop()
         if low_level is not None:
+            torch.cuda.nvtx.range_push("upload_bootstrap")
             # Bootstrap back up to a usable level. Returns fresh
             # handles, so keep them separate from the uploaded ones
             # (which every trial re-reads).
             _booted = [_scheme.backend.Bootstrap(_cid, _boot_slots)
                        for _cid in uploaded_sparse.ids]
             _received = CipherTensor(_scheme, _booted, uploaded_sparse.shape)
+            torch.cuda.nvtx.range_pop()
         else:
             _received = uploaded_sparse
         sparse_in = _received
+        torch.cuda.nvtx.range_push("model_forward")
         out = model(encrypted_dense, sparse_in)
+        torch.cuda.nvtx.range_pop()
         t1 = time.time()
         torch.cuda.nvtx.range_pop()
         if low_level is not None:
