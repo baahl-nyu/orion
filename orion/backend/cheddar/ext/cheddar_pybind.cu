@@ -126,6 +126,18 @@ struct BackendState {
     std::map<int, HoistLT> hoist_lts;
     int next_hoist_lt_id = 1;
 
+    // Broadcast scalars in RNS form. One word per prime, against a
+    // Plaintext's N words per prime -- see MulConstantAccumNew. Kept in
+    // their own registry so a table of them can be encoded once, offline,
+    // and reused across evaluations the way plaintexts are.
+    struct StoredConst {
+        std::unique_ptr<cheddar::Constant<word>> value;
+        int level;
+        double scale;
+    };
+    std::map<int, StoredConst> constants;
+    int next_const_id = 1;
+
     int put_pt(std::unique_ptr<Pt> pt) {
         int id = next_pt_id++;
         plaintexts[id] = std::move(pt);
@@ -149,6 +161,19 @@ struct BackendState {
             throw std::out_of_range("Ciphertext id " + std::to_string(id) +
                                     " not found");
         return *it->second;
+    }
+    int put_const(std::unique_ptr<cheddar::Constant<word>> c, int level,
+                  double scale) {
+        int id = next_const_id++;
+        constants[id] = StoredConst{std::move(c), level, scale};
+        return id;
+    }
+    StoredConst& konst(int id) {
+        auto it = constants.find(id);
+        if (it == constants.end())
+            throw std::out_of_range("Constant id " + std::to_string(id) +
+                                    " not found");
+        return it->second;
     }
 };
 
@@ -387,6 +412,11 @@ int setup_scheme(py::dict params) {
 void delete_scheme() {
     g_state.plaintexts.clear();
     g_state.ciphertexts.clear();
+    // Constants hold device memory like the other containers; leaving
+    // them to static destruction runs their frees after the CUDA context
+    // is gone, which segfaults at exit (seen as exit=139 after a clean
+    // run has already written its results).
+    g_state.constants.clear();
     g_state.hoist_lts.clear();
     g_state.rot_keys.clear();
     g_state.boot_prepared_slots.clear();
@@ -802,6 +832,123 @@ int MulPlaintextAccumNew(std::vector<int> ct_ids, std::vector<int> pt_ids) {
         pt_views.push_back(pts[i]->ConstView());
     }
     g_state.context->elem_handler_.PAccum(out_view, np, ct_views, pt_views);
+    return g_state.put_ct(std::move(out));
+}
+
+// Constant-weighted accumulation: sum_i scalars[i] * ct_ids[i], fused.
+//
+// Same shape as MulPlaintextAccumNew, but each weight is a broadcast
+// scalar rather than a slot vector, so it rides cheddar's CAccum (the
+// path EvalPoly and BootContext already use) instead of PAccum. That
+// matters for memory, not just speed: a Constant<word> is one word per
+// prime, while the equivalent Plaintext is N words per prime -- 65536x
+// larger for the same information. IVE's PCMM multiplies p coordinate
+// ciphertexts by d*p table scalars, and materialising those as full
+// plaintexts is what put p >= 8192 out of reach on a 96 GB card.
+//
+// Scale follows MulScalarFloat: each constant is encoded at the
+// ciphertext's own scale, so the result's scale is squared and the
+// caller must Rescale once -- identical to the plaintext path it
+// replaces.
+cheddar::Constant<word> encode_const(double number, int level, double scale);
+
+// Broadcast-scalar table entries, encoded once and reused.
+//
+// A Constant<word> holds one word per prime; the Plaintext that encodes
+// the same broadcast value holds N words per prime -- 65536x more for
+// identical arithmetic. IVE's PCMM multiplies p coordinate ciphertexts
+// by d*p table scalars, and materialising those as plaintexts is what
+// put p >= 8192 out of reach on a 96 GB card.
+int EncodeConstantNew(double scalar, int level, double scale) {
+    ensure_setup();
+    auto c = std::make_unique<cheddar::Constant<word>>(
+        encode_const(scalar, level, scale));
+    return g_state.put_const(std::move(c), level, scale);
+}
+
+void DeleteConstant(int id) {
+    g_state.constants.erase(id);
+}
+
+// sum_i const_ids[i] * ct_ids[i], fused through cheddar's CAccum -- the
+// path EvalPoly and BootContext already use. Structurally the same as
+// MulPlaintextAccumNew; the weights are broadcast scalars rather than
+// slot vectors.
+//
+// Scale follows MulScalarFloat: constants are encoded at the
+// ciphertext's scale, so the result's scale is squared and the caller
+// Rescales once, exactly as with the plaintext path it replaces.
+//
+// Constants carry no level-alignment path (there is no Constant analogue
+// of align_pt), so every constant must already sit at the level the
+// ciphertexts align down to. That is the natural calling pattern: the
+// table is encoded at VecGen's output level and the coordinates arrive
+// there.
+int MulConstantAccumNew(std::vector<int> ct_ids, std::vector<int> const_ids) {
+    ensure_setup();
+    if (ct_ids.empty() || ct_ids.size() != const_ids.size())
+        throw std::runtime_error(
+            "MulConstantAccumNew: ct_ids/const_ids must be equal-length and "
+            "non-empty.");
+
+    int target = 1 << 30;
+    for (int id : ct_ids) target = std::min(target, level_of(g_state.ct(id)));
+
+    size_t n = ct_ids.size();
+    std::vector<std::unique_ptr<Ct>> tmp_cts(n);
+    std::vector<const Ct*> cts(n);
+    for (size_t i = 0; i < n; i++) {
+        const Ct& c = g_state.ct(ct_ids[i]);
+        if (c.HasRx())
+            throw std::runtime_error(
+                "MulConstantAccumNew: operand is degree-2; relinearize "
+                "first.");
+        cts[i] = align_down(c, target, tmp_cts[i]);
+    }
+
+    const cheddar::NPInfo np = cts[0]->GetNP();
+    const double ct_scale = cts[0]->GetScale();
+    const double const_scale = g_state.konst(const_ids[0]).scale;
+    int num_slots = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cts[i]->GetNP().GetNumQ() != np.GetNumQ() ||
+            cts[i]->GetNP().num_aux_ != np.num_aux_)
+            throw std::runtime_error(
+                "MulConstantAccumNew: ciphertext NP mismatch after level "
+                "alignment.");
+        if (std::abs(cts[i]->GetScale() - ct_scale) > 1e-9 * ct_scale)
+            throw std::runtime_error(
+                "MulConstantAccumNew: inconsistent ciphertext scales.");
+        if (std::abs(g_state.konst(const_ids[i]).scale - const_scale) >
+            1e-9 * const_scale)
+            throw std::runtime_error(
+                "MulConstantAccumNew: inconsistent constant scales.");
+        num_slots = std::max(num_slots, cts[i]->GetNumSlots());
+        if (g_state.konst(const_ids[i]).level != target)
+            throw std::runtime_error(
+                "MulConstantAccumNew: constant " +
+                std::to_string(const_ids[i]) + " is at level " +
+                std::to_string(g_state.konst(const_ids[i]).level) +
+                " but the ciphertexts align to level " +
+                std::to_string(target) + "; re-encode the table there.");
+    }
+
+    auto out = std::make_unique<Ct>();
+    out->RemoveRx();
+    out->ModifyNP(np);
+    out->SetScale(ct_scale * const_scale);
+    out->SetNumSlots(num_slots);
+    std::vector<cheddar::DvView<word>> out_view = out->ViewVector();
+
+    std::vector<std::vector<cheddar::DvConstView<word>>> ct_views;
+    std::vector<cheddar::DvConstView<word>> const_views;
+    ct_views.reserve(n);
+    const_views.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        ct_views.push_back(cts[i]->ConstViewVector());
+        const_views.push_back(g_state.konst(const_ids[i]).value->ConstView());
+    }
+    g_state.context->elem_handler_.CAccum(out_view, np, ct_views, const_views);
     return g_state.put_ct(std::move(out));
 }
 
@@ -1671,6 +1818,11 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     // ct - pt
     m.def("MulPlaintextNew", &MulPlaintextNew);
     m.def("MulPlaintext", &MulPlaintext);
+    m.def("EncodeConstantNew", &EncodeConstantNew, py::arg("scalar"),
+          py::arg("level"), py::arg("scale"));
+    m.def("DeleteConstant", &DeleteConstant, py::arg("const_id"));
+    m.def("MulConstantAccumNew", &MulConstantAccumNew, py::arg("ct_ids"),
+          py::arg("const_ids"));
     m.def("MulPlaintextAccumNew", &MulPlaintextAccumNew, py::arg("ct_ids"),
           py::arg("pt_ids"));
 
