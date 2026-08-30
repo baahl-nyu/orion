@@ -617,6 +617,30 @@ class CheddarLibrary:
     def MulPlaintextNew(self, ct_id: int, pt_id: int) -> int:
         return _native.MulPlaintextNew(int(ct_id), int(pt_id))
 
+    def EncodeConstantNew(self, scalar: float, level: int, scale) -> int:
+        """A broadcast scalar in RNS form: one word per prime.
+
+        The same value as `Encode([scalar] * slots, ...)` but without the
+        N-fold redundancy, so a table of them can be held where the
+        plaintext equivalent would not fit. Encode once, offline; the
+        level must match the level its ciphertexts align down to.
+        """
+        return _native.EncodeConstantNew(
+            float(scalar), int(level), float(scale))
+
+    def DeleteConstant(self, const_id: int) -> None:
+        _native.DeleteConstant(int(const_id))
+
+    def MulConstantAccumNew(self, ct_ids: Sequence[int],
+                            const_ids: Sequence[int]) -> int:
+        """sum_i const_ids[i] * ct_ids[i], fused, with broadcast scalars.
+
+        The constant-weight twin of MulPlaintextAccumNew. Result scale is
+        squared; Rescale once, exactly as with the plaintext path.
+        """
+        return _native.MulConstantAccumNew(
+            [int(c) for c in ct_ids], [int(k) for k in const_ids])
+
     def MulPlaintextAccumNew(self, ct_ids: Sequence[int],
                              pt_ids: Sequence[int]) -> int:
         """Fused MAC: sum_i ct_i * pt_i in one native PAccum kernel chain

@@ -114,16 +114,28 @@ def main():
         probe_src = ct_q
     probe, _ = vecgen(backend, probe_src, p, Counter())
     out_level = min(backend.GetCiphertextLevel(c) for c in probe)
+    # Capture the coordinates' own scale before the probe is freed. On
+    # the word32 rational-rescaling chain a ciphertext's scale drifts
+    # from the nominal 2^LogScale, and the table constants must be
+    # encoded at the same scale or the product's declared scale is wrong
+    # by that ratio and the decode is off.
+    out_scale = backend.GetCiphertextScale(probe[0])
     # Algorithm 1's line 16 is a query-independent constant; build it once.
     from ive_selector import make_const
     const_ct = make_const(backend, probe[0])
     for c in probe:
         if c is not const_ct:
             backend.DeleteCiphertext(c)
-    pts = [[backend.Encode([float(ML[k, r])] * slots, out_level, scale)
-            for k in range(p)] for r in range(d)]
+    # The transformed table enters PCMM as d*p broadcast scalars. Held as
+    # Cheddar Constants (one word per prime) rather than full plaintexts
+    # (N words per prime): same arithmetic, 65536x less memory, and it is
+    # what lets p run past 4096 at all -- see MulConstantAccumNew.
+    table = [[backend.EncodeConstantNew(float(ML[k, r]), out_level,
+                                        out_scale)
+              for k in range(p)] for r in range(d)]
     print(f"[ive] VecGen output at level {out_level}; "
-          f"{d*p} table plaintexts encoded offline", flush=True)
+          f"{d*p} table constants encoded offline "
+          f"(broadcast scalars, no plaintexts)", flush=True)
 
     if args.boot:
         backend.DeleteCiphertext(probe_src)
@@ -150,7 +162,7 @@ def main():
         aligned = [backend._align_lt_input(c, out_level)[0] for c in cts]
         outs = []
         for r in range(d):
-            acc = backend.MulPlaintextAccumNew(aligned, pts[r])
+            acc = backend.MulConstantAccumNew(aligned, table[r])
             outs.append(backend.RescaleNew(acc))
             backend.DeleteCiphertext(acc)
         torch.cuda.synchronize()
@@ -210,6 +222,17 @@ def main():
     avg = lambda k: sum(times[k]) / len(times[k])
     bt, vg, pc, sm = avg("boot"), avg("vecgen"), avg("pcmm"), avg("sum")
     total = bt + vg + pc + sm
+    peak_mb = backend.GetPeakDeviceMemoryMB()
+    rss_mb = 0.0
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    rss_mb = int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    print(f"[ive] peak pool {peak_mb/1024:.2f} GiB  host VmHWM {rss_mb/1024:.2f} GiB "
+          f"(managed_memory={os.environ.get('ORION_CHEDDAR_MANAGED_MEMORY', '0')})")
     print(f"[ive] boot {bt*1000:7.2f} ms  VecGen {vg*1000:7.2f} ms  "
           f"PCMM {pc*1000:7.2f} ms  subtable-sum {sm*1000:7.2f} ms  "
           f"TOTAL {total*1000:7.2f} ms   (one {slots}-slot batch, "
@@ -219,7 +242,10 @@ def main():
         json.dump({"p": p, "d": d, "slots": slots, "level": level,
                    "depth": depth, "vecgen_s": vg, "pcmm_s": pc,
                    "sum_s": sm, "boot_s": bt, "ell": args.ell,
-                   "query_bytes": query_bytes, "counts": counts.as_dict()},
+                   "query_bytes": query_bytes, "counts": counts.as_dict(),
+                   "peak_pool_mb": peak_mb, "host_hwm_mb": rss_mb,
+                   "managed_memory": os.environ.get(
+                       "ORION_CHEDDAR_MANAGED_MEMORY", "0")},
                   open(args.out, "w"), indent=1)
 
 
