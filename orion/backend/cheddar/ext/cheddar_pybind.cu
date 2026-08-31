@@ -22,6 +22,8 @@
 #include <extension/EvalPoly.h>
 #include <extension/Hoist.h>
 
+#include <common/Basic.cuh>
+
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
 
@@ -32,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -137,6 +140,61 @@ struct BackendState {
     };
     std::map<int, StoredConst> constants;
     int next_const_id = 1;
+
+    // A d x p table of constants, repacked prime-major and contiguous so
+    // the PC-MM kernel reads one array instead of chasing d*p device
+    // pointers. Built once, offline -- see PackConstantTableNew.
+    struct StoredConstTable {
+        cheddar::DeviceVector<word> data;
+        int rows;
+        int cols;
+        int qsize;
+        int level;
+        double scale;
+    };
+    std::map<int, StoredConstTable> const_tables;
+    int next_table_id = 1;
+
+    // The slot-varying twin: a rows x cols table of full plaintexts,
+    // recorded as device pointers (the plaintexts stay in their own
+    // registry). Used when several fields share one ciphertext, so a
+    // table entry cannot be a broadcast scalar.
+    struct StoredPtTable {
+        const word** ptrs;
+        int rows;
+        int cols;
+        int qsize;
+        int level;
+        double scale;
+        int num_slots;
+    };
+    std::map<int, StoredPtTable> pt_tables;
+    int next_pt_table_id = 1;
+
+    // Device-side descriptor arrays for the PC-MM kernel (pointers and
+    // aux offsets). Grown on demand and reused, so a per-call PC-MM does
+    // not pay a cudaMalloc.
+    void* scratch = nullptr;
+    size_t scratch_bytes = 0;
+
+    void* ensure_scratch(size_t bytes) {
+        if (bytes > scratch_bytes) {
+            if (scratch) cudaFree(scratch);
+            if (cudaMalloc(&scratch, bytes) != cudaSuccess) {
+                scratch = nullptr;
+                scratch_bytes = 0;
+                throw std::runtime_error("ensure_scratch: cudaMalloc failed.");
+            }
+            scratch_bytes = bytes;
+        }
+        return scratch;
+    }
+
+    void free_scratch() {
+        if (scratch) cudaFree(scratch);
+        scratch = nullptr;
+        scratch_bytes = 0;
+    }
 
     int put_pt(std::unique_ptr<Pt> pt) {
         int id = next_pt_id++;
@@ -417,6 +475,11 @@ void delete_scheme() {
     // is gone, which segfaults at exit (seen as exit=139 after a clean
     // run has already written its results).
     g_state.constants.clear();
+    g_state.const_tables.clear();
+    for (auto& kv : g_state.pt_tables)
+        if (kv.second.ptrs) cudaFree(kv.second.ptrs);
+    g_state.pt_tables.clear();
+    g_state.free_scratch();
     g_state.hoist_lts.clear();
     g_state.rot_keys.clear();
     g_state.boot_prepared_slots.clear();
@@ -950,6 +1013,558 @@ int MulConstantAccumNew(std::vector<int> ct_ids, std::vector<int> const_ids) {
     }
     g_state.context->elem_handler_.CAccum(out_view, np, ct_views, const_views);
     return g_state.put_ct(std::move(out));
+}
+
+// ---------------------------------------------------------------------------
+// PC-MM in one pass over the ciphertext matrix
+// ---------------------------------------------------------------------------
+// Bae-Cheon-Hanrot-Park-Stehle (CRYPTO'24, IVE's reference [5]) observe
+// that multiplying a plaintext matrix U into ciphertexts whose rows are
+// separate RLWE elements is, coefficient-wise, nothing but two plaintext
+// matrix products: writing the ciphertexts' polynomials as rows of A and
+// B, U*A and U*B are again the a- and b-parts of the answer. Their point
+// is that a PC-MM should therefore run at the speed of a PP-MM -- one
+// GEMM, each input read once -- rather than as a sequence of scalar
+// multiply-accumulates.
+//
+// MulConstantAccumNew already computes U*A and U*B; it just computes them
+// one output row at a time, so the p input ciphertexts are streamed from
+// HBM once per output row. For IVE's d x p table that is d-fold redundant
+// traffic (and, past cheddar's 8-way accumulation chunk, a recursive
+// temp-buffer walk on top). ConstMatMulKernel below is the GEMM form: one
+// pass over the inputs, all d accumulators live in registers.
+//
+// Their remaining tricks do not transfer. The floating-point PP-MM of
+// Section 5 buys nothing here (a GPU's modular multiplier is not the
+// bottleneck; memory traffic is), and the shared-a format of Section 3
+// does not apply to VecGen's outputs, which are products and conjugates
+// with independent a-parts.
+
+constexpr int kMatMulBlock = 256;
+constexpr int kMatMulKTile = 64;
+
+// out[j][i] = in[i][j]: the d*p constants, each one word per prime,
+// repacked so the online kernel indexes one contiguous array per prime
+// instead of chasing d*p device pointers. Runs once, offline.
+template <typename W>
+__global__ void GatherConstTableKernel(W* out, const W* const* in, int n,
+                                       int tsize) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n * tsize) return;
+    int i = tid / tsize;
+    int j = tid - i * tsize;
+    out[static_cast<size_t>(j) * n + i] = in[i][j];
+}
+
+// One RNS coefficient position per thread; D output rows accumulated at
+// once. The k-tile stages the table entries and source pointers for the
+// current chunk of input ciphertexts in shared memory, so the inner loop
+// is a register-resident FMA chain over streamed source words.
+template <typename W, int D>
+__global__ void ConstMatMulKernel(
+    W* const* __restrict__ dst_ptrs, const W* const* __restrict__ src_ptrs,
+    const int* __restrict__ src_extra, const W* __restrict__ table,
+    int table_stride, int table_qsize, int row0, int rows,
+    const W* __restrict__ primes,
+    const cheddar::make_signed_t<W>* __restrict__ inv_primes, int num_q_primes,
+    int log_degree, int P) {
+    using SW = cheddar::make_signed_t<W>;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int prime_index = i >> log_degree;
+    const W prime = primes[prime_index];
+    const SW inv_prime = inv_primes[prime_index];
+    // Aux primes sit behind the container's own q-part, which may be
+    // longer than this NP's -- the same offset CPAccum applies.
+    const bool aux = (prime_index >= num_q_primes);
+    const int common_index =
+        aux ? prime_index + (table_qsize - num_q_primes) : prime_index;
+    const W* trow = table + static_cast<size_t>(common_index) * table_stride;
+
+    __shared__ W s_const[D * kMatMulKTile];
+    __shared__ const W* s_src[2 * kMatMulKTile];
+    __shared__ int s_extra[kMatMulKTile];
+
+    W acc[D][2];
+#pragma unroll
+    for (int r = 0; r < D; r++) {
+        acc[r][0] = 0;
+        acc[r][1] = 0;
+    }
+
+    for (int k0 = 0; k0 < P; k0 += kMatMulKTile) {
+        const int kt = min(kMatMulKTile, P - k0);
+        __syncthreads();
+        for (int t = threadIdx.x; t < D * kt; t += blockDim.x) {
+            const int r = t / kt;
+            const int kk = t - r * kt;
+            s_const[r * kMatMulKTile + kk] =
+                (r < rows)
+                    ? trow[static_cast<size_t>(row0 + r) * P + k0 + kk]
+                    : W{0};
+        }
+        for (int t = threadIdx.x; t < kt; t += blockDim.x) {
+            s_src[2 * t] = src_ptrs[2 * (k0 + t)];
+            s_src[2 * t + 1] = src_ptrs[2 * (k0 + t) + 1];
+            s_extra[t] = src_extra[k0 + t];
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < kt; kk++) {
+            const int off = aux ? s_extra[kk] : 0;
+            const W v0 =
+                cheddar::basic::StreamingLoad(s_src[2 * kk] + i + off);
+            const W v1 =
+                cheddar::basic::StreamingLoad(s_src[2 * kk + 1] + i + off);
+#pragma unroll
+            for (int r = 0; r < D; r++) {
+                const W c = s_const[r * kMatMulKTile + kk];
+                acc[r][0] = cheddar::basic::Add(
+                    acc[r][0],
+                    cheddar::basic::MultMontgomery(c, v0, prime, inv_prime),
+                    prime);
+                acc[r][1] = cheddar::basic::Add(
+                    acc[r][1],
+                    cheddar::basic::MultMontgomery(c, v1, prime, inv_prime),
+                    prime);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < D; r++) {
+        if (r < rows) {
+            dst_ptrs[2 * r][i] = acc[r][0];
+            dst_ptrs[2 * r + 1][i] = acc[r][1];
+        }
+    }
+}
+
+// Pack a d x p table of already-encoded constants (row-major, entry
+// (r, k) at const_ids[r * p + k]) into the layout ConstMatMulKernel
+// reads. Offline work: the IVE table is query-independent.
+int PackConstantTableNew(std::vector<int> const_ids, int rows) {
+    ensure_setup();
+    if (rows <= 0 || const_ids.empty() ||
+        const_ids.size() % static_cast<size_t>(rows) != 0)
+        throw std::runtime_error(
+            "PackConstantTableNew: const_ids must be a non-empty row-major "
+            "rows x cols table.");
+    const int n = static_cast<int>(const_ids.size());
+    const int cols = n / rows;
+
+    const auto& first = g_state.konst(const_ids[0]);
+    const int level = first.level;
+    const double scale = first.scale;
+    const int qsize = first.value->ConstView().QSize();
+    const int tsize = first.value->ConstView().TotalSize();
+
+    std::vector<const word*> hptr(n);
+    for (int i = 0; i < n; i++) {
+        const auto& k = g_state.konst(const_ids[i]);
+        if (k.level != level)
+            throw std::runtime_error(
+                "PackConstantTableNew: all constants must share one level.");
+        if (std::abs(k.scale - scale) > 1e-9 * scale)
+            throw std::runtime_error(
+                "PackConstantTableNew: all constants must share one scale.");
+        auto view = k.value->ConstView();
+        if (view.QSize() != qsize || view.TotalSize() != tsize)
+            throw std::runtime_error(
+                "PackConstantTableNew: inconsistent constant layout.");
+        hptr[i] = view.data();
+    }
+
+    const word** dptr = nullptr;
+    if (cudaMalloc(&dptr, sizeof(const word*) * n) != cudaSuccess)
+        throw std::runtime_error(
+            "PackConstantTableNew: cudaMalloc for the pointer array failed.");
+    cudaMemcpy(dptr, hptr.data(), sizeof(const word*) * n,
+               cudaMemcpyHostToDevice);
+
+    cheddar::DeviceVector<word> packed(n * tsize);
+    const int total = n * tsize;
+    GatherConstTableKernel<word>
+        <<<(total + 255) / 256, 256>>>(packed.data(), dptr, n, tsize);
+    cudaError_t err = cudaDeviceSynchronize();
+    cudaFree(dptr);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("PackConstantTableNew: ") +
+                                 cudaGetErrorString(err));
+
+    int id = g_state.next_table_id++;
+    g_state.const_tables.emplace(
+        id, BackendState::StoredConstTable{std::move(packed), rows, cols,
+                                          qsize, level, scale});
+    return id;
+}
+
+void DeleteConstantTable(int id) { g_state.const_tables.erase(id); }
+
+// U * (the p input ciphertexts), all d output rows in one pass. Returns
+// d new ciphertext ids, in table row order. Scale follows the CAccum
+// path: constants carry the ciphertexts' own scale, so each output's
+// scale is squared and the caller Rescales once.
+std::vector<int> MulConstantMatMulNew(std::vector<int> ct_ids, int table_id) {
+    ensure_setup();
+    auto it = g_state.const_tables.find(table_id);
+    if (it == g_state.const_tables.end())
+        throw std::out_of_range("Constant table id " +
+                                std::to_string(table_id) + " not found");
+    const auto& tab = it->second;
+    if (static_cast<int>(ct_ids.size()) != tab.cols)
+        throw std::runtime_error(
+            "MulConstantMatMulNew: expected " + std::to_string(tab.cols) +
+            " ciphertexts, got " + std::to_string(ct_ids.size()) + ".");
+
+    int target = 1 << 30;
+    for (int id : ct_ids) target = std::min(target, level_of(g_state.ct(id)));
+    if (tab.level != target)
+        throw std::runtime_error(
+            "MulConstantMatMulNew: table is at level " +
+            std::to_string(tab.level) + " but the ciphertexts align to " +
+            std::to_string(target) + "; re-encode the table there.");
+
+    const size_t n = ct_ids.size();
+    std::vector<std::unique_ptr<Ct>> tmp_cts(n);
+    std::vector<const Ct*> cts(n);
+    for (size_t i = 0; i < n; i++) {
+        const Ct& c = g_state.ct(ct_ids[i]);
+        if (c.HasRx())
+            throw std::runtime_error(
+                "MulConstantMatMulNew: operand is degree-2; relinearize "
+                "first.");
+        cts[i] = align_down(c, target, tmp_cts[i]);
+    }
+
+    const cheddar::NPInfo np = cts[0]->GetNP();
+    const double ct_scale = cts[0]->GetScale();
+    int num_slots = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cts[i]->GetNP().GetNumQ() != np.GetNumQ() ||
+            cts[i]->GetNP().num_aux_ != np.num_aux_)
+            throw std::runtime_error(
+                "MulConstantMatMulNew: ciphertext NP mismatch after level "
+                "alignment.");
+        if (std::abs(cts[i]->GetScale() - ct_scale) > 1e-9 * ct_scale)
+            throw std::runtime_error(
+                "MulConstantMatMulNew: inconsistent ciphertext scales.");
+        num_slots = std::max(num_slots, cts[i]->GetNumSlots());
+    }
+
+    const auto& param = g_state.context->param_;
+    const int degree = param.degree_;
+    const int q_size = np.GetNumQ() * degree;
+
+    std::vector<const word*> hsrc(2 * n);
+    std::vector<int> hextra(n);
+    for (size_t i = 0; i < n; i++) {
+        auto views = cts[i]->ConstViewVector();
+        if (views.size() != 2)
+            throw std::runtime_error(
+                "MulConstantMatMulNew: expected degree-1 ciphertexts.");
+        hsrc[2 * i] = views[0].data();
+        hsrc[2 * i + 1] = views[1].data();
+        hextra[i] = views[0].QSize() - q_size;
+    }
+
+    std::vector<std::unique_ptr<Ct>> outs(tab.rows);
+    std::vector<word*> hdst(2 * tab.rows);
+    for (int r = 0; r < tab.rows; r++) {
+        outs[r] = std::make_unique<Ct>();
+        outs[r]->RemoveRx();
+        outs[r]->ModifyNP(np);
+        outs[r]->SetScale(ct_scale * tab.scale);
+        outs[r]->SetNumSlots(num_slots);
+        auto views = outs[r]->ViewVector();
+        hdst[2 * r] = views[0].data();
+        hdst[2 * r + 1] = views[1].data();
+    }
+
+    // One H2D transfer for the three descriptor arrays: d*2 output
+    // pointers, p*2 source pointers, p aux offsets.
+    const size_t ptr_bytes = sizeof(void*) * (hdst.size() + hsrc.size());
+    const size_t int_bytes = sizeof(int) * hextra.size();
+    std::vector<unsigned char> host(ptr_bytes + int_bytes);
+    std::memcpy(host.data(), hdst.data(), sizeof(void*) * hdst.size());
+    std::memcpy(host.data() + sizeof(void*) * hdst.size(), hsrc.data(),
+                sizeof(void*) * hsrc.size());
+    std::memcpy(host.data() + ptr_bytes, hextra.data(), int_bytes);
+    unsigned char* dev =
+        static_cast<unsigned char*>(g_state.ensure_scratch(host.size()));
+    cudaMemcpy(dev, host.data(), host.size(), cudaMemcpyHostToDevice);
+
+    word* const* d_dst = reinterpret_cast<word* const*>(dev);
+    const word* const* d_src = reinterpret_cast<const word* const*>(
+        dev + sizeof(void*) * hdst.size());
+    const int* d_extra = reinterpret_cast<const int*>(dev + ptr_bytes);
+
+    const word* primes = param.GetPrimesPtr(np);
+    const cheddar::make_signed_t<word>* inv_primes =
+        param.GetInvPrimesPtr(np);
+    if (degree % kMatMulBlock != 0)
+        throw std::runtime_error(
+            "one-pass PC-MM: ring degree must be a multiple of " +
+            std::to_string(kMatMulBlock) + ".");
+    const int grid = np.GetNumTotal() * degree / kMatMulBlock;
+    // 16 accumulator pairs fit comfortably in registers for 32-bit
+    // words; the 64-bit build halves the tile to stay off local memory.
+    constexpr int kDTile = sizeof(word) == 4 ? 16 : 8;
+    for (int row0 = 0; row0 < tab.rows; row0 += kDTile) {
+        const int rows = std::min(kDTile, tab.rows - row0);
+        ConstMatMulKernel<word, kDTile><<<grid, kMatMulBlock>>>(
+            d_dst + 2 * row0, d_src, d_extra, tab.data.data(),
+            tab.rows * tab.cols, tab.qsize, row0, rows, primes, inv_primes,
+            np.GetNumQ(), param.log_degree_, tab.cols);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("MulConstantMatMulNew: ") +
+                                 cudaGetErrorString(err));
+
+    std::vector<int> ids(tab.rows);
+    for (int r = 0; r < tab.rows; r++)
+        ids[r] = g_state.put_ct(std::move(outs[r]));
+    return ids;
+}
+
+// The slot-varying twin of ConstMatMulKernel. When several fields share
+// one ciphertext each table entry is a full plaintext rather than a
+// broadcast scalar, so the multipliers cannot be staged in shared
+// memory -- but the one-pass structure still removes the d-fold re-read
+// of the coordinate ciphertexts, which is the larger of the two streams
+// whenever the ciphertexts outweigh the table.
+template <typename W, int D>
+__global__ void PlaintextMatMulKernel(
+    W* const* __restrict__ dst_ptrs, const W* const* __restrict__ src_ptrs,
+    const int* __restrict__ src_extra,
+    const W* const* __restrict__ pt_ptrs, int pt_extra, int row0, int rows,
+    const W* __restrict__ primes,
+    const cheddar::make_signed_t<W>* __restrict__ inv_primes, int num_q_primes,
+    int log_degree, int P) {
+    using SW = cheddar::make_signed_t<W>;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int prime_index = i >> log_degree;
+    const W prime = primes[prime_index];
+    const SW inv_prime = inv_primes[prime_index];
+    const bool aux = (prime_index >= num_q_primes);
+    const int poff = aux ? pt_extra : 0;
+
+    W acc[D][2];
+#pragma unroll
+    for (int r = 0; r < D; r++) {
+        acc[r][0] = 0;
+        acc[r][1] = 0;
+    }
+
+    for (int k = 0; k < P; k++) {
+        const int off = aux ? src_extra[k] : 0;
+        const W v0 = cheddar::basic::StreamingLoad(src_ptrs[2 * k] + i + off);
+        const W v1 =
+            cheddar::basic::StreamingLoad(src_ptrs[2 * k + 1] + i + off);
+#pragma unroll
+        for (int r = 0; r < D; r++) {
+            if (r < rows) {
+                const W c = cheddar::basic::StreamingLoad(
+                    pt_ptrs[(row0 + r) * P + k] + i + poff);
+                acc[r][0] = cheddar::basic::Add(
+                    acc[r][0],
+                    cheddar::basic::MultMontgomery(c, v0, prime, inv_prime),
+                    prime);
+                acc[r][1] = cheddar::basic::Add(
+                    acc[r][1],
+                    cheddar::basic::MultMontgomery(c, v1, prime, inv_prime),
+                    prime);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < D; r++) {
+        if (r < rows) {
+            dst_ptrs[2 * r][i] = acc[r][0];
+            dst_ptrs[2 * r + 1][i] = acc[r][1];
+        }
+    }
+}
+
+// Pin a rows x cols plaintext table (row-major, entry (r, k) at
+// pt_ids[r * cols + k]) for MulPlaintextMatMulNew. Only the pointers
+// are recorded, so the plaintexts must outlive the table and stay at
+// the level they were encoded at; delete and repack otherwise.
+int PackPlaintextTableNew(std::vector<int> pt_ids, int rows) {
+    ensure_setup();
+    if (rows <= 0 || pt_ids.empty() ||
+        pt_ids.size() % static_cast<size_t>(rows) != 0)
+        throw std::runtime_error(
+            "PackPlaintextTableNew: pt_ids must be a non-empty row-major "
+            "rows x cols table.");
+    const int n = static_cast<int>(pt_ids.size());
+    const int cols = n / rows;
+
+    const Pt& first = g_state.pt(pt_ids[0]);
+    const int level = level_of(first);
+    const double scale = first.GetScale();
+    const int qsize = first.ConstView().QSize();
+    int num_slots = 0;
+
+    std::vector<const word*> hptr(n);
+    for (int i = 0; i < n; i++) {
+        const Pt& p = g_state.pt(pt_ids[i]);
+        if (level_of(p) != level)
+            throw std::runtime_error(
+                "PackPlaintextTableNew: all plaintexts must share one level.");
+        if (std::abs(p.GetScale() - scale) > 1e-9 * scale)
+            throw std::runtime_error(
+                "PackPlaintextTableNew: all plaintexts must share one scale.");
+        auto view = p.ConstView();
+        if (view.QSize() != qsize)
+            throw std::runtime_error(
+                "PackPlaintextTableNew: inconsistent plaintext layout.");
+        num_slots = std::max(num_slots, p.GetNumSlots());
+        hptr[i] = view.data();
+    }
+
+    const word** dptr = nullptr;
+    if (cudaMalloc(&dptr, sizeof(const word*) * n) != cudaSuccess)
+        throw std::runtime_error(
+            "PackPlaintextTableNew: cudaMalloc for the pointer array failed.");
+    cudaMemcpy(dptr, hptr.data(), sizeof(const word*) * n,
+               cudaMemcpyHostToDevice);
+
+    int id = g_state.next_pt_table_id++;
+    g_state.pt_tables[id] = BackendState::StoredPtTable{
+        dptr, rows, cols, qsize, level, scale, num_slots};
+    return id;
+}
+
+void DeletePlaintextTable(int id) {
+    auto it = g_state.pt_tables.find(id);
+    if (it == g_state.pt_tables.end()) return;
+    if (it->second.ptrs) cudaFree(it->second.ptrs);
+    g_state.pt_tables.erase(it);
+}
+
+// The plaintext-table PC-MM, all d rows in one pass. Returns d new
+// ciphertext ids; each output's scale is ct_scale * pt_scale, so the
+// caller Rescales once -- same contract as MulPlaintextAccumNew.
+std::vector<int> MulPlaintextMatMulNew(std::vector<int> ct_ids,
+                                       int table_id) {
+    ensure_setup();
+    auto it = g_state.pt_tables.find(table_id);
+    if (it == g_state.pt_tables.end())
+        throw std::out_of_range("Plaintext table id " +
+                                std::to_string(table_id) + " not found");
+    const auto& tab = it->second;
+    if (static_cast<int>(ct_ids.size()) != tab.cols)
+        throw std::runtime_error(
+            "MulPlaintextMatMulNew: expected " + std::to_string(tab.cols) +
+            " ciphertexts, got " + std::to_string(ct_ids.size()) + ".");
+
+    int target = 1 << 30;
+    for (int id : ct_ids) target = std::min(target, level_of(g_state.ct(id)));
+    if (tab.level != target)
+        throw std::runtime_error(
+            "MulPlaintextMatMulNew: table is at level " +
+            std::to_string(tab.level) + " but the ciphertexts align to " +
+            std::to_string(target) + "; re-encode the table there.");
+
+    const size_t n = ct_ids.size();
+    std::vector<std::unique_ptr<Ct>> tmp_cts(n);
+    std::vector<const Ct*> cts(n);
+    for (size_t i = 0; i < n; i++) {
+        const Ct& c = g_state.ct(ct_ids[i]);
+        if (c.HasRx())
+            throw std::runtime_error(
+                "MulPlaintextMatMulNew: operand is degree-2; relinearize "
+                "first.");
+        cts[i] = align_down(c, target, tmp_cts[i]);
+    }
+
+    const cheddar::NPInfo np = cts[0]->GetNP();
+    const double ct_scale = cts[0]->GetScale();
+    int num_slots = tab.num_slots;
+    for (size_t i = 0; i < n; i++) {
+        if (cts[i]->GetNP().GetNumQ() != np.GetNumQ() ||
+            cts[i]->GetNP().num_aux_ != np.num_aux_)
+            throw std::runtime_error(
+                "MulPlaintextMatMulNew: ciphertext NP mismatch after level "
+                "alignment.");
+        if (std::abs(cts[i]->GetScale() - ct_scale) > 1e-9 * ct_scale)
+            throw std::runtime_error(
+                "MulPlaintextMatMulNew: inconsistent ciphertext scales.");
+        num_slots = std::max(num_slots, cts[i]->GetNumSlots());
+    }
+
+    const auto& param = g_state.context->param_;
+    const int degree = param.degree_;
+    const int q_size = np.GetNumQ() * degree;
+
+    std::vector<const word*> hsrc(2 * n);
+    std::vector<int> hextra(n);
+    for (size_t i = 0; i < n; i++) {
+        auto views = cts[i]->ConstViewVector();
+        if (views.size() != 2)
+            throw std::runtime_error(
+                "MulPlaintextMatMulNew: expected degree-1 ciphertexts.");
+        hsrc[2 * i] = views[0].data();
+        hsrc[2 * i + 1] = views[1].data();
+        hextra[i] = views[0].QSize() - q_size;
+    }
+
+    std::vector<std::unique_ptr<Ct>> outs(tab.rows);
+    std::vector<word*> hdst(2 * tab.rows);
+    for (int r = 0; r < tab.rows; r++) {
+        outs[r] = std::make_unique<Ct>();
+        outs[r]->RemoveRx();
+        outs[r]->ModifyNP(np);
+        outs[r]->SetScale(ct_scale * tab.scale);
+        outs[r]->SetNumSlots(num_slots);
+        auto views = outs[r]->ViewVector();
+        hdst[2 * r] = views[0].data();
+        hdst[2 * r + 1] = views[1].data();
+    }
+
+    const size_t ptr_bytes = sizeof(void*) * (hdst.size() + hsrc.size());
+    const size_t int_bytes = sizeof(int) * hextra.size();
+    std::vector<unsigned char> host(ptr_bytes + int_bytes);
+    std::memcpy(host.data(), hdst.data(), sizeof(void*) * hdst.size());
+    std::memcpy(host.data() + sizeof(void*) * hdst.size(), hsrc.data(),
+                sizeof(void*) * hsrc.size());
+    std::memcpy(host.data() + ptr_bytes, hextra.data(), int_bytes);
+    unsigned char* dev =
+        static_cast<unsigned char*>(g_state.ensure_scratch(host.size()));
+    cudaMemcpy(dev, host.data(), host.size(), cudaMemcpyHostToDevice);
+
+    word* const* d_dst = reinterpret_cast<word* const*>(dev);
+    const word* const* d_src = reinterpret_cast<const word* const*>(
+        dev + sizeof(void*) * hdst.size());
+    const int* d_extra = reinterpret_cast<const int*>(dev + ptr_bytes);
+
+    const word* primes = param.GetPrimesPtr(np);
+    const cheddar::make_signed_t<word>* inv_primes =
+        param.GetInvPrimesPtr(np);
+    if (degree % kMatMulBlock != 0)
+        throw std::runtime_error(
+            "one-pass PC-MM: ring degree must be a multiple of " +
+            std::to_string(kMatMulBlock) + ".");
+    const int grid = np.GetNumTotal() * degree / kMatMulBlock;
+    constexpr int kDTile = sizeof(word) == 4 ? 16 : 8;
+    for (int row0 = 0; row0 < tab.rows; row0 += kDTile) {
+        const int rows = std::min(kDTile, tab.rows - row0);
+        PlaintextMatMulKernel<word, kDTile><<<grid, kMatMulBlock>>>(
+            d_dst + 2 * row0, d_src, d_extra, tab.ptrs,
+            tab.qsize - q_size, row0, rows, primes, inv_primes,
+            np.GetNumQ(), param.log_degree_, tab.cols);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("MulPlaintextMatMulNew: ") +
+                                 cudaGetErrorString(err));
+
+    std::vector<int> ids(tab.rows);
+    for (int r = 0; r < tab.rows; r++)
+        ids[r] = g_state.put_ct(std::move(outs[r]));
+    return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +2438,16 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     m.def("DeleteConstant", &DeleteConstant, py::arg("const_id"));
     m.def("MulConstantAccumNew", &MulConstantAccumNew, py::arg("ct_ids"),
           py::arg("const_ids"));
+    m.def("PackConstantTableNew", &PackConstantTableNew,
+          py::arg("const_ids"), py::arg("rows"));
+    m.def("DeleteConstantTable", &DeleteConstantTable, py::arg("table_id"));
+    m.def("MulConstantMatMulNew", &MulConstantMatMulNew, py::arg("ct_ids"),
+          py::arg("table_id"));
+    m.def("PackPlaintextTableNew", &PackPlaintextTableNew,
+          py::arg("pt_ids"), py::arg("rows"));
+    m.def("DeletePlaintextTable", &DeletePlaintextTable, py::arg("table_id"));
+    m.def("MulPlaintextMatMulNew", &MulPlaintextMatMulNew, py::arg("ct_ids"),
+          py::arg("table_id"));
     m.def("MulPlaintextAccumNew", &MulPlaintextAccumNew, py::arg("ct_ids"),
           py::arg("pt_ids"));
 

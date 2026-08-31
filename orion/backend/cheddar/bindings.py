@@ -641,6 +641,60 @@ class CheddarLibrary:
         return _native.MulConstantAccumNew(
             [int(c) for c in ct_ids], [int(k) for k in const_ids])
 
+    def PackConstantTableNew(self, const_ids: Sequence[int],
+                             rows: int) -> int:
+        """Pack a rows x cols constant table for MulConstantMatMulNew.
+
+        `const_ids` is row-major: entry (r, k) at index r * cols + k.
+        Offline work -- the table is query-independent, so this repack
+        happens once and the online call just streams ciphertexts.
+        """
+        return _native.PackConstantTableNew(
+            [int(k) for k in const_ids], int(rows))
+
+    def DeleteConstantTable(self, table_id: int) -> None:
+        _native.DeleteConstantTable(int(table_id))
+
+    def MulConstantMatMulNew(self, ct_ids: Sequence[int],
+                             table_id: int) -> list[int]:
+        """The whole table against the ciphertext vector, in one pass.
+
+        MulConstantAccumNew computes one output row per call, so the
+        input ciphertexts are streamed from HBM once per row. This is
+        the same arithmetic as a full matrix product (Bae et al.,
+        CRYPTO'24: a PC-MM is two plaintext matrix products over the
+        ciphertexts' polynomials), done as one -- each input read once,
+        all rows accumulated together. Returns one id per table row;
+        result scales are squared, so Rescale each once.
+        """
+        return list(_native.MulConstantMatMulNew(
+            [int(c) for c in ct_ids], int(table_id)))
+
+    def PackPlaintextTableNew(self, pt_ids: Sequence[int],
+                              rows: int) -> int:
+        """Pin a rows x cols plaintext table for MulPlaintextMatMulNew.
+
+        Row-major: entry (r, k) at index r * cols + k. Only pointers are
+        recorded, so the plaintexts must outlive the table and stay at
+        the level they were encoded at.
+        """
+        return _native.PackPlaintextTableNew(
+            [int(t) for t in pt_ids], int(rows))
+
+    def DeletePlaintextTable(self, table_id: int) -> None:
+        _native.DeletePlaintextTable(int(table_id))
+
+    def MulPlaintextMatMulNew(self, ct_ids: Sequence[int],
+                              table_id: int) -> list[int]:
+        """The slot-varying twin of MulConstantMatMulNew.
+
+        One pass over the ciphertexts for all table rows, so the inputs
+        are read once instead of once per row. Returns one id per row;
+        each scale is ct_scale * pt_scale, so Rescale each once.
+        """
+        return list(_native.MulPlaintextMatMulNew(
+            [int(c) for c in ct_ids], int(table_id)))
+
     def MulPlaintextAccumNew(self, ct_ids: Sequence[int],
                              pt_ids: Sequence[int]) -> int:
         """Fused MAC: sum_i ct_i * pt_i in one native PAccum kernel chain
