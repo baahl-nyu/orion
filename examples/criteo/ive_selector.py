@@ -93,6 +93,44 @@ def transformed_table(M, p):
     return (M.T @ L / math.sqrt(2.0 * p)).T
 
 
+def folded_table(M, p):
+    """The same lookup, refolded onto the powers so v is never built.
+
+    Algorithm 1 materialises all p coordinates of v(alpha) and the PCMM
+    then contracts them against M@L. But those coordinates are only
+    Re(alpha^k) and Im(alpha^k), and both are linear in alpha^k and its
+    conjugate, so the contraction can be applied to the *powers* and the
+    Re/Im split deferred past it. Writing A = (M@L)[0:n], B = (M@L)[n:p-1]
+    padded to length n, and z_k = alpha^(k+1):
+
+        out_r = S_r + conj(S_r) + const_r,   S_r = sum_k (A - i B)[k,r] z_k
+
+    and S_r splits into two real-constant accumulations, S_r = P_r + i Q_r,
+    because multiplying a ciphertext by i is key-free.
+
+    The multiply count is unchanged -- 2d accumulations over p/2 powers is
+    the same d*p ciphertext-constant products as d accumulations over p
+    coordinates. What changes is that Algorithm 1's p/2 conjugations
+    become d, its p-1 adds become 3d, and only the p/2 powers are ever
+    live instead of p/2 powers plus p coordinates.
+
+    **This is not the paper's Algorithm 1.** Their Table 2 books
+    #Conj = p/2, so they do materialise v. This is our refactoring of
+    their scheme, and is labelled as such wherever it is measured.
+
+    Returns (W, const): W is (2d, p/2) with row 2r the weights for P_r
+    and row 2r+1 those for Q_r; const is (d,), the contribution of v's
+    constant last coordinate.
+    """
+    ML = transformed_table(M, p)
+    n, d = p // 2, ML.shape[1]
+    W = np.zeros((2 * d, n))
+    for r in range(d):
+        W[2 * r] = ML[0:n, r]
+        W[2 * r + 1, :n - 1] = -ML[n:p - 1, r]
+    return W, ML[p - 1, :] * math.sqrt(2.0)
+
+
 # --------------------------------------------------------------------
 # Ciphertext side: Algorithm 1
 # --------------------------------------------------------------------
@@ -123,25 +161,32 @@ def make_const(backend, like_ct):
     return ct
 
 
-def vecgen(backend, ct_id, p, counter=None, keep=None, const_ct=None):
-    """Algorithm 1. Returns p ciphertext ids encrypting sqrt(2p)*v_j.
+def power_tree(backend, ct_id, p, counter=None, last_stage=True):
+    """Algorithm 1's lines 3-9 on their own: alpha^1 .. alpha^(p/2).
 
-    `ct_id` encrypts alpha_j in every slot that carries a query. The
-    returned ciphertexts are owned by the caller; intermediates are
-    freed here except those `keep` asks to retain.
+    Split out because both selector variants need exactly this and
+    nothing else in common. Returns (prime, owned, counter): `prime[k]`
+    encrypts alpha^(k+1) -- `prime[0]` is `ct_id` itself, not a copy --
+    and `owned` holds the level-alignment temporaries the caller must
+    free.
+
+    With `last_stage=False` the tree stops one stage early, having built
+    alpha^1 .. alpha^(n/2) -- exactly the powers that are ever used as
+    multiplicands. See `top_powers`.
     """
     c = counter or Counter()
     n = p // 2
+    limit = n if last_stage else n // 2
     owned = []
 
-    # Stage 1 (lines 3-9): powers of alpha by a multiplication tree.
+    # Powers of alpha by a multiplication tree.
     # prime[k] encrypts alpha^(k+1). The tree schedule is the paper's:
     # at stage d the anchor is alpha^i for i = 2^d, multiplied into the
     # t = min(i, n - i) powers already built.
     prime = [None] * n
     prime[0] = ct_id
     d = 0
-    while (1 << d) < n:
+    while (1 << d) < limit:
         i = 1 << d
         t = min(i, n - i)
         for j in range(1, t + 1):
@@ -152,22 +197,77 @@ def vecgen(backend, ct_id, p, counter=None, keep=None, const_ct=None):
             # -- LevelDown is a Mult+Rescale per level in Cheddar.
             la, lb = (backend.GetCiphertextLevel(a),
                       backend.GetCiphertextLevel(b))
+            mine_a = mine_b = False
             if la != lb:
                 target = min(la, lb)
                 if la > target:
-                    a, mine = backend._align_lt_input(a, target)
-                    if mine:
-                        owned.append(a)
+                    a, mine_a = backend._align_lt_input(a, target)
                 else:
-                    b, mine = backend._align_lt_input(b, target)
-                    if mine:
-                        owned.append(b)
+                    b, mine_b = backend._align_lt_input(b, target)
                 c.ptmult += 1
             prod = backend.MulRelinCiphertextNew(a, b)
             c.mult += 1
             prime[i + j - 1] = backend.RescaleNew(prod)
             backend.DeleteCiphertext(prod)
+            # The aligned copy feeds exactly one multiply. Holding it to
+            # the end of the tree, as this did, keeps O(p) of them alive
+            # at once -- for p = 32768 that was tens of GiB of nothing.
+            if mine_a:
+                backend.DeleteCiphertext(a)
+            if mine_b:
+                backend.DeleteCiphertext(b)
         d += 1
+
+    return prime, owned, c
+
+
+def top_powers(backend, prime, n, js, counter=None):
+    """The final tree stage, for the given j: alpha^(n/2 + j).
+
+    Every anchor in the schedule is alpha^(2^d) with 2^d <= n/2, so the
+    powers this stage produces -- alpha^(n/2+1) .. alpha^n, half of all
+    of them -- are the only ones never read again. Producing them a
+    chunk at a time and contracting each chunk into the running PCMM
+    sums halves the peak live set, which is what bounds the reachable p.
+
+    Returns (products, temporaries); both are the caller's to free.
+    """
+    c = counter or Counter()
+    i = n // 2
+    out, owned = [], []
+    for j in js:
+        a, b = prime[i - 1], prime[j - 1]
+        la, lb = (backend.GetCiphertextLevel(a),
+                  backend.GetCiphertextLevel(b))
+        mine_a = mine_b = False
+        if la != lb:
+            target = min(la, lb)
+            if la > target:
+                a, mine_a = backend._align_lt_input(a, target)
+            else:
+                b, mine_b = backend._align_lt_input(b, target)
+            c.ptmult += 1
+        prod = backend.MulRelinCiphertextNew(a, b)
+        c.mult += 1
+        out.append(backend.RescaleNew(prod))
+        backend.DeleteCiphertext(prod)
+        if mine_a:
+            backend.DeleteCiphertext(a)
+        if mine_b:
+            backend.DeleteCiphertext(b)
+    return out, owned
+
+
+def vecgen(backend, ct_id, p, counter=None, keep=None, const_ct=None):
+    """Algorithm 1. Returns p ciphertext ids encrypting sqrt(2p)*v_j.
+
+    `ct_id` encrypts alpha_j in every slot that carries a query. The
+    returned ciphertexts are owned by the caller; intermediates are
+    freed here except those `keep` asks to retain.
+    """
+    c = counter or Counter()
+    n = p // 2
+    prime, owned, c = power_tree(backend, ct_id, p, c)
 
     # Stage 2 (lines 10-18): split each power into 2*Re and 2*Im by
     # conjugation. z + conj(z) = 2Re(z); (z - conj(z))/sqrt(-1) = 2Im(z),

@@ -56,6 +56,14 @@ def parse_args():
                          "IVE path does not use; kept small so the compile "
                          "is quick. The IVE forward does not depend on it.")
     ap.add_argument("--trials", type=int, default=3)
+    ap.add_argument("--pcmm", choices=("matmul", "accum"), default="matmul",
+                    help="matmul: the whole d x p table in one pass over the "
+                         "coordinate ciphertexts, so each is read once "
+                         "(Bae et al. CRYPTO'24). accum: one output row per "
+                         "call, the previous behaviour.")
+    ap.add_argument("--check", action="store_true",
+                    help="decrypt both PCMM paths on the first trial and "
+                         "report their difference.")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
 
@@ -151,8 +159,18 @@ def main():
         mask[embedding_features * (f + 1)] = 1.0
     mask_pt = B.Encode(mask.tolist(), pcmm_level - 1, scale)
     zero_pt = B.Encode([0.0] * width, pcmm_level - 2, scale)
-    print(f"[ive] PCMM at level {pcmm_level}; {d*p} table plaintexts offline",
-          flush=True)
+    # Bae et al.'s reduction in GPU form: the table is pinned once,
+    # offline, and the online PC-MM streams the p coordinate ciphertexts
+    # once for all d rows instead of once per row. Here the entries are
+    # slot-varying (26 fields share a ciphertext, each with its own
+    # table), so they stay full plaintexts -- only the ciphertext
+    # re-reads are removed, not the table reads.
+    pt_table = None
+    if args.pcmm == "matmul":
+        pt_table = B.PackPlaintextTableNew(
+            [pts[r][k] for r in range(d) for k in range(p)], d)
+    print(f"[ive] PCMM at level {pcmm_level}; {d*p} table plaintexts offline"
+          f"; one-pass={pt_table is not None}", flush=True)
 
     times = {"bottom": [], "boot": [], "vecgen": [], "pcmm": [], "sum": [],
              "repack": [], "mlp": [], "total": []}
@@ -179,8 +197,29 @@ def main():
         cts, _ = vecgen(B, src, p, Counter(), const_ct=const_ct)
         torch.cuda.synchronize(); t2 = time.time()
         aligned = [B._align_lt_input(c, pcmm_level)[0] for c in cts]
-        outs = [B.RescaleNew(B.MulPlaintextAccumNew(aligned, pts[r]))
-                for r in range(d)]
+        if t == 0 and args.check and pt_table is not None:
+            ref = [B.RescaleNew(B.MulPlaintextAccumNew(aligned, pts[r]))
+                   for r in range(d)]
+            new = [B.RescaleNew(o)
+                   for o in B.MulPlaintextMatMulNew(aligned, pt_table)]
+            dr = np.array([B.Decode(B.Decrypt(o)) for o in ref])
+            dn = np.array([B.Decode(B.Decrypt(o)) for o in new])
+            print(f"[check] accum vs matmul max abs diff "
+                  f"{np.abs(dr - dn).max():.3e} (magnitude "
+                  f"{np.abs(dr).max():.3e})", flush=True)
+            for o in ref + new:
+                B.DeleteCiphertext(o)
+        if pt_table is not None:
+            outs = []
+            for o in B.MulPlaintextMatMulNew(aligned, pt_table):
+                outs.append(B.RescaleNew(o))
+                B.DeleteCiphertext(o)
+        else:
+            outs = []
+            for r in range(d):
+                acc = B.MulPlaintextAccumNew(aligned, pts[r])
+                outs.append(B.RescaleNew(acc))
+                B.DeleteCiphertext(acc)
         torch.cuda.synchronize(); t3 = time.time()
         # collapse the ell sub-tables of each field into slot 16+16f
         summed = []
@@ -270,6 +309,7 @@ def main():
         import json
         json.dump({k: a(k) for k in times} | {"p": p, "ell": ell,
                   "query_bytes": query_bytes, "boot_protocol": args.boot,
+                  "pcmm_kind": args.pcmm,
                   "q_level": q_level, "ref_forward_s": ref_fwd,
                   "threshold": args.compress_threshold},
                   open(args.out, "w"), indent=1)
