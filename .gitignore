@@ -216,6 +216,9 @@ matmul-encoding-material/
 examples/criteo/processed/
 examples/criteo/raw/
 examples/criteo/model/
+# Trained checkpoints and metric logs from the threshold/base sweeps.
+# Kept on disk (they are re-usable) but ~1.1 GiB, so never committed.
+examples/criteo/model_*/
 examples/criteo/fhe/
 
 # Scratch space for notes/artifacts not ready for the repo yet
