@@ -39,7 +39,8 @@ import orion
 from orion.backend.python.tensors import CipherTensor
 from bench_sweep import build_config, SPARSE_SIZES, _impose_block_diagonal
 from dlrm import HELRM, embedding_features, sparse_fields
-from ive_selector import Counter, alpha, make_const, transformed_table, vecgen
+from ive_selector import (Counter, alpha, folded_table, make_const,
+                          power_tree, transformed_table, vecgen)
 
 SEED_BYTES = 16
 
@@ -61,6 +62,16 @@ def parse_args():
                          "coordinate ciphertexts, so each is read once "
                          "(Bae et al. CRYPTO'24). accum: one output row per "
                          "call, the previous behaviour.")
+    ap.add_argument("--vecgen", choices=("paper", "fold"), default="paper",
+                    help="paper: Algorithm 1 as published. fold: contract "
+                         "the table onto the p/2 powers so v is never "
+                         "materialised (see folded_table).")
+    ap.add_argument("--boot-after", type=int, default=None,
+                    help="refresh every live power after this many tree "
+                         "stages, so the tree can run deeper than the "
+                         "chain. Only 2^k powers exist after k stages, so "
+                         "an early k is cheap. Required once "
+                         "log2(p/2) + 2 + out_level exceeds the chain top.")
     ap.add_argument("--check", action="store_true",
                     help="decrypt both PCMM paths on the first trial and "
                          "report their difference.")
@@ -111,7 +122,20 @@ def main():
     # the top MLP. Integrating IVE is what exposes the last term -- a
     # selector benchmarked on its own never has to pay it.
     need = depth + 2 + out_level
-    q_level = 0 if args.boot else need
+    top = scheme.params.get_max_level()
+    if args.boot:
+        q_level = 0
+    elif args.boot_after is not None:
+        # The tree is refreshed partway, so the query only has to carry
+        # the stages before that point.
+        q_level = min(need, top)
+    else:
+        q_level = need
+    if q_level > top:
+        raise SystemExit(
+            f"query needs level {need} (log2(p/2)={depth} + 2 + "
+            f"out_level={out_level}) but the chain tops out at {top}. "
+            f"Use --boot-after K.")
     vals = np.zeros(width, dtype=np.complex128)
     rng = np.random.RandomState(0)
     idx = rng.randint(0, p, size=(sparse_fields, ell))
@@ -139,21 +163,75 @@ def main():
                 v[embedding_features * (f + 1) + s] = MLs[f][k, r]
         return B.Encode(v.tolist(), level, scale)
 
-    if args.boot:
-        boot_slots = B.GetCiphertextSlots(ct_q)
+    # The fold's table: 2d rows of weights on the p/2 powers, per field,
+    # plus one extra column carrying v's constant last coordinate. That
+    # column multiplies Enc(1), so it needs no separate plaintext add and
+    # the scale bookkeeping stays inside the PC-MM.
+    n_pow = p // 2
+    if args.vecgen == "fold":
+        folded = [folded_table(Mf, p) for Mf in tables]
+
+        def fold_pt(k, r2, level):
+            v = np.zeros(width)
+            for f in range(sparse_fields):
+                for s in range(ell):
+                    v[embedding_features * (f + 1) + s] = folded[f][0][r2, k]
+            return B.Encode(v.tolist(), level, scale)
+
+        def const_col_pt(r2, level):
+            # out_r = 2*Re(S_r), so a constant c_r enters as c_r/2 on the
+            # P row and 0 on the Q row.
+            v = np.zeros(width)
+            if r2 % 2 == 0:
+                for f in range(sparse_fields):
+                    for s in range(ell):
+                        v[embedding_features * (f + 1) + s] = \
+                            folded[f][1][r2 // 2] / 2.0
+            return B.Encode(v.tolist(), level, scale)
+
+    boot_slots = B.GetCiphertextSlots(ct_q)
+    if args.boot or args.boot_after is not None:
         B.NewBootstrapper(0, boot_slots)
+    if args.boot:
         probe_src = B.Bootstrap(ct_q, boot_slots)
     else:
         probe_src = ct_q
-    probe, _ = vecgen(B, probe_src, p, Counter())
+    tree_kw = dict(boot_after=args.boot_after, boot_slots=boot_slots)
+    if args.vecgen == "fold":
+        probe, probe_owned, _ = power_tree(B, probe_src, p, Counter(),
+                                           **tree_kw)
+    else:
+        probe, probe_owned = vecgen(B, probe_src, p, Counter())[0], []
     pcmm_level = min(B.GetCiphertextLevel(c) for c in probe)
-    const_ct = make_const(B, probe[0])
-    for c in probe:
-        if c is not const_ct:
+    if args.vecgen == "fold":
+        # Enc(1) for the constant column, at the level and scale the
+        # aligned powers arrive with.
+        at_level = [c for c in probe
+                    if B.GetCiphertextLevel(c) == pcmm_level][0]
+        pt_one = B.Encode([1.0] * width, pcmm_level,
+                          B.GetCiphertextScale(at_level))
+        const_ct = B.Encrypt(pt_one)
+        B.DeletePlaintext(pt_one)
+        for c in probe:
+            if c is not probe_src:
+                B.DeleteCiphertext(c)
+        for c in probe_owned:
             B.DeleteCiphertext(c)
+    else:
+        const_ct = make_const(B, probe[0])
+        for c in probe:
+            if c is not const_ct:
+                B.DeleteCiphertext(c)
     if args.boot:
         B.DeleteCiphertext(probe_src)
-    pts = [[table_pt(k, r, pcmm_level) for k in range(p)] for r in range(d)]
+    if args.vecgen == "fold":
+        rows, cols = 2 * d, n_pow + 1
+        pts = [[fold_pt(k, r2, pcmm_level) for k in range(n_pow)]
+               + [const_col_pt(r2, pcmm_level)] for r2 in range(rows)]
+    else:
+        rows, cols = d, p
+        pts = [[table_pt(k, r, pcmm_level) for k in range(p)]
+               for r in range(d)]
     mask = np.zeros(width)
     for f in range(sparse_fields):
         mask[embedding_features * (f + 1)] = 1.0
@@ -168,7 +246,7 @@ def main():
     pt_table = None
     if args.pcmm == "matmul":
         pt_table = B.PackPlaintextTableNew(
-            [pts[r][k] for r in range(d) for k in range(p)], d)
+            [pts[r][k] for r in range(rows) for k in range(cols)], rows)
     print(f"[ive] PCMM at level {pcmm_level}; {d*p} table plaintexts offline"
           f"; one-pass={pt_table is not None}", flush=True)
 
@@ -194,10 +272,17 @@ def main():
         torch.cuda.synchronize(); t0 = time.time()
         src = B.Bootstrap(ct_q, boot_slots) if args.boot else ct_q
         torch.cuda.synchronize(); t1 = time.time()
-        cts, _ = vecgen(B, src, p, Counter(), const_ct=const_ct)
+        if args.vecgen == "fold":
+            cts, tree_owned, _ = power_tree(B, src, p, Counter(), **tree_kw)
+        else:
+            cts, _ = vecgen(B, src, p, Counter(), const_ct=const_ct)
+            tree_owned = []
         torch.cuda.synchronize(); t2 = time.time()
         aligned = [B._align_lt_input(c, pcmm_level)[0] for c in cts]
-        if t == 0 and args.check and pt_table is not None:
+        if args.vecgen == "fold":
+            aligned.append(const_ct)      # the constant column
+        if t == 0 and args.check and pt_table is not None \
+                and args.vecgen == "paper":
             ref = [B.RescaleNew(B.MulPlaintextAccumNew(aligned, pts[r]))
                    for r in range(d)]
             new = [B.RescaleNew(o)
@@ -220,6 +305,19 @@ def main():
                 acc = B.MulPlaintextAccumNew(aligned, pts[r])
                 outs.append(B.RescaleNew(acc))
                 B.DeleteCiphertext(acc)
+        if args.vecgen == "fold":
+            # 2d accumulators -> d answers: one key-free multiply by i,
+            # one add, one conjugation, one add. d conjugations against
+            # Algorithm 1's p/2.
+            pq, outs = outs, []
+            for r in range(d):
+                P, Q = pq[2 * r], pq[2 * r + 1]
+                iq = B.MulImaginaryUnitNew(Q)
+                sr = B.AddCiphertextNew(P, iq)
+                cj = B.ConjugateNew(sr)
+                outs.append(B.AddCiphertextNew(sr, cj))
+                for x in (iq, sr, cj, P, Q):
+                    B.DeleteCiphertext(x)
         torch.cuda.synchronize(); t3 = time.time()
         # collapse the ell sub-tables of each field into slot 16+16f
         summed = []
@@ -284,8 +382,10 @@ def main():
             times["repack"].append(t5 - t4); times["mlp"].append(t6 - t5)
             times["bottom"].append(t0 - tm); times["total"].append(t6 - tm)
         for c in cts:
-            if c is not const_ct:
+            if c is not const_ct and c is not src and c is not ct_q:
                 B.DeleteCiphertext(c)
+        for c in tree_owned:
+            B.DeleteCiphertext(c)
         for a, c in zip(aligned, cts):
             if a is not c:
                 B.DeleteCiphertext(a)

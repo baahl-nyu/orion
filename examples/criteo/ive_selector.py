@@ -140,10 +140,11 @@ class Counter:
 
     def __init__(self):
         self.add = self.ptmult = self.mult = self.conj = self.pcmm = 0
+        self.boot = 0
 
     def as_dict(self):
         return dict(add=self.add, ptmult=self.ptmult, mult=self.mult,
-                    conj=self.conj, pcmm=self.pcmm)
+                    conj=self.conj, pcmm=self.pcmm, boot=self.boot)
 
     def expected(self, p):
         return dict(add=p - 1, ptmult=p // 2 - 1, mult=p // 2 - 1,
@@ -161,7 +162,8 @@ def make_const(backend, like_ct):
     return ct
 
 
-def power_tree(backend, ct_id, p, counter=None, last_stage=True):
+def power_tree(backend, ct_id, p, counter=None, last_stage=True,
+               boot_after=None, boot_slots=None):
     """Algorithm 1's lines 3-9 on their own: alpha^1 .. alpha^(p/2).
 
     Split out because both selector variants need exactly this and
@@ -173,6 +175,13 @@ def power_tree(backend, ct_id, p, counter=None, last_stage=True):
     With `last_stage=False` the tree stops one stage early, having built
     alpha^1 .. alpha^(n/2) -- exactly the powers that are ever used as
     multiplicands. See `top_powers`.
+
+    `boot_after=k` refreshes every live power once k stages are done,
+    which is what lets the tree run deeper than the chain allows. The
+    cost is set by *when*: after k stages only 2^k powers exist, so
+    booting early is cheap. A bootstrap lands at level 13 here, so a
+    D-stage tree needing m levels left over fits whenever
+    13 - (D - k) >= m. The tree is otherwise untouched.
     """
     c = counter or Counter()
     n = p // 2
@@ -217,6 +226,16 @@ def power_tree(backend, ct_id, p, counter=None, last_stage=True):
             if mine_b:
                 backend.DeleteCiphertext(b)
         d += 1
+        if boot_after is not None and d == boot_after:
+            live = min(1 << d, n)
+            for k in range(live):
+                if prime[k] is None:
+                    continue
+                fresh = backend.Bootstrap(prime[k], boot_slots)
+                if prime[k] is not ct_id:
+                    backend.DeleteCiphertext(prime[k])
+                prime[k] = fresh
+                c.boot += 1
 
     return prime, owned, c
 
