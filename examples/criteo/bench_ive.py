@@ -119,7 +119,7 @@ def main():
     query_bytes = backend.GetCiphertextBxBytes(ct_q) + SEED_BYTES
     backend.DeletePlaintext(pt_q)
     print(f"[ive] query: 1 ciphertext, {query_bytes/2**20:.4f} MiB "
-          f"(b + 128-bit seed, ring N; halve for their ring-N/2 transmission)",
+          f"(b + 128-bit seed, ring N)",
           flush=True)
 
     # ---- server: the plaintext table, transformed offline ----------

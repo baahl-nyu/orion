@@ -149,7 +149,7 @@ def main():
     ct_q = B.EncryptSeeded(pt_q, 0x5EED)
     query_bytes = B.GetCiphertextBxBytes(ct_q) + SEED_BYTES
     print(f"[ive] query: 1 ct at level {q_level}, "
-          f"{query_bytes/2**20:.4f} MiB (ring N; halve for ring N/2)",
+          f"{query_bytes/2**20:.4f} MiB (ring N)",
           flush=True)
 
     # ---- server: tables, transformed offline -----------------------
