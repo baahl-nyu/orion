@@ -88,6 +88,13 @@ def parse_args():
     # match the chain's usable levels (see _word32_num_logq); LogP count
     # is ignored in word32 mode.
     parser.add_argument("--word32", action="store_true")
+    # Independent inferences packed into the same ciphertexts. Orion lays
+    # a batch out along the slot axis, so everything slot-parallel (the
+    # MLPs and their bootstraps) amortizes; the one-hot selector does not,
+    # since batch B needs B times the slots. batch=1 is the protocol every
+    # recorded table was measured under and leaves this script's
+    # behaviour unchanged.
+    parser.add_argument("--batch", type=int, default=1)
     # Seeded ("compressed") upload: transmit only the b polynomial plus
     # the 8-byte seed its a was drawn from, and regenerate a server-side.
     # Halves the bytes of every uploaded ciphertext.
@@ -196,7 +203,7 @@ def _upload_bytes(backend, ct_ids, log_n, seeded=False):
     return int(total)
 
 
-def build_config(word32=False):
+def build_config(word32=False, batch=1):
     if word32:
         _nq, _np = _word32_logq_logp_counts()
         ckks = {
@@ -223,7 +230,7 @@ def build_config(word32=False):
             "num_stc_levels": 3,
         },
         "orion": {
-            "batch_size": 1,
+            "batch_size": batch,
             "margin": 2,
             "embedding_method": "hybrid",
             "backend": "cheddar",
@@ -273,11 +280,19 @@ def main():
     _impose_block_diagonal(model, args.compress_threshold, args.base)
     model.eval()
 
-    dense = torch.rand(13)
-    sparse_ids = torch.tensor(
-        [torch.randint(0, size, (1,)).item() for size in SPARSE_SIZES]
-    )
-    dense_in, expanded_sparse = model.fhe_input(dense, sparse_ids)
+    # One independent (dense, sparse) row per batch element; the batch is
+    # their concatenation, which is what Orion's batch_size lays out along
+    # the slot axis. At --batch 1 this is the original single draw.
+    _rows = [
+        model.fhe_input(
+            torch.rand(13),
+            torch.tensor([torch.randint(0, size, (1,)).item()
+                          for size in SPARSE_SIZES]),
+        )
+        for _ in range(args.batch)
+    ]
+    dense_in = torch.cat([r[0] for r in _rows], dim=0)
+    expanded_sparse = torch.cat([r[1] for r in _rows], dim=0)
 
     with torch.no_grad():
         clear_logit = model(dense_in, expanded_sparse)
@@ -287,7 +302,7 @@ def main():
         raise SystemExit(
             "--word32 requires ORION_CHEDDAR_WORD32=1 in the environment "
             "(bindings.py selects the native module at import time).")
-    orion.init_scheme(build_config(word32=args.word32))
+    orion.init_scheme(build_config(word32=args.word32, batch=args.batch))
     orion.fit(model, [dense_in, expanded_sparse])
     input_level = orion.compile(model)
 
@@ -463,7 +478,7 @@ def main():
     result = {
         "compress_threshold": args.compress_threshold,
         "base": args.base,
-        "batch_size": 1,
+        "batch_size": args.batch,
         "clear": clear_logit.reshape(-1).tolist(),
         "fhe": fhe_logit.reshape(-1).tolist(),
         "mae": mae,
@@ -481,7 +496,8 @@ def main():
     }
 
     makedirs(args.out_dir, exist_ok=True)
-    out_path = join(args.out_dir, f"threshold_{args.compress_threshold}.json")
+    _bt = "" if args.batch == 1 else f"_b{args.batch}"
+    out_path = join(args.out_dir, f"threshold_{args.compress_threshold}{_bt}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(result, indent=2) + "\n")
 

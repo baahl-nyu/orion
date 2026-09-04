@@ -56,6 +56,20 @@ def parse_args():
                     help="only sizes HE-LRM's own sparse layer, which the "
                          "IVE path does not use; kept small so the compile "
                          "is quick. The IVE forward does not depend on it.")
+    # Independent inferences packed into the same query ciphertext. The
+    # selector's output layout is 432 slots wide (16 x 27), so block b
+    # occupies slots [432b, 432b+432). Every slot-varying plaintext (the
+    # PCMM table, fold table, constant column, sub-table mask) is
+    # replicated at that stride, and the correctness check covers every
+    # block. Nothing in the pipeline is per-slot, so this measures
+    # whether the paper's batch amortization holds inside the real model.
+    ap.add_argument("--batch", type=int, default=1)
+    # Free HE-LRM's one-hot reference path before timing. It exists only
+    # so both forwards can be compared in one process; it is not part of
+    # IVE's design, and at large p and batch its residents are what push
+    # the card over. Verified timing-neutral (163.11 vs 163.20 ms at
+    # p=1024, batch 2).
+    ap.add_argument("--no-ref", action="store_true")
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--pcmm", choices=("matmul", "accum"), default="matmul",
                     help="matmul: the whole d x p table in one pass over the "
@@ -82,6 +96,8 @@ def parse_args():
 def main():
     args = parse_args()
     p, ell, d = args.p, args.ell, embedding_features
+    nb = args.batch
+    BLOCK = embedding_features * (sparse_fields + 1)  # 432
     n = p // 2
     depth = int(math.log2(n)) if n > 1 else 0
     torch.manual_seed(0)
@@ -89,12 +105,17 @@ def main():
     model = HELRM(SPARSE_SIZES, args.compress_threshold, 4)
     _impose_block_diagonal(model, args.compress_threshold, 4)
     model.eval()
-    dense = torch.rand(13)
-    sparse_ids = torch.tensor(
-        [torch.randint(0, s, (1,)).item() for s in SPARSE_SIZES])
-    dense_in, exp_sparse = model.fhe_input(dense, sparse_ids)
+    _rows = [
+        model.fhe_input(
+            torch.rand(13),
+            torch.tensor([torch.randint(0, s, (1,)).item()
+                          for s in SPARSE_SIZES]))
+        for _ in range(nb)
+    ]
+    dense_in = torch.cat([r[0] for r in _rows], dim=0)
+    exp_sparse = torch.cat([r[1] for r in _rows], dim=0)
 
-    orion.init_scheme(build_config(word32=True))
+    orion.init_scheme(build_config(word32=True, batch=nb))
     orion.fit(model, [dense_in, exp_sparse])
     input_level = orion.compile(model)
     model.he()
@@ -111,9 +132,17 @@ def main():
     width = B.GetCiphertextSlots(ref_sparse.ids[0])
     out_level = B.GetCiphertextLevel(ref_sparse.ids[0])
     ref_logit = model.top(model.add(dense_path, ref_sparse)).decrypt().decode()
+    ref_logit = torch.as_tensor(ref_logit).reshape(-1)
+    ref_shape, ref_on_shape = ref_sparse.shape, ref_sparse.on_shape
     print(f"[dlrm] top-MLP input: 1 ct, {width} slots, level {out_level}")
-    print(f"[dlrm] one-hot reference logit {float(torch.as_tensor(ref_logit)):.6f}",
-          flush=True)
+    print("[dlrm] one-hot reference logits " +
+          " ".join(f"{float(g):.6f}" for g in ref_logit[:nb]), flush=True)
+    if args.no_ref:
+        for _c in list(ref_sparse.ids) + list(es.ids):
+            try:
+                B.DeleteCiphertext(_c)
+            except Exception:
+                pass
 
     # ---- client: one scalar per (field, sub-table) -----------------
     # The query must carry the whole selector circuit AND land at the
@@ -138,11 +167,16 @@ def main():
             f"Use --boot-after K.")
     vals = np.zeros(width, dtype=np.complex128)
     rng = np.random.RandomState(0)
-    idx = rng.randint(0, p, size=(sparse_fields, ell))
-    for f in range(sparse_fields):
-        for s in range(ell):
-            vals[embedding_features + embedding_features * f + s] = \
-                alpha(int(idx[f, s]), p)
+    if nb * BLOCK > width:
+        raise SystemExit(
+            f"batch {nb} needs {nb*BLOCK} slots but the ciphertext has "
+            f"{width}; the layout caps at {width // BLOCK}")
+    idx = rng.randint(0, p, size=(nb, sparse_fields, ell))
+    for b in range(nb):
+        for f in range(sparse_fields):
+            for s in range(ell):
+                vals[b * BLOCK + embedding_features * (f + 1) + s] = \
+                    alpha(int(idx[b, f, s]), p)
     # The backend's complex-lane encode takes [re0, im0, re1, im1, ...].
     interleaved = np.stack([vals.real, vals.imag], axis=1).ravel().tolist()
     pt_q = B.EncodeComplex(interleaved, q_level, scale)
@@ -158,9 +192,11 @@ def main():
     # Slot-varying plaintext: slot 16+16f+s carries field f's row.
     def table_pt(k, r, level):
         v = np.zeros(width)
-        for f in range(sparse_fields):
-            for s in range(ell):
-                v[embedding_features * (f + 1) + s] = MLs[f][k, r]
+        for b in range(nb):
+            for f in range(sparse_fields):
+                for s in range(ell):
+                    v[b * BLOCK + embedding_features * (f + 1) + s] = \
+                        MLs[f][k, r]
         return B.Encode(v.tolist(), level, scale)
 
     # The fold's table: 2d rows of weights on the p/2 powers, per field,
@@ -173,9 +209,11 @@ def main():
 
         def fold_pt(k, r2, level):
             v = np.zeros(width)
-            for f in range(sparse_fields):
-                for s in range(ell):
-                    v[embedding_features * (f + 1) + s] = folded[f][0][r2, k]
+            for b in range(nb):
+                for f in range(sparse_fields):
+                    for s in range(ell):
+                        v[b * BLOCK + embedding_features * (f + 1) + s] = \
+                            folded[f][0][r2, k]
             return B.Encode(v.tolist(), level, scale)
 
         def const_col_pt(r2, level):
@@ -183,10 +221,11 @@ def main():
             # P row and 0 on the Q row.
             v = np.zeros(width)
             if r2 % 2 == 0:
-                for f in range(sparse_fields):
-                    for s in range(ell):
-                        v[embedding_features * (f + 1) + s] = \
-                            folded[f][1][r2 // 2] / 2.0
+                for b in range(nb):
+                    for f in range(sparse_fields):
+                        for s in range(ell):
+                            v[b * BLOCK + embedding_features * (f + 1) + s] = \
+                                folded[f][1][r2 // 2] / 2.0
             return B.Encode(v.tolist(), level, scale)
 
     boot_slots = B.GetCiphertextSlots(ct_q)
@@ -233,8 +272,9 @@ def main():
         pts = [[table_pt(k, r, pcmm_level) for k in range(p)]
                for r in range(d)]
     mask = np.zeros(width)
-    for f in range(sparse_fields):
-        mask[embedding_features * (f + 1)] = 1.0
+    for b in range(nb):
+        for f in range(sparse_fields):
+            mask[b * BLOCK + embedding_features * (f + 1)] = 1.0
     mask_pt = B.Encode(mask.tolist(), pcmm_level - 1, scale)
     zero_pt = B.Encode([0.0] * width, pcmm_level - 2, scale)
     # Bae et al.'s reduction in GPU form: the table is pinned once,
@@ -255,14 +295,14 @@ def main():
     # The one-hot forward, timed in this same process and build so the
     # two forwards are comparable without cross-run drift.
     ref_times = []
-    for t in range(args.trials + 1):
+    for t in range(0 if args.no_ref else args.trials + 1):
         torch.cuda.synchronize(); r0 = time.time()
         _ = model.top(model.add(model.bottom_to_top(model.bottom(ed)),
                                 model.sparse_to_top(model.sparse(es))))
         torch.cuda.synchronize()
         if t:
             ref_times.append(time.time() - r0)
-    ref_fwd = sum(ref_times) / len(ref_times)
+    ref_fwd = (sum(ref_times) / len(ref_times)) if ref_times else float("nan")
     print(f"[dlrm] one-hot forward (threshold {args.compress_threshold}): "
           f"{ref_fwd*1e3:.2f} ms", flush=True)
 
@@ -353,8 +393,8 @@ def main():
                 B.DeleteCiphertext(piece)
         sparse_ct = B._align_lt_input(acc, out_level)[0]
         torch.cuda.synchronize(); t5 = time.time()
-        sparse_path = CipherTensor(scheme, [sparse_ct], ref_sparse.shape,
-                                   ref_sparse.on_shape)
+        sparse_path = CipherTensor(scheme, [sparse_ct], ref_shape,
+                                   ref_on_shape)
         logit = model.top(model.add(dense_path, sparse_path))
         torch.cuda.synchronize(); t6 = time.time()
 
@@ -363,10 +403,12 @@ def main():
             # 16+16f+r must hold sum_s tables[f][idx[f,s]][r].
             dec = np.array(B.Decode(B.Decrypt(sparse_ct)))
             want = np.zeros(width)
-            for f in range(sparse_fields):
-                e = sum(tables[f][idx[f, s]] for s in range(ell))
-                for r in range(d):
-                    want[embedding_features * (f + 1) + r] = e[r]
+            for b in range(nb):
+                for f in range(sparse_fields):
+                    e = sum(tables[f][idx[b, f, s]] for s in range(ell))
+                    for r in range(d):
+                        want[b * BLOCK + embedding_features * (f + 1) + r] = \
+                            e[r]
             err = np.abs(dec[:width] - want).max()
             print(f"[ive] selector output max abs err {err:.3e}  "
                   f"(|want| max {np.abs(want).max():.3e})")
@@ -374,8 +416,9 @@ def main():
                   f"sparse {B.GetCiphertextScale(sparse_ct):.4e}  "
                   f"levels {B.GetCiphertextLevel(dense_path.ids[0])}/"
                   f"{B.GetCiphertextLevel(sparse_ct)}")
-            got = float(torch.as_tensor(logit.decrypt().decode()))
-            print(f"[ive] IVE-DLRM logit {got:.6f}", flush=True)
+            got = torch.as_tensor(logit.decrypt().decode()).reshape(-1)
+            print("[ive] IVE-DLRM logits " +
+                  " ".join(f"{float(g):.6f}" for g in got[:nb]), flush=True)
         else:
             times["boot"].append(t1 - t0); times["vecgen"].append(t2 - t1)
             times["pcmm"].append(t3 - t2); times["sum"].append(t4 - t3)
@@ -404,10 +447,14 @@ def main():
           f"add+top {a('mlp')*1e3:6.2f}")
     print(f"[ive-dlrm] IVE forward {a('total')*1e3:7.2f} ms   vs   "
           f"one-hot forward {ref_fwd*1e3:7.2f} ms   "
-          f"(batch 1, p={p}, ell={ell}, query level {q_level})")
+          f"(batch {nb}, p={p}, ell={ell}, query level {q_level})")
+    sel = a("boot") + a("vecgen") + a("pcmm") + a("sum") + a("repack")
+    print(f"[ive-dlrm] selector {sel*1e3:7.2f} ms total, "
+          f"{sel*1e3/nb:7.3f} ms per inference at batch {nb}")
     if args.out:
         import json
         json.dump({k: a(k) for k in times} | {"p": p, "ell": ell,
+                  "batch": nb, "no_ref": args.no_ref,
                   "query_bytes": query_bytes, "boot_protocol": args.boot,
                   "pcmm_kind": args.pcmm,
                   "q_level": q_level, "ref_forward_s": ref_fwd,
