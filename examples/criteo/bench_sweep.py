@@ -112,6 +112,11 @@ def parse_args():
     # any limb above that is uploaded only to be dropped.
     parser.add_argument("--upload-level", type=int, default=None,
                         metavar="LEVEL")
+    # Per-stage wall time of each forward (bottom MLP, embedding lookup,
+    # repacks, top MLP), synchronized at stage boundaries; the JSON gains
+    # stage_seconds (mean over the timed trials). Off by default: the
+    # syncs are not part of the plain end-to-end protocol.
+    parser.add_argument("--stage-times", action="store_true")
     return parser.parse_args()
 
 
@@ -180,6 +185,39 @@ def _impose_block_diagonal(model, compress_threshold, base):
         f"block-diagonal fill covered {row}x{col}, expected "
         f"{tuple(weight.shape)}")
 
+
+
+HELRM_STAGES = {
+    "bottom_mlp": ("bottom", "bottom_to_top"),
+    "lookup": ("sparse",),
+    "sparse_to_top": ("sparse_to_top",),
+    "add": ("add",),
+    "top_mlp": ("top",),
+}
+
+
+def time_stages(model, sync=lambda: None):
+    """Register forward hooks on the HELRM stage modules so every forward
+    accumulates wall time per stage into model.stage_seconds; `sync` runs
+    before each timestamp (torch.cuda.synchronize on the GPU). Reset
+    model.stage_seconds = {} before each forward you want measured.
+    Backend-agnostic; hooks rather than a forward wrapper because replacing
+    module.forward was measured to add a one-off 0.5 s stall to the first
+    timed forward (t=500, word32) that plain runs do not have."""
+    model.stage_seconds = {}
+    for stage, attrs in HELRM_STAGES.items():
+        for attr in attrs:
+            module = getattr(model, attr)
+
+            def pre(mod, inp):
+                sync(); mod._stage_t0 = time.time()
+
+            def post(mod, inp, out, _stage=stage):
+                sync()
+                model.stage_seconds[_stage] = (
+                    model.stage_seconds.get(_stage, 0.0) + time.time() - mod._stage_t0)
+            module.register_forward_pre_hook(pre)
+            module.register_forward_hook(post)
 
 
 def _upload_bytes(backend, ct_ids, log_n, seeded=False):
@@ -388,6 +426,9 @@ def main():
           flush=True)
 
     model.he()
+    if args.stage_times:
+        time_stages(model, torch.cuda.synchronize)
+    stage_trials = []
     # 1 warmup + 3 timed trials in the SAME process. The warmup forward
     # absorbs first-touch costs -- UVM paging the key/plaintext working
     # set onto the card, lazy per-width bootstrap-circuit prep -- which
@@ -435,6 +476,7 @@ def main():
             _received = uploaded_sparse
         sparse_in = _received
         torch.cuda.nvtx.range_push("model_forward")
+        model.stage_seconds = {}
         out = model(encrypted_dense, sparse_in)
         torch.cuda.nvtx.range_pop()
         t1 = time.time()
@@ -443,8 +485,13 @@ def main():
             for _cid in _received.ids:
                 _scheme.backend.DeleteCiphertext(_cid)
         print(f"[timing] {label}: {t1 - t0:.3f}s", flush=True)
+        if args.stage_times:
+            print("[stages] " + " ".join(
+                f"{k}={v:.3f}s" for k, v in model.stage_seconds.items()), flush=True)
         if i > 0:
             trial_times.append(t1 - t0)
+            if args.stage_times:
+                stage_trials.append(dict(model.stage_seconds))
     runtime = sum(trial_times) / len(trial_times)
     fhe_logit = out.decrypt().decode()
     fhe_logit = torch.as_tensor(fhe_logit).detach().cpu()
@@ -494,6 +541,11 @@ def main():
         "key_memory_mb": key_memory_mb,
         "env_knobs": env_knobs,
     }
+    if args.stage_times:
+        result["stage_seconds"] = {
+            k: sum(d[k] for d in stage_trials) / len(stage_trials)
+            for k in stage_trials[0]}
+        result["stage_seconds_trials"] = stage_trials
 
     makedirs(args.out_dir, exist_ok=True)
     _bt = "" if args.batch == 1 else f"_b{args.batch}"
