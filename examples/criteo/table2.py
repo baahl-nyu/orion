@@ -17,7 +17,10 @@ GPU: bench_sweep.py, word32 chain, seeded upload at the level the sparse
 CPU: this file's --cpu-cell mode, Lattigo, 64-bit chain from params.yaml
      (Lattigo takes LogQ/LogP bit lists only; the word32 chain is
      Cheddar-only), single thread like the paper's CPU column. Peak =
-     process max RSS from /usr/bin/time -v over setup + 1 forward.
+     peak live Go heap (working set) over setup + 1 forward, sampled
+     after forced collections (memstats.go); process max RSS is a
+     property of the collector, not the computation, and is kept in
+     the JSON only.
 """
 import argparse
 import json
@@ -76,10 +79,23 @@ def cpu_cell(threshold, out, trials=0):
         clear = model(dense_in, expanded_sparse)
 
     orion.init_scheme(cfg)
+    from orion.core.orion import scheme
+    live = {}
+    if not trials:
+        # Memory cell: sample the live heap through the run. Not for timed
+        # cells; the forced collections slow the forward.
+        scheme.backend.StartLiveHeapSampler(50)
+        live["init_scheme"] = int(scheme.backend.LiveHeapBytes())
     orion.fit(model, [dense_in, expanded_sparse])
+    if not trials:
+        live["fit"] = int(scheme.backend.LiveHeapBytes())
     input_level = orion.compile(model)
+    if not trials:
+        live["compile"] = int(scheme.backend.LiveHeapBytes())
     enc_dense = orion.encrypt(orion.encode(dense_in, input_level))
     enc_sparse = orion.encrypt(orion.encode(expanded_sparse, input_level))
+    if not trials:
+        live["encrypt"] = int(scheme.backend.LiveHeapBytes())
     model.he()
     if trials:
         time_stages(model)
@@ -97,6 +113,12 @@ def cpu_cell(threshold, out, trials=0):
             stage_trials.append(dict(model.stage_seconds))
             print("[stages] " + " ".join(f"{k}={v:.3f}s" for k, v in model.stage_seconds.items()),
                   flush=True)
+    live_peak = None
+    if not trials:
+        live["forward"] = int(scheme.backend.LiveHeapBytes())
+        live_peak = int(scheme.backend.StopLiveHeapSampler())
+        print("[live-heap] " + " ".join(f"{k}={v / 2**30:.1f}GiB" for k, v in live.items())
+              + f" peak={live_peak / 2**30:.1f}GiB", flush=True)
     fhe = torch.as_tensor(out_ct.decrypt().decode()).reshape(-1)[:1]
     mae = float((clear.reshape(-1) - fhe).abs().mean())
 
@@ -110,6 +132,7 @@ def cpu_cell(threshold, out, trials=0):
         "stage_seconds": ({k: sum(d[k] for d in stage_trials) / len(stage_trials)
                            for k in stage_trials[0]} if stage_trials else None),
         "stage_seconds_trials": stage_trials,
+        "live_heap_peak_bytes": live_peak, "live_heap_stage_bytes": live,
         "peak_rss_kb_ru_maxrss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "GOMAXPROCS": os.environ.get("GOMAXPROCS"),
         "env_knobs": {k: v for k, v in sorted(os.environ.items()) if k.startswith("ORION_")},
@@ -212,6 +235,8 @@ def main():
         if exists(js):
             cpu[t] = json.load(open(js))
             cpu[t]["peak_rss_kb"] = time_v_rss_kb(log)
+            if not cpu[t].get("live_heap_peak_bytes"):
+                notes.append(f"CPU t={t}: no live-heap peak in the JSON (old run?)")
         else:
             notes.append(f"CPU t={t}: run failed, see {log}")
 
@@ -251,12 +276,16 @@ def main():
         f"{dense_features} dense inputs. Both are set by the model and identical on the two backends "
         "(the encrypted widths were checked against the model on each run).", "",
         "### CPU: Lattigo, 64-bit chain (params.yaml), single thread", "",
-        "Peak RAM is the process max RSS (`/usr/bin/time -v`) over setup and one forward pass.", "",
+        "Peak RAM is the peak live Go heap over setup and one forward pass: the working set of "
+        "keys, plaintexts, ciphertexts and temporaries, sampled every 50 ms after a forced "
+        "collection so garbage never counts. Process max RSS depends on when Go's collector "
+        "happened to run and is kept in the JSON only.", "",
         hdr,
     ]
     for t in THRESHOLDS:
         c = cpu.get(t)
-        lines.append(row(t, f"{c['peak_rss_kb'] / 2**20:.1f}" if c else "—"))
+        lines.append(row(t, f"{c['live_heap_peak_bytes'] / 2**30:.1f}"
+                         if c and c.get("live_heap_peak_bytes") else "—"))
     lines += [
         "", "### GPU: Cheddar, word32 chain, seeded upload at the sparse layer's level", "",
         "Peak RAM is the device allocation peak with managed memory off, over setup and "
