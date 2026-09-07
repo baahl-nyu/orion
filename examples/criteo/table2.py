@@ -45,15 +45,17 @@ CPU_ENV = {"GOMAXPROCS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
 
 
 # ---------------------------------------------------------------- CPU cell
-def cpu_cell(threshold, out):
-    """One Lattigo forward pass set, run in its own process."""
+def cpu_cell(threshold, out, trials=0):
+    """Lattigo setup plus one forward (plus `trials` timed forwards), in its
+    own process. table2.py uses trials=0 (memory only); batch1.py times it."""
     import resource
+    import time
 
     import torch
     import yaml
 
     import orion
-    from bench_sweep import SPARSE_SIZES, _impose_block_diagonal
+    from bench_sweep import SPARSE_SIZES, _impose_block_diagonal, time_stages
     from dlrm import HELRM
 
     torch.set_num_threads(1)
@@ -78,9 +80,22 @@ def cpu_cell(threshold, out):
     enc_dense = orion.encrypt(orion.encode(dense_in, input_level))
     enc_sparse = orion.encrypt(orion.encode(expanded_sparse, input_level))
     model.he()
+    if trials:
+        time_stages(model)
 
     # One forward: the peak can land inside it, and its output checks the run.
-    out_ct = model(enc_dense, enc_sparse)
+    times, stage_trials = [], []
+    for i in range(trials + 1):
+        model.stage_seconds = {}
+        t0 = time.time()
+        out_ct = model(enc_dense, enc_sparse)
+        dt = time.time() - t0
+        print(f"[timing] {'warmup' if i == 0 else f'trial{i}'}: {dt:.3f}s", flush=True)
+        if i:
+            times.append(dt)
+            stage_trials.append(dict(model.stage_seconds))
+            print("[stages] " + " ".join(f"{k}={v:.3f}s" for k, v in model.stage_seconds.items()),
+                  flush=True)
     fhe = torch.as_tensor(out_ct.decrypt().decode()).reshape(-1)[:1]
     mae = float((clear.reshape(-1) - fhe).abs().mean())
 
@@ -89,6 +104,11 @@ def cpu_cell(threshold, out):
         "sparse_width": int(expanded_sparse.shape[1]),
         "input_level": int(input_level), "sparse_level": model.sparse.level,
         "mae": mae, "precision": None if mae == 0 else -math.log2(mae),
+        "runtime_seconds": sum(times) / len(times) if times else None,
+        "runtime_seconds_trials": times,
+        "stage_seconds": ({k: sum(d[k] for d in stage_trials) / len(stage_trials)
+                           for k in stage_trials[0]} if stage_trials else None),
+        "stage_seconds_trials": stage_trials,
         "peak_rss_kb_ru_maxrss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "GOMAXPROCS": os.environ.get("GOMAXPROCS"),
         "env_knobs": {k: v for k, v in sorted(os.environ.items()) if k.startswith("ORION_")},
@@ -124,10 +144,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/table2"))
     ap.add_argument("--cpu-cell", type=int, help=argparse.SUPPRESS)
+    ap.add_argument("--trials", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--out", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.cpu_cell:
-        cpu_cell(args.cpu_cell, args.out)
+        cpu_cell(args.cpu_cell, args.out, args.trials)
         return
 
     from bench_sweep import SPARSE_SIZES
