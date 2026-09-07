@@ -288,8 +288,12 @@ def main():
                          if c and c.get("live_heap_peak_bytes") else "—"))
     lines += [
         "", "### GPU: Cheddar, word32 chain, seeded upload at the sparse layer's level", "",
-        "Peak RAM is the device allocation peak with managed memory off, over setup and "
-        "1 warmup + 3 forwards.", "",
+        "Peak RAM here is the pool's allocation footprint with managed memory off, over setup and "
+        "1 warmup + 3 forwards: what Cheddar's binning pool took from the device, which overshoots "
+        "the working set by the bins' unused preallocation. It is not the working-set metric used "
+        "for the CPU column and in the ladder section, and this column is not used in the paper; "
+        "it was measured before the pool's bins were turned off (`ORION_CHEDDAR_BIN_CHUNK=0`) and "
+        "is left as recorded.", "",
         hdr,
     ]
     for t in THRESHOLDS:
