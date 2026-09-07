@@ -485,6 +485,11 @@ def main():
             for _cid in _received.ids:
                 _scheme.backend.DeleteCiphertext(_cid)
         print(f"[timing] {label}: {t1 - t0:.3f}s", flush=True)
+        # Device-allocation peak so far, so any growth across forwards is
+        # visible in the log (it should be flat after the warmup).
+        if hasattr(_scheme.backend, "GetPeakDeviceMemoryMB"):
+            print(f"[mem] after {label}: peak "
+                  f"{_scheme.backend.GetPeakDeviceMemoryMB():.0f} MiB", flush=True)
         if args.stage_times:
             print("[stages] " + " ".join(
                 f"{k}={v:.3f}s" for k, v in model.stage_seconds.items()), flush=True)
