@@ -5,7 +5,8 @@ compiler (sliced diagonal packing), batch 1.
 
     python table2.py [--results DIR]
 
-Runs every missing cell, then writes examples/criteo/table2.md. Raw JSON
+Runs every missing cell, then writes the "table2" section of
+examples/criteo/PAPER_NUMBERS.md (replaced in place on every run). Raw JSON
 and logs go to --results (default ~/cheddar-orion-results/table2, outside
 the repo). A cell whose JSON exists is not re-run; delete it to redo.
 
@@ -140,6 +141,29 @@ def fmt_compression(c):
     return f"{round(c, 3 - mag):,.{max(0, 3 - mag)}f}"
 
 
+PAPER_MD = join(HERE, "PAPER_NUMBERS.md")
+PAPER_HEADER = """# Paper numbers
+
+Every section below is written by the script it names, from runs on this
+branch; re-running a script replaces its section in place. Raw JSON and logs
+live outside the repo under ~/cheddar-orion-results/<section>/.
+"""
+
+
+def write_section(name, lines):
+    """Replace the block between <!-- section:name --> markers in
+    PAPER_NUMBERS.md, or append it if absent. `lines` is a list of md lines;
+    the first should be the section's "## " heading."""
+    body = f"<!-- section:{name} -->\n" + "\n".join(lines).rstrip() + f"\n<!-- /section:{name} -->\n"
+    text = open(PAPER_MD).read() if exists(PAPER_MD) else PAPER_HEADER
+    pat = re.compile(rf"<!-- section:{re.escape(name)} -->.*?<!-- /section:{re.escape(name)} -->\n",
+                     re.S)
+    text = pat.sub(lambda m: body, text, count=1) if pat.search(text) else text.rstrip("\n") + "\n\n" + body
+    open(PAPER_MD, "w").write(text)
+    print("\n".join(lines))
+    print(f"wrote section {name} of {PAPER_MD}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/table2"))
@@ -220,13 +244,13 @@ def main():
         return f"| {t:,} | {fmt_compression(total / width)}x | {width + dense_features:,} | {peak} |"
 
     lines = [
-        "# Table 2: compression ratio and resource requirements per threshold", "",
+        "## Table 2: compression ratio and resource requirements per threshold", "",
         f"Regenerated {date.today().isoformat()} at commit {git} by `table2.py`: current compiler "
         "(sliced diagonal packing), batch 1.",
         f"Compression = {total:,} total categories / selector width; slots = selector width + "
         f"{dense_features} dense inputs. Both are set by the model and identical on the two backends "
         "(the encrypted widths were checked against the model on each run).", "",
-        "## CPU: Lattigo, 64-bit chain (params.yaml), single thread", "",
+        "### CPU: Lattigo, 64-bit chain (params.yaml), single thread", "",
         "Peak RAM is the process max RSS (`/usr/bin/time -v`) over setup and one forward pass.", "",
         hdr,
     ]
@@ -234,7 +258,7 @@ def main():
         c = cpu.get(t)
         lines.append(row(t, f"{c['peak_rss_kb'] / 2**20:.1f}" if c else "—"))
     lines += [
-        "", "## GPU: Cheddar, word32 chain, seeded upload at the sparse layer's level", "",
+        "", "### GPU: Cheddar, word32 chain, seeded upload at the sparse layer's level", "",
         "Peak RAM is the device allocation peak with managed memory off, over setup and "
         "1 warmup + 3 forwards.", "",
         hdr,
@@ -244,10 +268,7 @@ def main():
         lines.append(row(t, f"{g['peak_device_mb'] / 1024:.1f}" if g else "—"))
     lines += ["", "Checks: " + ("all passed." if not notes else " ".join(notes)), ""]
 
-    md = join(HERE, "table2.md")
-    open(md, "w").write("\n".join(lines))
-    print("\n".join(lines))
-    print(f"wrote {md}")
+    write_section("table2", lines)
 
 
 if __name__ == "__main__":
