@@ -4,7 +4,8 @@ forward runtime per threshold, current compiler (sliced diagonal packing).
 
     python batch1.py [--results DIR]
 
-Runs every missing cell, then writes examples/criteo/batch1.md. Raw JSON
+Runs every missing cell, then writes the "batch1" section of
+examples/criteo/PAPER_NUMBERS.md (replaced in place). Raw JSON
 and logs go to --results (default ~/cheddar-orion-results/batch1). A cell
 whose JSON exists is not re-run; delete it to redo.
 
@@ -30,7 +31,7 @@ for _p in (REPO, HERE):
         sys.path.insert(0, _p)
 
 from table2 import (COMMON_ENV, CPU_ENV, GPU_ENV, PY, SLOTS_PER_CT, THRESHOLDS,
-                    fmt_compression, run, sparse_level_from_log)
+                    fmt_compression, run, sparse_level_from_log, write_section)
 
 TRIALS = 3
 GPU_LEVEL = {500: 4, 5000: 4, 50000: 4, 500000: 5, 5000000: 5}
@@ -100,7 +101,7 @@ def main():
     git = subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
                          capture_output=True, text=True).stdout.strip()
     lines = [
-        "# CPU against GPU at batch 1", "",
+        "## CPU against GPU at batch 1", "",
         f"Regenerated {date.today().isoformat()} at commit {git} by `batch1.py`: current compiler "
         "(sliced diagonal packing), batch 1, 1 warmup + 3 timed forwards; "
         "runtime is the mean of the 3 timed forwards, with the per-trial spread alongside.",
@@ -117,7 +118,7 @@ def main():
     stage_rows = {"bottom_mlp": "Bottom MLP", "lookup": "Embedding lookup",
                   "sparse_to_top": "Repack lookup to top layout", "add": "Add",
                   "top_mlp": "Top MLP"}
-    breakdown = ["", "## Forward breakdown by stage (s, mean of the 3 timed forwards)", "",
+    breakdown = ["", "### Forward breakdown by stage (s, mean of the 3 timed forwards)", "",
                  "Timed inside the same forwards as the runtimes above; the remainder is "
                  "Python glue and, on the GPU, re-expanding the uploaded seeds.", "",
                  "| Stage | " + " | ".join(f"CPU {t:,}" for t in THRESHOLDS) + " | "
@@ -150,10 +151,7 @@ def main():
     lines += breakdown
     lines += ["", "Checks: " + ("all passed." if not notes else " ".join(notes)), ""]
 
-    md = join(HERE, "batch1.md")
-    open(md, "w").write("\n".join(lines))
-    print("\n".join(lines))
-    print(f"wrote {md}")
+    write_section("batch1", lines)
 
 
 if __name__ == "__main__":
