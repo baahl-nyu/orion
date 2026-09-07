@@ -35,6 +35,8 @@ import time
 import numpy as np
 import torch
 
+import os
+
 import orion
 from orion.backend.python.tensors import CipherTensor
 from bench_sweep import build_config, SPARSE_SIZES, _impose_block_diagonal
@@ -453,12 +455,21 @@ def main():
           f"{sel*1e3/nb:7.3f} ms per inference at batch {nb}")
     if args.out:
         import json
+        # Device-allocation peak (logical, so meaningful under managed
+        # memory) and resident key memory, same counters bench_sweep.py
+        # records; None if the backend lacks them.
+        peak_mb = keys_mb = None
+        if hasattr(B, "GetPeakDeviceMemoryMB"):
+            peak_mb, keys_mb = B.GetPeakDeviceMemoryMB(), B.GetKeyMemoryMB()
         json.dump({k: a(k) for k in times} | {"p": p, "ell": ell,
                   "batch": nb, "no_ref": args.no_ref,
                   "query_bytes": query_bytes, "boot_protocol": args.boot,
                   "pcmm_kind": args.pcmm,
                   "q_level": q_level, "ref_forward_s": ref_fwd,
-                  "threshold": args.compress_threshold},
+                  "threshold": args.compress_threshold,
+                  "peak_device_mb": peak_mb, "key_memory_mb": keys_mb,
+                  "env_knobs": {k: v for k, v in sorted(os.environ.items())
+                                if k.startswith("ORION_CHEDDAR_")}},
                   open(args.out, "w"), indent=1)
 
 

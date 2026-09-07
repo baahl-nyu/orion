@@ -89,20 +89,44 @@ class CipherTensor:
         self.evaluator = scheme.evaluator
         self.bootstrapper = scheme.bootstrapper
 
-        self.ids = [ctxt_ids] if isinstance(ctxt_ids, int) else ctxt_ids 
+        self.ids = [ctxt_ids] if isinstance(ctxt_ids, int) else ctxt_ids
+        self._track_ids()
         self.shape = shape 
         self.on_shape = on_shape or shape
         self.start = start
         self.stride = stride
         self.stop = stop
 
-    #def __del__(self):
-    #    if 'sys' in globals() and sys.modules and self.scheme:
-    #        try:
-    #            for idx in self.ids:
-    #                self.backend.DeleteCiphertext(idx)
-    #        except Exception: 
-    #            pass # avoids errors for GC at program termination
+    # Release a backend ciphertext when the last CipherTensor wrapping its
+    # id goes away. Ids are reference-counted because several tensors can
+    # wrap the same id (a layer's output and the temporary it was built
+    # from), so a plain destructor would free ids still in use. Before
+    # this, every intermediate ciphertext of every forward stayed allocated
+    # for the life of the process (measured on Cheddar: +4.5 GiB per
+    # forward for HE-LRM at threshold 5,000,000, batch 2; the same growth
+    # in host RSS on Lattigo). Plaintexts are not freed here: layers hold
+    # diagonal plaintexts by raw id.
+    _id_refs = {}  # ct_id -> number of live CipherTensors wrapping it
+
+    def _track_ids(self):
+        for idx in self.ids:
+            CipherTensor._id_refs[idx] = CipherTensor._id_refs.get(idx, 0) + 1
+
+    def __del__(self):
+        if getattr(self, "scheme", None) is None:
+            return
+        if 'sys' not in globals() or not sys.modules:
+            return
+        try:
+            for idx in self.ids:
+                n = CipherTensor._id_refs.get(idx, 0) - 1
+                if n > 0:
+                    CipherTensor._id_refs[idx] = n
+                else:
+                    CipherTensor._id_refs.pop(idx, None)
+                    self.backend.DeleteCiphertext(idx)
+        except Exception:
+            pass  # avoids errors for GC at program termination
 
     def __len__(self):
         return len(self.ids)
