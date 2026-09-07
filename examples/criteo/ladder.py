@@ -36,7 +36,7 @@ for _p in (REPO, HERE):
         sys.path.insert(0, _p)
 from table2 import COMMON_ENV, GPU_ENV, PY, THRESHOLDS, fmt_compression, run, write_section
 
-IVE_P = [32, 64, 128, 256, 512, 1024]
+IVE_P = [64, 128, 256, 512, 1024]  # p=32 is not in IVE's parameter set
 IVE_ELL = {32: 5, 64: 4, 128: 4, 256: 3, 512: 3, 1024: 3}
 IVE_COMPRESSION = {32: 14453, 64: 8374, 128: 4628, 256: 2536, 512: 1346, 1024: 717}
 BATCHES = [1, 2, 4, 8, 16, 32]
@@ -214,10 +214,8 @@ def main():
         import matplotlib.pyplot as plt
         os.makedirs(join(HERE, "figures"), exist_ok=True)
         FIGS = {
-            "latency_vs_batch": ("fwd", "Forward latency (s)", True,
-                                 "Hollow marker: first batch past the memory ceiling, run with paging"),
-            "memory_vs_batch": ("peak", "Peak GPU memory (GiB)", False,
-                                "Hollow marker: first batch past the ceiling, run with paging"),
+            "latency_vs_batch": ("fwd", "Forward latency (s)", True),
+            "memory_vs_batch": ("peak", "Peak GPU memory (GiB)", False),
         }
 
         def panel(ax, design, key, logy, ylabel):
@@ -249,7 +247,7 @@ def main():
 
         # Figures A (memory) and B (latency): the two-panel PNG, and each panel
         # on its own for subfigure (a)/(b) with the same y-limits.
-        for name, (key, ylabel, logy, note) in FIGS.items():
+        for name, (key, ylabel, logy) in FIGS.items():
             fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), dpi=200, sharey=True)
             for ax, design in zip(axes, ("HE-LRM", "IVE")):
                 panel(ax, design, key, logy, ylabel if ax is axes[0] else None)
@@ -284,7 +282,7 @@ def main():
                          ("HE-LRM", 500): ((4, -9), "left"),
                          ("IVE", 1024): ((4, -9), "left"), ("IVE", 512): ((4, -9), "left"),
                          ("IVE", 256): ((-4, 5), "right"), ("IVE", 128): ((4, -9), "left"),
-                         ("IVE", 64): ((4, 4), "left"), ("IVE", 32): ((4, 5), "left")}
+                         ("IVE", 64): ((4, 4), "left")}
                 off, ha = place[(design, cfg)]
                 ax.annotate(f"{label(d_, cfg)}, b={b['batch']}", (x, b["qps"]),
                             textcoords="offset points", xytext=off, ha=ha, fontsize=5)
