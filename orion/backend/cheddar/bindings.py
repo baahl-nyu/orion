@@ -1241,6 +1241,14 @@ class CheddarLibrary:
         ORION_CHEDDAR_MANAGED_MEMORY pages part of it to host RAM."""
         return _native.GetPeakDeviceMemoryMB()
 
+    def GetPeakLiveMemoryMB(self) -> float:
+        """Peak of the bytes users held through the pool at any instant
+        (working set). GetPeakDeviceMemoryMB is the pool's footprint."""
+        return _native.GetPeakLiveMemoryMB()
+
+    def GetLiveMemoryMB(self) -> float:
+        return _native.GetLiveMemoryMB()
+
     def GetModuliChain(self) -> list[int]:
         """Usable-level moduli (q_i), indexed by Orion level 0..max_level.
 

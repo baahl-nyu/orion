@@ -2346,6 +2346,16 @@ double GetPeakDeviceMemoryMB() {
     return static_cast<double>(cheddar::GetPeakDeviceBytes()) / (1024.0 * 1024.0);
 }
 
+// Working set: bytes users hold through the pool at an instant, and its
+// peak. GetPeakDeviceMemoryMB above is the pool's footprint (what it took
+// from the upstream, including per-bin preallocation), an upper bound.
+double GetPeakLiveMemoryMB() {
+    return static_cast<double>(cheddar::GetPeakLiveBytes()) / (1024.0 * 1024.0);
+}
+double GetLiveMemoryMB() {
+    return static_cast<double>(cheddar::GetLiveBytes()) / (1024.0 * 1024.0);
+}
+
 int GetCiphertextLevel(int ct_id) { return level_of(g_state.ct(ct_id)); }
 int GetPlaintextLevel(int pt_id) { return level_of(g_state.pt(pt_id)); }
 // Real per-object widths (these were stubs returning the global
@@ -2523,6 +2533,8 @@ PYBIND11_MODULE(ORION_CHEDDAR_MODULE_NAME, m) {
     // Metadata
     m.def("GetKeyMemoryMB", &GetKeyMemoryMB);
     m.def("GetPeakDeviceMemoryMB", &GetPeakDeviceMemoryMB);
+    m.def("GetPeakLiveMemoryMB", &GetPeakLiveMemoryMB);
+    m.def("GetLiveMemoryMB", &GetLiveMemoryMB);
     m.def("GetCiphertextLevel", &GetCiphertextLevel, py::arg("ct_id"));
     m.def("GetPlaintextLevel", &GetPlaintextLevel, py::arg("pt_id"));
     m.def("GetCiphertextSlots", &GetCiphertextSlots, py::arg("ct_id"));
