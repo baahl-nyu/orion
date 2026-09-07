@@ -667,6 +667,190 @@ index 7b6f79b..c0140ee 100644
  }
 ```
 
+### 7. `working-set-counter-no-bins`
+
+Applies on top of `managed-memory` (same two files). Two changes to
+`MemoryPool`:
+
+* A second `statistics_resource_adaptor` sits *above* the binning pool and
+  is what `set_current_device_resource` installs, so `GetPeakLiveBytes()`
+  and `GetLiveBytes()` report the bytes users actually hold (the working
+  set: keys, plaintexts, ciphertexts, temporaries). `GetPeakDeviceBytes()`
+  from patch 1 sits below the pool and reports what the pool took from the
+  upstream, which with RMM's default bins overshoots the working set by up
+  to 127 blocks per size class (900 MiB for a full-level ciphertext) and
+  never shrinks; measured 2 to 18 GiB above the working set on the HE-LRM
+  and IVE batch ladders, so the process ran out of card before the
+  computation did.
+* The bins are off by default (`ORION_CHEDDAR_BIN_CHUNK=0`): every
+  allocation goes to the upstream's own pool (`cudaMallocAsync`, or
+  `cudaMallocManaged` under `ORION_CHEDDAR_MANAGED_MEMORY`), so the
+  footprint equals the working set exactly and an out-of-memory failure
+  means the computation does not fit. `ORION_CHEDDAR_BIN_CHUNK=N` (N > 0)
+  restores the bins with N blocks taken from the upstream per bin refill
+  (RMM's default is 128). Measured on the HE-LRM and IVE forwards at
+  batch 1 and at the memory ceiling: bins off is 2-3% faster than
+  128-block bins; one-block bins are within 0.4% of 128-block bins but
+  still leave a 2-9 GiB footprint gap.
+
+The extension exposes the new counters as `GetPeakLiveMemoryMB` and
+`GetLiveMemoryMB` (`cheddar_pybind.cu`, tracked in this repo).
+
+```diff
+--- a/include/core/MemoryPool.h	2026-09-07 15:13:52.926550253 +0000
++++ b/include/core/MemoryPool.h	2026-09-07 15:13:52.926574830 +0000
+@@ -5,6 +5,8 @@
+ 
+ #include <rmm/mr/device/binning_memory_resource.hpp>
+ #include <rmm/mr/device/device_memory_resource.hpp>
++#include <rmm/mr/device/fixed_size_memory_resource.hpp>
++#include <vector>
+ #include <rmm/mr/device/statistics_resource_adaptor.hpp>
+ 
+ #include "core/Parameter.h"
+@@ -37,10 +39,28 @@
+   std::unique_ptr<rmm::mr::device_memory_resource> base_;
+   Stats stats_;
+   MemoryPoolBase memory_pool_;
++  // Second adaptor ABOVE the binning pool: counts the bytes users hold at
++  // any instant (ciphertexts, keys, plaintexts, temporaries). stats_ below
++  // the pool counts what the pool took from the upstream, which includes
++  // each bin's 128-block preallocation and never shrinks, so it is the
++  // allocator's footprint rather than the working set.
++  Stats user_stats_;
++  // The bins, if any (see BinChunkSetting in MemoryPool.cpp; default is
++  // no bins). RMM's default bin takes 128 blocks from the upstream at a
++  // time and never gives them back, and even a one-block bin keeps every
++  // freed block for its own size class, so the pool's footprint overshoots
++  // the working set and the process runs out of card before the
++  // computation does.
++  using FixedBin = rmm::mr::fixed_size_memory_resource<rmm::mr::device_memory_resource>;
++  std::vector<std::unique_ptr<FixedBin>> bins_;
++  void AddBin(std::size_t size);
+ };
+ 
+-// Peak bytes allocated through the currently-active MemoryPool's statistics
+-// adaptor. Returns 0 if no MemoryPool is currently constructed.
++// Peak bytes the binning pool ever took from its upstream (allocator
++// footprint). Returns 0 if no MemoryPool is currently constructed.
+ std::size_t GetPeakDeviceBytes();
++// Peak and current bytes held by users through the pool (working set).
++std::size_t GetPeakLiveBytes();
++std::size_t GetLiveBytes();
+ 
+ }  // namespace cheddar
+--- a/src/core/MemoryPool.cpp	2026-09-07 15:14:04.086307252 +0000
++++ b/src/core/MemoryPool.cpp	2026-09-07 15:13:52.926599977 +0000
+@@ -1,5 +1,6 @@
+ #include "core/MemoryPool.h"
+ 
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rmm/mr/device/cuda_async_memory_resource.hpp>
+@@ -16,6 +17,27 @@
+ // lifetime (mirrors rmm::mr::set_current_device_resource's single-current
+ // -resource model), so one global tracking the live adaptor is sufficient.
+ StatsAdaptor* g_active_stats = nullptr;
++StatsAdaptor* g_active_user_stats = nullptr;
++
++// ORION_CHEDDAR_BIN_CHUNK: 0 (the default) disables the bins, so every
++// allocation goes to the upstream's own pool (cudaMallocAsync, or
++// cudaMallocManaged) and the footprint is that pool's high-water mark of
++// live bytes, i.e. the working set. A positive value restores the bins
++// with that many blocks taken from the upstream at a time (RMM's default
++// is 128); with bins, a freed block is reused only by its own size class,
++// so the footprint is a sum of per-class high-water marks and the process
++// can run out of card before the computation does. Measured on the
++// HE-LRM/IVE forwards: bins off is 2-3% faster than 128-block bins.
++long BinChunkSetting() {
++  const char* env = std::getenv("ORION_CHEDDAR_BIN_CHUNK");
++  if (env == nullptr || *env == '\0') return 0;
++  return std::strtol(env, nullptr, 10);
++}
++
++std::size_t BinChunkBlocks() {
++  long v = BinChunkSetting();
++  return v > 0 ? static_cast<std::size_t>(v) : 1;
++}
+ 
+ bool ManagedMemoryRequested() {
+   const char* env = std::getenv("ORION_CHEDDAR_MANAGED_MEMORY");
+@@ -33,8 +55,10 @@
+ 
+ template <typename word>
+ MemoryPool::MemoryPool(const Parameter<word> &param)
+-    : base_(MakeUpstream()), stats_(base_.get()), memory_pool_(&stats_) {
++    : base_(MakeUpstream()), stats_(base_.get()), memory_pool_(&stats_),
++      user_stats_(&memory_pool_) {
+   g_active_stats = &stats_;
++  g_active_user_stats = &user_stats_;
+ 
+   // Hueristically add bins to save memory and speed-up bootstrapping.
+   const int degree = param.degree_;
+@@ -46,29 +70,36 @@
+   int next_threshold = limb_size;
+   // Should be: 512, 2048, 8192, 32768, 131072
+   for (; bin_size < next_threshold; bin_size *= 4) {
+-    memory_pool_.add_bin(bin_size);
++    AddBin(bin_size);
+   }
+   bin_size = next_threshold;
+   int chunk_size = param.alpha_ * limb_size;
+   for (; bin_size < chunk_size; bin_size *= 2) {
+     // Maybe one more bin will be added
+-    memory_pool_.add_bin(bin_size);
++    AddBin(bin_size);
+   }
+   // Finally, about dnum additional bins;
+   bin_size = chunk_size;
+   int max_size = (param.L_ + param.alpha_) * limb_size;
+   for (; bin_size < max_size; bin_size += chunk_size) {
+-    memory_pool_.add_bin(bin_size);
++    AddBin(bin_size);
+   }
+-  memory_pool_.add_bin(max_size);
++  AddBin(max_size);
++
++  rmm::mr::set_current_device_resource(&user_stats_);
++}
+ 
+-  rmm::mr::set_current_device_resource(&memory_pool_);
++void MemoryPool::AddBin(std::size_t size) {
++  if (BinChunkSetting() == 0) return;  // no bins: everything passes to the upstream
++  bins_.push_back(std::make_unique<FixedBin>(&stats_, size, BinChunkBlocks()));
++  memory_pool_.add_bin(size, bins_.back().get());
+ }
+ 
+ MemoryPool::~MemoryPool() {
+   // reset to cuda_device_resource
+   rmm::mr::set_current_device_resource(nullptr);
+   if (g_active_stats == &stats_) g_active_stats = nullptr;
++  if (g_active_user_stats == &user_stats_) g_active_user_stats = nullptr;
+ }
+ 
+ std::size_t GetPeakDeviceBytes() {
+@@ -77,6 +108,18 @@
+              : 0;
+ }
+ 
++std::size_t GetPeakLiveBytes() {
++  return g_active_user_stats != nullptr
++             ? static_cast<std::size_t>(g_active_user_stats->get_bytes_counter().peak)
++             : 0;
++}
++
++std::size_t GetLiveBytes() {
++  return g_active_user_stats != nullptr
++             ? static_cast<std::size_t>(g_active_user_stats->get_bytes_counter().value)
++             : 0;
++}
++
+ template MemoryPool::MemoryPool(const Parameter<uint32_t> &param);
+ template MemoryPool::MemoryPool(const Parameter<uint64_t> &param);
+ 
+```
+
 ## Not used on `cheddar-backend`
 
 ### 6. `fused-rotate`

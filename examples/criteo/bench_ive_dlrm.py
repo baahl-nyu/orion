@@ -309,17 +309,23 @@ def main():
           f"{ref_fwd*1e3:.2f} ms", flush=True)
 
     for t in range(args.trials + 1):
+        # NVTX ranges per trial and stage so nsys can attribute unified-memory
+        # traffic and kernels to them (warmup is trial 0).
+        torch.cuda.nvtx.range_push(f"trial{t}"); torch.cuda.nvtx.range_push("bottom")
         torch.cuda.synchronize(); tm = time.time()
         dense_path = model.bottom_to_top(model.bottom(ed))
         torch.cuda.synchronize(); t0 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("boot")
         src = B.Bootstrap(ct_q, boot_slots) if args.boot else ct_q
         torch.cuda.synchronize(); t1 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("vecgen")
         if args.vecgen == "fold":
             cts, tree_owned, _ = power_tree(B, src, p, Counter(), **tree_kw)
         else:
             cts, _ = vecgen(B, src, p, Counter(), const_ct=const_ct)
             tree_owned = []
         torch.cuda.synchronize(); t2 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("pcmm")
         aligned = [B._align_lt_input(c, pcmm_level)[0] for c in cts]
         if args.vecgen == "fold":
             aligned.append(const_ct)      # the constant column
@@ -361,6 +367,7 @@ def main():
                 for x in (iq, sr, cj, P, Q):
                     B.DeleteCiphertext(x)
         torch.cuda.synchronize(); t3 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("sum")
         # collapse the ell sub-tables of each field into slot 16+16f
         summed = []
         for o in outs:
@@ -378,6 +385,7 @@ def main():
             summed.append(B.RescaleNew(m))
             B.DeleteCiphertext(m)
         torch.cuda.synchronize(); t4 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("repack")
         # coordinate r to slot 16+16f+r, then fold the 16 into one ct.
         # RotateNew's positive k rotates LEFT and a negative k is not a
         # valid key index -- it decrypts to garbage rather than failing --
@@ -395,10 +403,12 @@ def main():
                 B.DeleteCiphertext(piece)
         sparse_ct = B._align_lt_input(acc, out_level)[0]
         torch.cuda.synchronize(); t5 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_push("mlp")
         sparse_path = CipherTensor(scheme, [sparse_ct], ref_shape,
                                    ref_on_shape)
         logit = model.top(model.add(dense_path, sparse_path))
         torch.cuda.synchronize(); t6 = time.time()
+        torch.cuda.nvtx.range_pop(); torch.cuda.nvtx.range_pop()
 
         if t == 0:
             # Check the selector output itself, before the top MLP: slot
@@ -426,6 +436,12 @@ def main():
             times["pcmm"].append(t3 - t2); times["sum"].append(t4 - t3)
             times["repack"].append(t5 - t4); times["mlp"].append(t6 - t5)
             times["bottom"].append(t0 - tm); times["total"].append(t6 - tm)
+            # Wall-clock stamps so an external sampler (nvidia-smi) can be
+            # aligned with the trials, and the pool peak so far.
+            live = (f" live_peak={B.GetPeakLiveMemoryMB():.0f}MiB live_now={B.GetLiveMemoryMB():.0f}MiB"
+                    if hasattr(B, "GetPeakLiveMemoryMB") else "")
+            print(f"[trial] {t} start={tm:.3f} end={t6:.3f} total={t6 - tm:.3f}s "
+                  f"peak={B.GetPeakDeviceMemoryMB():.0f}MiB{live}", flush=True)
         for c in cts:
             if c is not const_ct and c is not src and c is not ct_q:
                 B.DeleteCiphertext(c)
@@ -467,7 +483,10 @@ def main():
                   "pcmm_kind": args.pcmm,
                   "q_level": q_level, "ref_forward_s": ref_fwd,
                   "threshold": args.compress_threshold,
+                  "trials": {k: list(v) for k, v in times.items()},
                   "peak_device_mb": peak_mb, "key_memory_mb": keys_mb,
+                  "peak_live_mb": (B.GetPeakLiveMemoryMB()
+                                   if hasattr(B, "GetPeakLiveMemoryMB") else None),
                   "env_knobs": {k: v for k, v in sorted(os.environ.items())
                                 if k.startswith("ORION_CHEDDAR_")}},
                   open(args.out, "w"), indent=1)

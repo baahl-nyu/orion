@@ -109,9 +109,10 @@ def parse_args():
     # Upload at an explicit level WITHOUT bootstrapping. Useful because
     # the compiled input level is set by the whole network, while the
     # selector's own consumer (the sparse layer) may run far lower --
-    # any limb above that is uploaded only to be dropped.
-    parser.add_argument("--upload-level", type=int, default=None,
-                        metavar="LEVEL")
+    # any limb above that is uploaded only to be dropped. "min" uploads
+    # at the level compile() assigned to the sparse layer, which moves
+    # with the batch as the packed layout changes.
+    parser.add_argument("--upload-level", default=None, metavar="LEVEL|min")
     # Per-stage wall time of each forward (bottom MLP, embedding lookup,
     # repacks, top MLP), synchronized at stage boundaries; the JSON gains
     # stage_seconds (mean over the timed trials). Off by default: the
@@ -358,8 +359,10 @@ def main():
     low_level = args.low_level_upload
     if low_level is not None:
         _upload_level = low_level
+    elif args.upload_level == "min":
+        _upload_level = model.sparse.level
     elif args.upload_level is not None:
-        _upload_level = args.upload_level
+        _upload_level = int(args.upload_level)
     else:
         _upload_level = input_level
     _plain = orion.encode(_vec, _upload_level)
@@ -488,8 +491,11 @@ def main():
         # Device-allocation peak so far, so any growth across forwards is
         # visible in the log (it should be flat after the warmup).
         if hasattr(_scheme.backend, "GetPeakDeviceMemoryMB"):
-            print(f"[mem] after {label}: peak "
-                  f"{_scheme.backend.GetPeakDeviceMemoryMB():.0f} MiB", flush=True)
+            _live = (f", live peak {_scheme.backend.GetPeakLiveMemoryMB():.0f} MiB, live now "
+                     f"{_scheme.backend.GetLiveMemoryMB():.0f} MiB"
+                     if hasattr(_scheme.backend, "GetPeakLiveMemoryMB") else "")
+            print(f"[mem] after {label}: pool peak "
+                  f"{_scheme.backend.GetPeakDeviceMemoryMB():.0f} MiB{_live}", flush=True)
         if args.stage_times:
             print("[stages] " + " ".join(
                 f"{k}={v:.3f}s" for k, v in model.stage_seconds.items()), flush=True)
@@ -510,13 +516,15 @@ def main():
     # RAM by UVM, so it stays meaningful under MANAGED_MEMORY=1. Without it
     # a memory ablation can't distinguish "fits in VRAM" from "fits only
     # because UVM paged it out". Cheddar-only; None on other backends.
-    peak_device_mb = key_memory_mb = None
+    peak_device_mb = key_memory_mb = peak_live_mb = None
     try:
         from orion.core.orion import scheme as _scheme
         _backend = _scheme.backend
         if hasattr(_backend, "GetPeakDeviceMemoryMB"):
             peak_device_mb = _backend.GetPeakDeviceMemoryMB()
             key_memory_mb = _backend.GetKeyMemoryMB()
+        if hasattr(_backend, "GetPeakLiveMemoryMB"):
+            peak_live_mb = _backend.GetPeakLiveMemoryMB()
     except Exception as exc:  # never fail a timed run over instrumentation
         print(f"[mem] counters unavailable: {exc}", flush=True)
 
@@ -542,7 +550,8 @@ def main():
         "upload_level": _upload_level,
         "upload_ciphertexts": upload_cts,
         "upload_bytes": upload_bytes,
-        "peak_device_mb": peak_device_mb,
+        "peak_device_mb": peak_device_mb,   # pool footprint (upper bound)
+        "peak_live_mb": peak_live_mb,       # working set: peak of live user bytes
         "key_memory_mb": key_memory_mb,
         "env_knobs": env_knobs,
     }
