@@ -37,11 +37,13 @@ bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
 ## Build
 
 1. Build Cheddar itself (once). Clone plain upstream, then apply this
-   branch's 3 required patches from
+   branch's 5 required patches from
    [CHEDDAR_PATCHES.md](CHEDDAR_PATCHES.md) (`managed-memory`,
-   `evalpoly-argswap`, `boot-circuit-eviction` -- copy each diff block into
-   a file and `git apply` it; a 4th patch, `fused-rotate`, is documented
-   there too but isn't needed on this branch):
+   `evalpoly-argswap`, `boot-circuit-eviction`, `seeded-ciphertext`,
+   `working-set-counter-no-bins` -- copy each diff block into a file and
+   `git apply` it, `managed-memory` before `working-set-counter-no-bins`;
+   two more patches, `fused-dispatch-beta1` and `fused-rotate`, are
+   documented there but are not applied in this checkout):
 
 ```bash
 git clone https://github.com/scale-snu/cheddar-fhe.git \
@@ -50,6 +52,8 @@ cd matmul-encoding-material/cheddar
 git apply /path/to/managed-memory.patch
 git apply /path/to/evalpoly-argswap.patch
 git apply /path/to/boot-circuit-eviction.patch
+git apply /path/to/seeded-ciphertext.patch
+git apply /path/to/working-set-counter-no-bins.patch
 CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release -DUSE_GMP=ON \
     -DCMAKE_CUDA_ARCHITECTURES=86 \
