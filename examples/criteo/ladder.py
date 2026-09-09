@@ -2,9 +2,9 @@
 """Batch ladder: forward latency, throughput and peak memory against batch
 size for HE-LRM (five thresholds) and IVE (six compressions), the largest
 batch that fits in device memory, and the first batch past it run with
-paging. Figure B (latency against batch) comes from this run; the memory
-and peak-throughput figures are drawn by gpu_ceilings.py from these cells
-and the other cards' folders.
+paging. Figure B (HE-LRM latency against batch, one column-width panel)
+comes from this run; the memory and peak-throughput figures are drawn by
+gpu_ceilings.py from these cells and the other cards' folders.
 
     python ladder.py [--results DIR]
 
@@ -208,32 +208,33 @@ def main():
     # ---- figures
     try:
         import matplotlib.pyplot as plt
-        from figstyle import COL_W, GREY, LINE, apply, save, series
+        from figstyle import COL_W, LINE, apply, save, series
         apply()
-        # Figure B (latency): one panel per design, stacked at column width.
-        fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.9), sharey=True)
-        for ax, design in zip(axes, ("HE-LRM", "IVE")):
-            for i, (design_, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
-                r = results[(design, cfg)]
-                xs = [row["batch"] for row in r["rows"]]
-                ys = [row["fwd"] for row in r["rows"]]
-                series(ax, xs, ys, i, label=label(design, cfg))
-                if r["paged"]:  # first batch past the ceiling, paged: dashed segment, open marker
-                    pb, pv = r["paged"]["batch"], r["paged"]["fwd"]
-                    ax.plot([xs[-1], pb], [ys[-1], pv], "--", color=LINE[i], lw=1.0, zorder=2)
-                    ax.plot([pb], [pv], "o", mfc="white", mec=LINE[i], mew=1.2, ls="none", zorder=3)
-            ax.set_xscale("log", base=2)
-            ax.set_yscale("log")
-            ax.set_ylim(0.1, 600)  # the top decade holds the legend, above the paged points
-            ax.set_xlabel("Batch size")
-            ax.legend(loc="upper left", ncol=3, title=design, fontsize=6.5)
-        axes[0].set_ylabel("Forward latency (s)")
-        fig.tight_layout(w_pad=0.8)
+        # Figure B (latency): HE-LRM at every threshold on one column-width panel; the IVE
+        # ladders are in the table above. The legend sits over batches 1-4, under the paged points.
+        fig, ax = plt.subplots(figsize=(COL_W, 2.3))
+        for i, (design, cfg) in enumerate([c for c in CONFIGS if c[0] == "HE-LRM"]):
+            r = results[(design, cfg)]
+            xs = [row["batch"] for row in r["rows"]]
+            ys = [row["fwd"] for row in r["rows"]]
+            series(ax, xs, ys, i, label=f"{label(design, cfg)}, {fmt_compression(compression(design, cfg))}x")
+            if r["paged"]:  # first batch past the ceiling, paged: dotted segment, open marker
+                pb, pv = r["paged"]["batch"], r["paged"]["fwd"]
+                ax.plot([xs[-1], pb], [ys[-1], pv], ":", color=LINE[i], lw=1.0, zorder=2)
+                ax.plot([pb], [pv], "o", mfc="white", mec=LINE[i], mew=1.2, ls="none", zorder=3)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_ylim(0.1, 100)
+        ax.set_xlabel("Batch size")
+        ax.set_ylabel("Forward latency (s)")
+        ax.legend(loc="upper left", fontsize=6, borderpad=0.3, labelspacing=0.2, handletextpad=0.3)
+        fig.tight_layout()
         save(fig, "latency_vs_batch")
         plt.close(fig)
-        lines += ["", "Figure: `figures/latency_vs_batch.png` (B). The memory-against-batch figure with the "
-                  "cards' capacities and the peak-throughput figures are drawn by `gpu_ceilings.py` from these "
-                  "cells and the other cards' folders (see `max_qps.md`)."]
+        lines += ["", "Figure: `figures/latency_vs_batch.png` (B), the HE-LRM ladders only; the IVE ladders "
+                  "are in the table above. The memory-against-batch figure with the cards' capacities and the "
+                  "peak-throughput figures are drawn by `gpu_ceilings.py` from these cells and the other "
+                  "cards' folders (see `max_qps.md`)."]
     except Exception as exc:
         problems.append(f"figures not written: {exc}")
 
