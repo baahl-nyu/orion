@@ -126,13 +126,13 @@ def main():
         fig, ax = plt.subplots(figsize=(COL_W, 2.7))
         ts = [t for t in THRESHOLDS if t in ours]
         xs, ys = [ours[t]["compression"] for t in ts], [ours[t]["selector"] for t in ts]
-        series(ax, xs, ys, 0, label="HE-LRM (this work)", marker="o")
+        series(ax, xs, ys, 1, label="HE-LRM (this work)", marker="o")
         for t, x, y in zip(ts, xs, ys):
             ax.annotate(f"t={t:,}", (x, y), textcoords="offset points",
                         xytext=(7, 4) if x < 100 else (0, -12), fontsize=6, ha="center" if x >= 100 else "left")
         ps = [p for p in IVE_P if p in ive]
         xs, ys = [ive[p]["compression"] for p in ps], [ive[p]["selector"] for p in ps]
-        series(ax, xs, ys, 1, label="IVE", marker="s")
+        series(ax, xs, ys, 0, label="IVE", marker="o")
         for p, x, y in zip(ps, xs, ys):
             ax.annotate(f"p={p}", (x, y), textcoords="offset points",
                         xytext=(0, -12) if p == 32 else (7, 4), fontsize=6, ha="center" if p == 32 else "left")

@@ -143,23 +143,23 @@ def main():
             ref_line(ax, gib, name, left=gib >= 60, dy=2.5)
 
     # ---- memory_vs_batch: working set against batch, one panel per design, stacked
-    fig, axes = plt.subplots(2, 1, figsize=(COL_W, 4.6), sharex=True)
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.0), sharey=True)
     for ax, design in zip(axes, ("HE-LRM", "IVE")):
         mem_lines(ax, design)
         cap_lines(ax)
         ax.set_xscale("log", base=2)
-        ax.set_ylim(0, 200)
-        ax.set_ylabel("Working set (GiB)")
+        ax.set_ylim(0, 235)  # the top band holds the legend, above the paged points
+        ax.set_xlabel("Batch size")
         ax.legend(loc="upper left", ncol=2, title=design, fontsize=6.5)
-    axes[1].set_xlabel("Batch size")
-    fig.tight_layout(h_pad=0.5)
+    axes[0].set_ylabel("Working set (GiB)")
+    fig.tight_layout(w_pad=0.8)
     save(fig, "memory_vs_batch")
     plt.close(fig)
 
     # ---- memory_vs_batch_one_panel: both designs on one panel, HE-LRM solid circles, IVE dashed squares
     fig, ax = plt.subplots(figsize=(COL_W, 3.2))
     mem_lines(ax, "HE-LRM")
-    mem_lines(ax, "IVE", ls="--", marker="s")
+    mem_lines(ax, "IVE", ls="--", marker="o")
     cap_lines(ax)
     ax.set_xscale("log", base=2)
     ax.set_ylim(0, 275)
