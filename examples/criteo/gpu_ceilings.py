@@ -126,14 +126,14 @@ def main():
     # ---- memory_vs_batch: working set against batch, both designs on one column-width panel.
     # Markers only: HE-LRM circles just left of each batch, IVE squares just right, a brace under
     # each pair carrying the batch label. y is linear to 50 GiB, 2x compressed to 100 GiB so the
-    # 80 and 96 GiB lines stay apart, 3x above; the top band holds the legends.
+    # 80 and 96 GiB lines stay apart, 3x to 150 and 10x above; the top band holds the legends.
     import math
     from matplotlib.ticker import FixedLocator, NullFormatter
 
     def short_t(t):
         return f"{t:,}" if t < 1000 else (f"{t // 1000}k" if t < 1_000_000 else f"{t // 1_000_000}M")
 
-    fig, ax = plt.subplots(figsize=(COL_W, 2.3))
+    fig, ax = plt.subplots(figsize=(COL_W, 2.2))
     DODGE = 0.09  # log2 units either side of the batch
     for design, marker, sign in (("HE-LRM", "o", -1), ("IVE", "s", 1)):
         for i, (d, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
@@ -152,34 +152,45 @@ def main():
                 f"{round(gib)} GiB ({SHORT[folder]})", fontsize=5.3, color=RED, fontweight="bold",
                 va="top" if below else "bottom", ha="left" if left else "right",
                 transform=ax.get_yaxis_transform(), zorder=4)
-    K1, K2, A, B = 1 / 2, 1 / 3, 50.0, 100.0
+    # knees and slopes of the piecewise-linear y axis: 1x to 50 GiB, 1/2 to 100, 1/3 to 150, 1/10 above
+    KNEES, SLOPES = [50.0, 100.0, 150.0], [1.0, 1 / 2, 1 / 3, 1 / 10]
 
     def fw(y):
         y = np.asarray(y, dtype=float)
-        return np.where(y <= A, y, np.where(y <= B, A + (y - A) * K1, A + (B - A) * K1 + (y - B) * K2))
+        u, lo, base = np.zeros_like(y), 0.0, 0.0
+        for knee, k in zip(KNEES + [np.inf], SLOPES):
+            u = np.where((y > lo) & (y <= knee), base + (y - lo) * k, u)
+            if np.isfinite(knee):
+                base, lo = base + (knee - lo) * k, knee
+        return np.where(y <= 0, y, u)
 
     def iv(u):
         u = np.asarray(u, dtype=float)
-        ub = A + (B - A) * K1
-        return np.where(u <= A, u, np.where(u <= ub, A + (u - A) / K1, B + (u - ub) / K2))
+        y, lo, base = np.zeros_like(u), 0.0, 0.0
+        for knee, k in zip(KNEES + [np.inf], SLOPES):
+            top = base + (knee - lo) * k if np.isfinite(knee) else np.inf
+            y = np.where((u > base) & (u <= top), lo + (u - base) / k, y)
+            if np.isfinite(knee):
+                base, lo = top, knee
+        return np.where(u <= 0, u, y)
 
     ax.set_yscale("function", functions=(fw, iv))
-    ax.set_ylim(10, 200)
+    ax.set_ylim(10, 230)
     ax.yaxis.set_major_locator(FixedLocator([10, 20, 30, 40, 50, 100, 200]))
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_locator(FixedLocator(list(BATCHES)))
     ax.xaxis.set_major_formatter(NullFormatter())
     ax.tick_params(axis="x", which="both", length=0)
     ax.set_ylabel("Working set (GiB)")
-    ax.set_xlabel("Batch size", labelpad=19)
+    ax.set_xlabel("Batch size", labelpad=15)
     h, l = ax.get_legend_handles_labels()
     n = len([c for c in CONFIGS if c[0] == "HE-LRM"])
-    kw = dict(fontsize=5.5, borderpad=0.3, labelspacing=0.2, handletextpad=0.3, handlelength=1.0, columnspacing=0.6)
-    leg1 = ax.legend(h[:n], l[:n], loc="upper left", ncol=2, **kw)
+    kw = dict(fontsize=5.3, borderpad=0.25, labelspacing=0.15, handletextpad=0.3, handlelength=1.0, columnspacing=0.5)
+    leg1 = ax.legend(h[:n], l[:n], loc="upper left", ncol=3, **kw)  # two rows each, side by side in the top band
     ax.add_artist(leg1)
     fig.canvas.draw()
     bb = leg1.get_window_extent().transformed(ax.transAxes.inverted())
-    ax.legend(h[n:], l[n:], loc="upper left", ncol=2, bbox_to_anchor=(bb.x1 + 0.02, 1.0), **kw)
+    ax.legend(h[n:], l[n:], loc="upper left", ncol=3, bbox_to_anchor=(bb.x1 + 0.015, 1.0), **kw)
     # braces under each batch, hugging the two columns, batch label beneath
     l0, l1 = (math.log2(v) for v in ax.get_xlim())
     sig = lambda z: 1 / (1 + np.exp(-z))  # noqa: E731
