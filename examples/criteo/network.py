@@ -143,7 +143,7 @@ def main():
     axes[0].legend(fontsize=7, frameon=False, loc="upper left")
     fig.tight_layout()
     os.makedirs(dirname(OUT_FIG), exist_ok=True)
-    fig.savefig(OUT_FIG, dpi=200)
+    fig.savefig(OUT_FIG, dpi=400)
 
     # ---- markdown
     git = os.popen(f"git -C {REPO} rev-parse --short HEAD").read().strip()

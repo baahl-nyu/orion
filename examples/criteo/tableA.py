@@ -124,7 +124,7 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         os.makedirs(dirname(fig_path), exist_ok=True)
-        fig, ax = plt.subplots(figsize=(4.2, 2.9), dpi=200)
+        fig, ax = plt.subplots(figsize=(4.2, 2.9), dpi=400)
         xs = [ours[t]["compression"] for t in THRESHOLDS if t in ours]
         ys = [ours[t]["selector"] for t in THRESHOLDS if t in ours]
         ax.plot(xs, ys, "o-", color="#2a78d6", label="HE-LRM (this work)")

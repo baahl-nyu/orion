@@ -135,7 +135,7 @@ def main():
     os.makedirs(FIG, exist_ok=True)
 
     # ---- memory_vs_batch: working set against batch, one panel per design
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), dpi=200, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), dpi=400, sharey=True)
     for ax, design in zip(axes, ("HE-LRM", "IVE")):
         for d, cfg in CONFIGS:
             if d != design:
@@ -162,7 +162,7 @@ def main():
     plt.close(fig)
 
     # ---- memory_vs_batch_one_panel: the same on one panel, blues against oranges
-    fig, ax = plt.subplots(figsize=(4.8, 3.4), dpi=200)
+    fig, ax = plt.subplots(figsize=(4.8, 3.4), dpi=400)
     blues, oranges = plt.colormaps["Blues"], plt.colormaps["Oranges"]
     hl = [c for c in CONFIGS if c[0] == "HE-LRM"]
     iv = [c for c in CONFIGS if c[0] == "IVE"]
@@ -197,7 +197,7 @@ def main():
     plt.close(fig)
 
     # ---- peak_qps_vs_compression: one line per card and design, from the card's own cells
-    fig, ax = plt.subplots(figsize=(4.6, 3.2), dpi=200)
+    fig, ax = plt.subplots(figsize=(4.6, 3.2), dpi=400)
     for (folder, _, cap), color in zip(cards, CARD_PAL):
         for design, ls, marker in (("HE-LRM", "-", "o"), ("IVE", "--", "s")):
             xs, ys = [], []
@@ -233,7 +233,7 @@ def main():
 
     # ---- peak_qps_bars: cards on x, HE-LRM against IVE at matched compression
     import numpy as np
-    fig, axes = plt.subplots(1, len(PAIRS), figsize=(2.6 * len(PAIRS), 2.5), dpi=200, sharey=True)
+    fig, axes = plt.subplots(1, len(PAIRS), figsize=(2.6 * len(PAIRS), 2.5), dpi=400, sharey=True)
     ticks = [f"{round(cap)}\n{SHORT[folder]}" for folder, _, cap in cards]
     xs = np.arange(len(cards))
     w = 0.38
