@@ -116,7 +116,7 @@ def main():
     def up(b, bw):
         return b * 8 / bw
 
-    # ---- figure: one column-width panel, thresholds down the side, a 100 Mbps bar over a 1 Gbps bar
+    # ---- figure: one column-width panel, a 100 Mbps bar over a 1 Gbps bar per threshold, named inside the axes
     # per threshold, each stacked dense upload + selector upload + forward. The x axis is linear to
     # 10 s and 10-20 s is compressed 3x so the 16.8 s bar fits without squeezing the sub-second ones.
     import matplotlib.pyplot as plt
@@ -124,9 +124,9 @@ def main():
     from figstyle import COL_W, FILL, apply, save
     apply()
     rows = [(t, helrm[t]) for t in THRESHOLDS if t in helrm]
-    c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[2]
-    fig, ax = plt.subplots(figsize=(COL_W, 2.4))
-    h, gap = 0.36, 0.04
+    c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[1]  # both uploads in one blue, the dense one hatched
+    fig, ax = plt.subplots(figsize=(COL_W, 2.0))
+    h, gap = 0.38, 0.03
     groups = np.arange(len(rows))[::-1] * 1.0  # smallest threshold at the top
     bar = dict(height=h, edgecolor="black", linewidth=0.5, zorder=2)
     K, KNEE = 1 / 3, 10.0
@@ -141,7 +141,7 @@ def main():
                 label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)" if lab else None, **bar)
         ax.barh(ys, sel, left=dn, color=c_sel, label="selector upload" if lab else None, **bar)
         ax.barh(ys, fwd, left=[a + b for a, b in zip(dn, sel)], color=c_fwd,
-                label="server forward" if lab else None, **bar)
+                label="inference compute cost" if lab else None, **bar)
         for y, a, b, c in zip(ys, dn, sel, fwd):
             tot = a + b + c
             if tot > KNEE:  # in the compressed region: label inside the bar's end
@@ -158,12 +158,16 @@ def main():
     ax.set_yticks(minor_y, minor=True)  # bandwidth on the left of each bar
     ax.set_yticklabels(minor_l, minor=True, fontsize=4.8)
     ax.tick_params(axis="y", which="minor", length=0, pad=1)
-    ax.set_yticks(groups)  # threshold and compression on the right of each pair
-    ax.set_yticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.5)
-    ax.tick_params(axis="y", which="major", length=0, pad=3, labelleft=False, labelright=True)
+    ax.set_yticks(groups)
+    ax.tick_params(axis="y", which="major", length=0, labelleft=False)
+    for g, (t, r) in zip(groups, rows):  # threshold and compression after the 1 Gbps total of each pair
+        y = g - (h + gap) / 2
+        tot = up(dense_bytes + r["bytes"], 1e9) + r["fwd"]
+        ax.annotate(f"t={t:,} ({fmt_compression(r['comp'])}$\\times$)", (tot + 0.12, y), xytext=(24, 0),
+                    textcoords="offset points", fontsize=5.3, color="0.25", ha="left", va="center", zorder=4)
     ax.grid(axis="y", visible=False)
     ax.set_xlabel("Live-query latency (s)")
-    ax.set_ylim(-0.6, len(rows) - 0.4)
+    ax.set_ylim(-0.55, len(rows) - 0.45)
     ax.legend(loc="upper right", fontsize=5.5, handlelength=1.3, borderpad=0.3, handletextpad=0.4, labelspacing=0.25)
     fig.tight_layout()
     os.makedirs(dirname(OUT_FIG), exist_ok=True)
