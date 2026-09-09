@@ -3,19 +3,20 @@
 
     python gpu_ceilings.py [--results DIR]
 
-Four figures under figures/, from the cells under --results (default
+Three figures under figures/, from the cells under --results (default
 ~/cheddar-orion-results/final), all Cheddar word32, bins off, managed memory
 off, 1 warmup + 3 timed forwards. The cards are the ones in max_qps.py's
 CARDS, each with a folder of cells run on that card.
 
-  memory_vs_batch.png            working set of a batch against batch size, one
-                                 panel per design, from the RTX PRO 6000 climb
-                                 (`ladder/`, ladder.py) including the first
-                                 paged batch; the capacity of each GPU is a
-                                 horizontal line. The working set does not
-                                 depend on the card (max_qps.py checks this),
-                                 so one climb gives every card's ceiling.
-  memory_vs_batch_one_panel.png  the same on one panel.
+  memory_vs_batch.png            working set of a batch against batch size, both
+                                 designs on one panel (HE-LRM circles just left
+                                 of each batch, IVE squares just right), from the
+                                 RTX PRO 6000 climb (`ladder/`, ladder.py)
+                                 including the first paged batch; the capacity
+                                 of each GPU is a horizontal line. The working
+                                 set does not depend on the card (max_qps.py
+                                 checks this), so one climb gives every card's
+                                 ceiling.
   peak_qps_vs_compression.png    peak throughput against compression, one line
                                  per GPU and design, from that GPU's own cells:
                                  the largest batch that ran there without OOM,
@@ -44,9 +45,10 @@ for _p in (REPO, HERE):
         sys.path.insert(0, _p)
 
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
-from figstyle import COL_W, FILL, GREY, LINE, RED, apply, ref_line, save, series  # noqa: E402
+from figstyle import COL_W, FILL, GREY, LINE, RED, apply, save, series  # noqa: E402
 from ladder import CONFIGS, IVE_COMPRESSION, row_from, tag  # noqa: E402
 from max_qps import CARDS, load_cells  # noqa: E402
 from table2 import fmt_compression  # noqa: E402
@@ -109,14 +111,6 @@ def main():
     def mem(row):
         return row["live"] if row["live"] else row["peak"]
 
-    def cap_label(ax, name, gib, dy):
-        # small cards labelled at the right, where the climbs have left them behind;
-        # large cards at the left, where batch 1 sits far below them
-        if gib < 60:
-            ax.text(34, gib + dy, name, fontsize=5.5, va="bottom", ha="right")
-        else:
-            ax.text(0.95, gib + dy, name, fontsize=5.5, va="bottom", ha="left")
-
     cards = sorted(CARDS, key=lambda c: c[2])  # by capacity
     caps = [(f"{round(cap)} GiB ({SHORT[folder]})", cap) for folder, _, cap in cards]
     results = climb(join(args.results, "ladder"))
@@ -129,49 +123,76 @@ def main():
 
     apply()
 
-    def mem_lines(ax, design, ls="-", marker="o"):
+    # ---- memory_vs_batch: working set against batch, both designs on one column-width panel.
+    # Markers only: HE-LRM circles just left of each batch, IVE squares just right, a brace under
+    # each pair carrying the batch label. y is linear to 50 GiB, 2x compressed to 100 GiB so the
+    # 80 and 96 GiB lines stay apart, 3x above; the top band holds the legends.
+    import math
+    from matplotlib.ticker import FixedLocator, NullFormatter
+
+    def short_t(t):
+        return f"{t:,}" if t < 1000 else (f"{t // 1000}k" if t < 1_000_000 else f"{t // 1_000_000}M")
+
+    fig, ax = plt.subplots(figsize=(COL_W, 2.3))
+    DODGE = 0.09  # log2 units either side of the batch
+    for design, marker, sign in (("HE-LRM", "o", -1), ("IVE", "s", 1)):
         for i, (d, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
             rows, paged = results[(d, cfg)]
-            xs, ys = [r["batch"] for r in rows], [mem(r) for r in rows]
+            xs, ys = [r["batch"] * 2 ** (sign * DODGE) for r in rows], [mem(r) for r in rows]
             if paged:
-                xs.append(paged["batch"])
+                xs.append(paged["batch"] * 2 ** (sign * DODGE))
                 ys.append(mem(paged))
-            series(ax, xs, ys, i, label=label(d, cfg), marker=marker, ls=ls)
+            ax.plot(xs, ys, marker, mfc=FILL[i], mec="black", ls="none", ms=4, zorder=3,
+                    label=f"t={short_t(cfg)}" if d == "HE-LRM" else f"p={cfg}")
+    for folder, _, gib in cards:  # capacity lines: 96 a bit over its line and 80 under it at the left, 40 and 24 at the right
+        ax.axhline(gib, color=RED, lw=1.1, ls="--", zorder=1.6)
+        left = gib >= 60
+        below = 60 <= gib < 90
+        ax.text(0.015 if left else 0.985, gib + (-3.5 if below else 3.0 if gib >= 90 else 1.5),
+                f"{round(gib)} GiB ({SHORT[folder]})", fontsize=5.3, color=RED, fontweight="bold",
+                va="top" if below else "bottom", ha="left" if left else "right",
+                transform=ax.get_yaxis_transform(), zorder=4)
+    K1, K2, A, B = 1 / 2, 1 / 3, 50.0, 100.0
 
-    def cap_lines(ax):
-        for name, gib in caps:
-            ref_line(ax, gib, name, left=gib >= 60, dy=2.5)
+    def fw(y):
+        y = np.asarray(y, dtype=float)
+        return np.where(y <= A, y, np.where(y <= B, A + (y - A) * K1, A + (B - A) * K1 + (y - B) * K2))
 
-    # ---- memory_vs_batch: working set against batch, one panel per design, stacked
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.0), sharey=True)
-    for ax, design in zip(axes, ("HE-LRM", "IVE")):
-        mem_lines(ax, design)
-        cap_lines(ax)
-        ax.set_xscale("log", base=2)
-        ax.set_ylim(0, 235)  # the top band holds the legend, above the paged points
-        ax.set_xlabel("Batch size")
-        ax.legend(loc="upper left", ncol=2, title=design, fontsize=6.5)
-    axes[0].set_ylabel("Working set (GiB)")
-    fig.tight_layout(w_pad=0.8)
-    save(fig, "memory_vs_batch")
-    plt.close(fig)
+    def iv(u):
+        u = np.asarray(u, dtype=float)
+        ub = A + (B - A) * K1
+        return np.where(u <= A, u, np.where(u <= ub, A + (u - A) / K1, B + (u - ub) / K2))
 
-    # ---- memory_vs_batch_one_panel: both designs on one panel, HE-LRM solid circles, IVE dashed squares
-    fig, ax = plt.subplots(figsize=(COL_W, 3.2))
-    mem_lines(ax, "HE-LRM")
-    mem_lines(ax, "IVE", ls="--", marker="o")
-    cap_lines(ax)
+    ax.set_yscale("function", functions=(fw, iv))
+    ax.set_ylim(10, 200)
+    ax.yaxis.set_major_locator(FixedLocator([10, 20, 30, 40, 50, 100, 200]))
     ax.set_xscale("log", base=2)
-    ax.set_ylim(0, 275)
-    ax.set_xlabel("Batch size")
+    ax.xaxis.set_major_locator(FixedLocator(list(BATCHES)))
+    ax.xaxis.set_major_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="both", length=0)
     ax.set_ylabel("Working set (GiB)")
+    ax.set_xlabel("Batch size", labelpad=19)
     h, l = ax.get_legend_handles_labels()
     n = len([c for c in CONFIGS if c[0] == "HE-LRM"])
-    leg1 = ax.legend(h[:n], l[:n], title="HE-LRM", loc="upper left", fontsize=6, title_fontsize=6.5)
+    kw = dict(fontsize=5.5, borderpad=0.3, labelspacing=0.2, handletextpad=0.3, handlelength=1.0, columnspacing=0.6)
+    leg1 = ax.legend(h[:n], l[:n], loc="upper left", ncol=2, **kw)
     ax.add_artist(leg1)
-    ax.legend(h[n:], l[n:], title="IVE", loc="upper right", fontsize=6, title_fontsize=6.5)
+    fig.canvas.draw()
+    bb = leg1.get_window_extent().transformed(ax.transAxes.inverted())
+    ax.legend(h[n:], l[n:], loc="upper left", ncol=2, bbox_to_anchor=(bb.x1 + 0.02, 1.0), **kw)
+    # braces under each batch, hugging the two columns, batch label beneath
+    l0, l1 = (math.log2(v) for v in ax.get_xlim())
+    sig = lambda z: 1 / (1 + np.exp(-z))  # noqa: E731
+    for b in BATCHES:
+        fa, fb = (((math.log2(b) + e * 0.17) - l0) / (l1 - l0) for e in (-1, 1))
+        u = np.linspace(0, 1, 301)
+        half = 0.5 * (1 - sig(90 * (u - 0.06))) + 0.5 * (1 - sig(90 * (u - 0.44)))
+        y = np.where(u <= 0.5, half, half[::-1])  # arms at the ends, cusp in the middle
+        ax.plot(fa + (fb - fa) * u, -0.06 + 0.045 * y, color="0.2", lw=0.6, transform=ax.transAxes, clip_on=False, zorder=5)
+        ax.text((math.log2(b) - l0) / (l1 - l0), -0.09, f"$2^{{{int(math.log2(b))}}}$", ha="center", va="top",
+                fontsize=7.5, transform=ax.transAxes)
     fig.tight_layout()
-    save(fig, "memory_vs_batch_one_panel")
+    save(fig, "memory_vs_batch")
     plt.close(fig)
 
     # ---- peak_qps_vs_compression: one line per card and design, from the card's own cells.
@@ -217,7 +238,6 @@ def main():
     plt.close(fig)
 
     # ---- peak_qps_bars: cards on x, HE-LRM against IVE at matched compression, one row (two-column width)
-    import numpy as np
     fig, axes = plt.subplots(1, len(PAIRS), figsize=(7.0, 2.4), sharey=True)
     ticks = [f"{round(cap)}\n{SHORT[folder].replace('RTX PRO 6000', 'PRO 6000')}" for folder, _, cap in cards]
     xs = np.arange(len(cards))
@@ -251,7 +271,7 @@ def main():
     save(fig, "peak_qps_bars")
     plt.close(fig)
     print("wrote " + ", ".join(join(FIG, f) for f in (
-        "memory_vs_batch.png", "memory_vs_batch_one_panel.png", "peak_qps_vs_compression.png", "peak_qps_bars.png")))
+        "memory_vs_batch.png", "peak_qps_vs_compression.png", "peak_qps_bars.png")))
 
 
 if __name__ == "__main__":
