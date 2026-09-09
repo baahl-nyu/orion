@@ -2,8 +2,9 @@
 """Batch ladder: forward latency, throughput and peak memory against batch
 size for HE-LRM (five thresholds) and IVE (six compressions), the largest
 batch that fits in device memory, and the first batch past it run with
-paging. Figures B (latency against batch) and C (peak QPS against
-compression) come from this run.
+paging. Figure B (latency against batch) comes from this run; the memory
+and peak-throughput figures are drawn by gpu_ceilings.py from these cells
+and the other cards' folders.
 
     python ladder.py [--results DIR]
 
@@ -13,7 +14,7 @@ forwards) until a cell dies with CUDA out of memory; that batch is then
 run once more with MANAGED_MEMORY=1 (CUDA unified memory, so the excess
 pages to host RAM). Cells whose log exists are not re-run, so the script
 resumes. Writes the "ladder" section of PAPER_NUMBERS.md and
-figures/latency_vs_batch.png, figures/peak_qps_vs_compression.png.
+figures/latency_vs_batch.png.
 
 HE-LRM: Cheddar word32, sliced packing, seeded upload,
 uploaded at the level compile assigns the sparse layer at that batch.
@@ -149,7 +150,7 @@ def main():
         return f"{x:.1f}" if x is not None else "--"
 
     lines = [
-        "## Batch ladder: latency, throughput and memory against batch size (Figures B and C)", "",
+        "## Batch ladder: latency, throughput and memory against batch size (Figure B)", "",
         f"Regenerated {date.today().isoformat()} at commit {git} by `ladder.py`. Cheddar word32, "
         "sliced packing, 1 warmup + 3 timed forwards (`fwd` is the mean, `trials` the three "
         "values). HE-LRM: seeded upload, "
@@ -183,7 +184,7 @@ def main():
                 f"{row['batch']} | {'yes' if row['mm'] else ''} | {row['fwd']:.4f} | {tr} | "
                 f"{row['qps']:.2f} | {gib(row['live'])} | {gib(row['peak'])} | {row['keys']:.1f} | "
                 f"{row['cts']} | {row['level']} | -- |")
-    lines += ["", "### Largest batch that fits, and peak throughput (Figure C)", "",
+    lines += ["", "### Largest batch that fits, and peak throughput on the RTX PRO 6000", "",
               "| design | config | compression | largest batch | fwd at it (s) | QPS at it | "
               "working set at it (GiB) | first OOM batch | paged fwd (s) | paged trials (s) | paged QPS | "
               "paged working set (GiB) | best batch | best QPS |",
@@ -213,8 +214,6 @@ def main():
         FIGS = {
             "latency_vs_batch": ("fwd", "Forward latency (s)", True,
                                  "Hollow marker: first batch past the memory ceiling, run with paging"),
-            "memory_vs_batch": ("peak", "Peak GPU memory (GiB)", False,
-                                "Hollow marker: first batch past the ceiling, run with paging"),
         }
 
         def panel(ax, design, key, logy, ylabel):
@@ -244,78 +243,18 @@ def main():
             ax.grid(alpha=0.3, which="both")
             ax.legend(fontsize=6, frameon=False, loc="lower right" if key == "peak" else "upper left")
 
-        # Figures A (memory) and B (latency): the two-panel PNG, and each panel
-        # on its own for subfigure (a)/(b) with the same y-limits.
+        # Figure B (latency): the two-panel PNG.
         for name, (key, ylabel, logy, note) in FIGS.items():
             fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), dpi=200, sharey=True)
             for ax, design in zip(axes, ("HE-LRM", "IVE")):
                 panel(ax, design, key, logy, ylabel if ax is axes[0] else None)
                 ax.set_title(design, fontsize=9)
-            ylim = axes[0].get_ylim()
             fig.tight_layout()  # the hollow-marker meaning goes in the caption, not on the plot
             fig.savefig(join(HERE, "figures", f"{name}.png"))
             plt.close(fig)
-            for design, suffix in (("HE-LRM", "helrm"), ("IVE", "ive")):
-                fig, ax = plt.subplots(figsize=(3.6, 2.9), dpi=200)
-                panel(ax, design, key, logy, ylabel)
-                ax.set_ylim(ylim)
-                fig.tight_layout()
-                fig.savefig(join(HERE, "figures", f"{name}_{suffix}.png"))
-                plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(4.2, 2.9), dpi=200)
-        for design, color, marker in (("HE-LRM", "#2a78d6", "o"), ("IVE", "#eb6834", "s")):
-            pts = [(compression(design, cfg), max(results[(design, cfg)]["rows"], key=lambda x: x["qps"]))
-                   for d_, cfg in CONFIGS if d_ == design and results[(design, cfg)]["rows"]]
-            pts.sort()
-            ax.plot([x for x, _ in pts], [b["qps"] for _, b in pts], marker + "-", color=color,
-                    label=design + (" (this work)" if design == "HE-LRM" else ""))
-            for (x, b), (d_, cfg) in zip(pts, [(d_, cfg) for d_, cfg in sorted(
-                    [(d_, cfg) for d_, cfg in CONFIGS if d_ == design and results[(d_, cfg)]["rows"]],
-                    key=lambda dc: compression(*dc))]):
-                # HE-LRM labels sit below-left of their point, IVE above-right,
-                # so the two curves' labels never share a spot where they cross
-                # placed by hand for the log-log axes; below-right = (4, -9)/"left" etc.
-                place = {("HE-LRM", 5000000): ((4, -9), "left"), ("HE-LRM", 500000): ((-4, 4), "right"),
-                         ("HE-LRM", 50000): ((-4, 4), "right"), ("HE-LRM", 5000): ((-4, -9), "right"),
-                         ("HE-LRM", 500): ((4, -9), "left"),
-                         ("IVE", 1024): ((4, -9), "left"), ("IVE", 512): ((4, -9), "left"),
-                         ("IVE", 256): ((-4, 5), "right"), ("IVE", 128): ((4, -9), "left"),
-                         ("IVE", 64): ((4, 4), "left"), ("IVE", 32): ((4, 5), "left")}
-                off, ha = place[(design, cfg)]
-                ax.annotate(f"{label(d_, cfg)}, b={b['batch']}", (x, b["qps"]),
-                            textcoords="offset points", xytext=off, ha=ha, fontsize=5)
-            # the first batch past the ceiling, run with paging: its QPS as a cross
-            paged = [(compression(design, cfg), results[(design, cfg)]["paged"])
-                     for d_, cfg in CONFIGS if d_ == design and results[(design, cfg)]["paged"]]
-            if paged:
-                ax.plot([x for x, _ in paged], [r["qps"] for _, r in paged], "x", color=color,
-                        ms=5, mew=1.2, ls="none")
-                for (x, r), (d_, cfg) in zip(paged, [(d_, cfg) for d_, cfg in CONFIGS
-                                                      if d_ == design and results[(d_, cfg)]["paged"]]):
-                    if design == "HE-LRM":
-                        off, ha = (0, 5), "center"
-                    else:  # the three IVE b=16 crosses sit close: spread their labels
-                        off, ha = {256: ((-5, -9), "right"), 128: ((5, -9), "left"), 64: ((5, -9), "left")}.get(cfg, ((0, -9), "center"))
-                    ax.annotate(f"b={r['batch']}", (x, r["qps"]), textcoords="offset points",
-                                xytext=off, ha=ha, fontsize=4.5, color=color)
-        from matplotlib.lines import Line2D
-        handles, labels_ = ax.get_legend_handles_labels()
-        handles.append(Line2D([], [], marker="x", color="gray", ls="none", ms=5, mew=1.2))
-        labels_.append("first batch past the ceiling, paged")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlim(7, 1.5e5)
-        ax.set_ylim(0.3, 120)
-        ax.set_xlabel("Embedding compression ratio")
-        ax.set_ylabel("Peak throughput (queries/s)")
-        ax.legend(handles, labels_, loc="upper left", fontsize=6, frameon=False)
-        ax.grid(alpha=0.3, which="both")
-        fig.tight_layout()
-        fig.savefig(join(HERE, "figures", "peak_qps_vs_compression.png"))
-        lines += ["", "Figures: `figures/memory_vs_batch.png` (A), `figures/latency_vs_batch.png` (B), "
-                  "`figures/peak_qps_vs_compression.png` (C); A and B also as one panel per design, "
-                  "`*_helrm.png` (a) and `*_ive.png` (b), same y-limits as the pair."]
+        lines += ["", "Figure: `figures/latency_vs_batch.png` (B). The memory-against-batch figure with the "
+                  "cards' capacities and the peak-throughput figures are drawn by `gpu_ceilings.py` from these "
+                  "cells and the other cards' folders (see `max_qps.md`)."]
     except Exception as exc:
         problems.append(f"figures not written: {exc}")
 
