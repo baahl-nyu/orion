@@ -8,7 +8,7 @@ paper's column width so the fonts print at the size they are set here.
     apply()
     fig, ax = plt.subplots(figsize=(COL_W, 2.6))
     ...
-    save(fig, "name")      # figures/name.png at 600 dpi and figures/name.pdf
+    save(fig, "name")      # figures/name.png at 1200 dpi and figures/name.pdf
 """
 import os
 from os.path import abspath, dirname, join
@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 
 FIG_DIR = join(dirname(abspath(__file__)), "figures")
 COL_W = 3.33  # \columnwidth of the two-column layout, inches
-DPI = 600
+DPI = 1200  # a column-width figure is 4000 px wide
 
 # series palette: pastel fill for the marker, a darker shade of the same hue for the line
 # hues: olive green, blue, orange, purple, teal, brown; none near the red of the reference lines

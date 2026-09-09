@@ -211,7 +211,7 @@ def main():
         from figstyle import COL_W, GREY, LINE, apply, save, series
         apply()
         # Figure B (latency): one panel per design, stacked at column width.
-        fig, axes = plt.subplots(2, 1, figsize=(COL_W, 4.4), sharex=True)
+        fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.9), sharey=True)
         for ax, design in zip(axes, ("HE-LRM", "IVE")):
             for i, (design_, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
                 r = results[(design, cfg)]
@@ -225,10 +225,10 @@ def main():
             ax.set_xscale("log", base=2)
             ax.set_yscale("log")
             ax.set_ylim(0.1, 600)  # the top decade holds the legend, above the paged points
-            ax.set_ylabel("Forward latency (s)")
-            ax.legend(loc="upper left", ncol=2, title=design, fontsize=6.5)
-        axes[1].set_xlabel("Batch size")
-        fig.tight_layout(h_pad=0.5)
+            ax.set_xlabel("Batch size")
+            ax.legend(loc="upper left", ncol=3, title=design, fontsize=6.5)
+        axes[0].set_ylabel("Forward latency (s)")
+        fig.tight_layout(w_pad=0.8)
         save(fig, "latency_vs_batch")
         plt.close(fig)
         lines += ["", "Figure: `figures/latency_vs_batch.png` (B). The memory-against-batch figure with the "
