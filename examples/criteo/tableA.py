@@ -123,7 +123,7 @@ def main():
         import matplotlib.pyplot as plt
         from figstyle import COL_W, apply, save, series
         apply()
-        fig, ax = plt.subplots(figsize=(COL_W, 2.7))
+        fig, ax = plt.subplots(figsize=(COL_W, 2.4))
         ts = [t for t in THRESHOLDS if t in ours]
         xs, ys = [ours[t]["compression"] for t in ts], [ours[t]["selector"] for t in ts]
         series(ax, xs, ys, 1, label="HE-LRM (this work)", marker="o")
@@ -135,10 +135,18 @@ def main():
         series(ax, xs, ys, 0, label="IVE", marker="o")
         for p, x, y in zip(ps, xs, ys):
             ax.annotate(f"p={p}", (x, y), textcoords="offset points",
-                        xytext=(0, -12) if p == 32 else (7, 4), fontsize=6, ha="center" if p == 32 else "left")
+                        xytext=(0, -12) if p == 32 else (8, -8) if p == 1024 else (7, 4), fontsize=6,
+                        ha="center" if p == 32 else "left")
         ax.set_xscale("log")
-        ax.set_ylim(-18, 185)
-        ax.set_yticks(range(0, 176, 25))
+        # y linear to 60 ms, then compressed 3x so the two slow IVE points (84, 165 ms) fit
+        # without flattening the sub-60 ms region where the designs are compared
+        import numpy as np
+        K, KNEE = 1 / 3, 60.0
+        fw = lambda y: np.where(y <= KNEE, y, KNEE + (y - KNEE) * K)  # noqa: E731
+        iv = lambda u: np.where(u <= KNEE, u, KNEE + (u - KNEE) / K)  # noqa: E731
+        ax.set_yscale("function", functions=(fw, iv))
+        ax.set_ylim(-13, 178)
+        ax.set_yticks([0, 10, 20, 30, 40, 50, 60, 175])
         ax.set_xlabel("Embedding compression ratio")
         ax.set_ylabel("Selector time (ms)")
         ax.legend(loc="upper left")
@@ -146,7 +154,7 @@ def main():
         save(fig, "selector_cost_vs_compression")
         plt.close(fig)
         lines += ["", f"Figure: `figures/selector_cost_vs_compression.png` (selector total against "
-                  "compression, both designs, batch 1)."]
+                  "compression, both designs, batch 1; y axis linear to 60 ms and compressed 3x above)."]
     except Exception as exc:  # the table is the deliverable; the figure is best effort
         problems.append(f"figure not written: {exc}")
 
