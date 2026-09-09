@@ -212,7 +212,7 @@ def main():
         apply()
         # Figure B (latency): HE-LRM at every threshold on one column-width panel; the IVE
         # ladders are in the table above. The legend sits over batches 1-4, under the paged points.
-        fig, ax = plt.subplots(figsize=(COL_W, 2.3))
+        fig, ax = plt.subplots(figsize=(COL_W, 2.0))
         for i, (design, cfg) in enumerate([c for c in CONFIGS if c[0] == "HE-LRM"]):
             r = results[(design, cfg)]
             xs = [row["batch"] for row in r["rows"]]
@@ -224,7 +224,7 @@ def main():
                 ax.plot([pb], [pv], "o", mfc="white", mec=LINE[i], mew=1.2, ls="none", zorder=3)
         ax.set_xscale("log", base=2)
         ax.set_yscale("log")
-        ax.set_ylim(0.1, 100)
+        ax.set_ylim(0.1, 40)
         ax.set_xlabel("Batch size")
         ax.set_ylabel("Forward latency (s)")
         ax.legend(loc="upper left", fontsize=6, borderpad=0.3, labelspacing=0.2, handletextpad=0.3)
