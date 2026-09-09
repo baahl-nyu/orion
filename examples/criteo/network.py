@@ -14,8 +14,8 @@ is measured once here (encrypt at the compiled input level, seeded) into
 `network/dense_ct.json` under --results, and reused afterwards.
 
 Writes examples/criteo/network.md (whole file) and
-figures/network_latency.png: per threshold, one bar per bandwidth (100 Mbps,
-1 Gbps) stacking upload time (dense, selector) and the RTX PRO 6000 forward.
+figures/network_latency.png: per threshold, the live-query latency at 100 Mbps
+and 1 Gbps as upload time (dense, selector) plus the RTX PRO 6000 forward.
 Upload time is bytes * 8 / bandwidth; nothing else is modelled.
 """
 import argparse
@@ -114,47 +114,33 @@ def main():
     def up(b, bw):
         return b * 8 / bw
 
-    # ---- figure: one panel, both bandwidths side by side per threshold, log y so 0.2 s and 17 s both read
+    # ---- figure: one panel per bandwidth, side by side at two-column width
     import matplotlib.pyplot as plt
-    import numpy as np
     from figstyle import COL_W, FILL, apply, save
     apply()
     rows = [(t, helrm[t]) for t in THRESHOLDS if t in helrm]
     c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[2]
-    fig, ax = plt.subplots(figsize=(COL_W, 2.9))
-    nb, w = len(BANDWIDTHS), 0.36
-    groups = np.arange(len(rows))
-    floor = 0.01
-    bar = dict(width=w, edgecolor="black", linewidth=0.7, zorder=2)
-    minor_x, minor_l = [], []
-    for k, (bw, name) in enumerate(BANDWIDTHS):
-        xs = groups + (k - (nb - 1) / 2) * (w + 0.04)
+    fig, axes = plt.subplots(1, len(BANDWIDTHS), figsize=(7.0, 2.8))
+    for ax, (bw, name) in zip(axes, BANDWIDTHS):
+        xs = list(range(len(rows)))
         dn = [up(dense_bytes, bw) for _ in rows]
         sel = [up(r["bytes"], bw) for _, r in rows]
         fwd = [r["fwd"] for _, r in rows]
-        lab = k == 0
-        ax.bar(xs, dn, bottom=floor, color=c_dense, hatch="///",
-               label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)" if lab else None, **bar)
-        ax.bar(xs, sel, bottom=[floor + a for a in dn], color=c_sel, label="selector upload" if lab else None, **bar)
-        ax.bar(xs, fwd, bottom=[floor + a + b for a, b in zip(dn, sel)], color=c_fwd,
-               label="server forward" if lab else None, **bar)
-        for x, a, b, c in zip(xs, dn, sel, fwd):
-            tot = a + b + c
-            ax.text(x, floor + tot, f"{tot:.2f}", ha="center", va="bottom", fontsize=5.5)
-        minor_x += list(xs)
-        minor_l += [name.replace(" Mbps", "M").replace(" Gbps", "G")] * len(xs)
-    ax.set_yscale("log")
-    ax.set_ylim(floor, 60)
-    ax.set_xticks(minor_x, minor=True)
-    ax.set_xticklabels(minor_l, minor=True, fontsize=5.5)
-    ax.tick_params(axis="x", which="minor", length=0)
-    ax.set_xticks(groups)
-    ax.set_xticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.5)
-    ax.tick_params(axis="x", which="major", pad=11, length=0)
-    ax.set_ylabel("Live-query latency (s)")
-    ax.grid(axis="x", visible=False)
-    ax.legend(loc="upper left", fontsize=6.5)
-    fig.tight_layout()
+        bar = dict(width=0.62, edgecolor="black", linewidth=0.7, zorder=2)
+        ax.bar(xs, dn, color=c_dense, hatch="///", label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)", **bar)
+        ax.bar(xs, sel, bottom=dn, color=c_sel, label="selector upload", **bar)
+        ax.bar(xs, fwd, bottom=[a + b for a, b in zip(dn, sel)], color=c_fwd, label="server forward", **bar)
+        tot = [a + b + c for a, b, c in zip(dn, sel, fwd)]
+        for x, v in zip(xs, tot):
+            ax.text(x, v, f"{v:.2f} s", ha="center", va="bottom", fontsize=6.5)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=6.5)
+        ax.set_title(name)
+        ax.set_ylim(0, max(tot) * 1.18)
+        ax.grid(axis="x", visible=False)
+    axes[0].set_ylabel("Live-query latency (s)")
+    axes[0].legend(loc="upper left", fontsize=6.5)
+    fig.tight_layout(w_pad=1.0)
     os.makedirs(dirname(OUT_FIG), exist_ok=True)
     save(fig, "network_latency")
     plt.close(fig)
