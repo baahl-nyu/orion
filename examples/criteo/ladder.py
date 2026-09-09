@@ -245,7 +245,7 @@ def main():
 
         # Figure B (latency): the two-panel PNG.
         for name, (key, ylabel, logy, note) in FIGS.items():
-            fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), dpi=200, sharey=True)
+            fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), dpi=400, sharey=True)
             for ax, design in zip(axes, ("HE-LRM", "IVE")):
                 panel(ax, design, key, logy, ylabel if ax is axes[0] else None)
                 ax.set_title(design, fontsize=9)
