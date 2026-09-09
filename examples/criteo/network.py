@@ -124,7 +124,7 @@ def main():
     from figstyle import COL_W, FILL, apply, save
     apply()
     rows = [(t, helrm[t]) for t in THRESHOLDS if t in helrm]
-    c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[1]  # both uploads in one blue, the dense one hatched
+    c_fwd, c_dense, c_sel = FILL[2], FILL[4], FILL[4]  # both uploads in teal, the dense one hatched; compute in orange
     fig, ax = plt.subplots(figsize=(COL_W, 2.0))
     h, gap = 0.38, 0.03
     groups = np.arange(len(rows))[::-1] * 1.0  # smallest threshold at the top
