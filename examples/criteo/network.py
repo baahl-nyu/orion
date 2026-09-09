@@ -155,12 +155,12 @@ def main():
     ax.set_xscale("function", functions=(fw, iv))
     ax.set_xlim(0, 20.0)
     ax.set_xticks([0, 2, 4, 6, 8, 10, 20])
-    ax.set_yticks(groups)
-    ax.set_yticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.5)
-    ax.set_yticks(minor_y, minor=True)
+    ax.set_yticks(minor_y, minor=True)  # bandwidth on the left of each bar
     ax.set_yticklabels(minor_l, minor=True, fontsize=4.8)
     ax.tick_params(axis="y", which="minor", length=0, pad=1)
-    ax.tick_params(axis="y", which="major", length=0, pad=34)
+    ax.set_yticks(groups)  # threshold and compression on the right of each pair
+    ax.set_yticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.5)
+    ax.tick_params(axis="y", which="major", length=0, pad=3, labelleft=False, labelright=True)
     ax.grid(axis="y", visible=False)
     ax.set_xlabel("Live-query latency (s)")
     ax.set_ylim(-0.6, len(rows) - 0.4)
