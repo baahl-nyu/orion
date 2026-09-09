@@ -14,9 +14,11 @@ is measured once here (encrypt at the compiled input level, seeded) into
 `network/dense_ct.json` under --results, and reused afterwards.
 
 Writes examples/criteo/network.md (whole file) and
-figures/network_latency.png: per threshold, the live-query latency at 100 Mbps
-and 1 Gbps as upload time (dense, selector) plus the RTX PRO 6000 forward.
-Upload time is bytes * 8 / bandwidth; nothing else is modelled.
+figures/network_latency.png (and .pdf): per threshold, a 100 Mbps bar over a
+1 Gbps bar of live-query latency, stacked as upload time (dense, selector)
+plus the RTX PRO 6000 forward; the x axis is linear to 10 s and compressed
+3x from 10 to 20 s. Upload time is bytes * 8 / bandwidth; nothing else is
+modelled.
 """
 import argparse
 import json
@@ -114,33 +116,56 @@ def main():
     def up(b, bw):
         return b * 8 / bw
 
-    # ---- figure: one panel per bandwidth, side by side at two-column width
+    # ---- figure: one column-width panel, thresholds down the side, a 100 Mbps bar over a 1 Gbps bar
+    # per threshold, each stacked dense upload + selector upload + forward. The x axis is linear to
+    # 10 s and 10-20 s is compressed 3x so the 16.8 s bar fits without squeezing the sub-second ones.
     import matplotlib.pyplot as plt
+    import numpy as np
     from figstyle import COL_W, FILL, apply, save
     apply()
     rows = [(t, helrm[t]) for t in THRESHOLDS if t in helrm]
     c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[2]
-    fig, axes = plt.subplots(1, len(BANDWIDTHS), figsize=(7.0, 2.8))
-    for ax, (bw, name) in zip(axes, BANDWIDTHS):
-        xs = list(range(len(rows)))
+    fig, ax = plt.subplots(figsize=(COL_W, 2.4))
+    h, gap = 0.36, 0.04
+    groups = np.arange(len(rows))[::-1] * 1.0  # smallest threshold at the top
+    bar = dict(height=h, edgecolor="black", linewidth=0.5, zorder=2)
+    K, KNEE = 1 / 3, 10.0
+    minor_y, minor_l = [], []
+    for k, (bw, name) in enumerate(BANDWIDTHS):
+        ys = groups + ((1 - k) - 0.5) * (h + gap)  # 100 Mbps above 1 Gbps
         dn = [up(dense_bytes, bw) for _ in rows]
         sel = [up(r["bytes"], bw) for _, r in rows]
         fwd = [r["fwd"] for _, r in rows]
-        bar = dict(width=0.62, edgecolor="black", linewidth=0.7, zorder=2)
-        ax.bar(xs, dn, color=c_dense, hatch="///", label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)", **bar)
-        ax.bar(xs, sel, bottom=dn, color=c_sel, label="selector upload", **bar)
-        ax.bar(xs, fwd, bottom=[a + b for a, b in zip(dn, sel)], color=c_fwd, label="server forward", **bar)
-        tot = [a + b + c for a, b, c in zip(dn, sel, fwd)]
-        for x, v in zip(xs, tot):
-            ax.text(x, v, f"{v:.2f} s", ha="center", va="bottom", fontsize=6.5)
-        ax.set_xticks(xs)
-        ax.set_xticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=6.5)
-        ax.set_title(name)
-        ax.set_ylim(0, max(tot) * 1.18)
-        ax.grid(axis="x", visible=False)
-    axes[0].set_ylabel("Live-query latency (s)")
-    axes[0].legend(loc="upper left", fontsize=6.5)
-    fig.tight_layout(w_pad=1.0)
+        lab = k == 0
+        ax.barh(ys, dn, color=c_dense, hatch="///",
+                label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)" if lab else None, **bar)
+        ax.barh(ys, sel, left=dn, color=c_sel, label="selector upload" if lab else None, **bar)
+        ax.barh(ys, fwd, left=[a + b for a, b in zip(dn, sel)], color=c_fwd,
+                label="server forward" if lab else None, **bar)
+        for y, a, b, c in zip(ys, dn, sel, fwd):
+            tot = a + b + c
+            if tot > KNEE:  # in the compressed region: label inside the bar's end
+                ax.text(tot - 0.5, y, f"{tot:.2f} s", va="center", ha="right", fontsize=5.8)
+            else:
+                ax.text(tot + 0.12, y, f"{tot:.2f} s", va="center", ha="left", fontsize=5.8)
+        minor_y += list(ys)
+        minor_l += [name] * len(ys)
+    fw = lambda x: np.where(x <= KNEE, x, KNEE + (x - KNEE) * K)  # noqa: E731
+    iv = lambda y: np.where(y <= KNEE, y, KNEE + (y - KNEE) / K)  # noqa: E731
+    ax.set_xscale("function", functions=(fw, iv))
+    ax.set_xlim(0, 20.0)
+    ax.set_xticks([0, 2, 4, 6, 8, 10, 20])
+    ax.set_yticks(groups)
+    ax.set_yticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.5)
+    ax.set_yticks(minor_y, minor=True)
+    ax.set_yticklabels(minor_l, minor=True, fontsize=4.8)
+    ax.tick_params(axis="y", which="minor", length=0, pad=1)
+    ax.tick_params(axis="y", which="major", length=0, pad=34)
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("Live-query latency (s)")
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    ax.legend(loc="upper right", fontsize=5.5, handlelength=1.3, borderpad=0.3, handletextpad=0.4, labelspacing=0.25)
+    fig.tight_layout()
     os.makedirs(dirname(OUT_FIG), exist_ok=True)
     save(fig, "network_latency")
     plt.close(fig)
@@ -174,7 +199,8 @@ def main():
                  + " | ".join(f"{up(tot, bw):.3f}" for bw, _ in BANDWIDTHS) + " | "
                  + " | ".join(f"{up(tot, bw) + r['fwd']:.3f}" for bw, _ in BANDWIDTHS) + " |")
     L += ["", f"Figure: `figures/network_latency.png` (the table's latency columns, split into dense upload, selector "
-          "upload and forward).", "",
+          "upload and forward; one bar per bandwidth and threshold, x axis linear to 10 s and compressed 3x from "
+          "10 to 20 s).", "",
           "## IVE selector upload at batch 1, for comparison", "",
           "IVE's query is one ciphertext at every p (432 slots used of 32,768), but it must enter at level "
           "log2(p/2) + 2 + the top-MLP level to carry the power tree, so it is larger than HE-LRM's single "
