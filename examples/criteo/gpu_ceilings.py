@@ -42,13 +42,11 @@ for _p in (REPO, HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import matplotlib  # noqa: E402
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.legend_handler import HandlerTuple  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
+from figstyle import COL_W, FILL, GREY, LINE, RED, apply, ref_line, save, series  # noqa: E402
 from ladder import CONFIGS, IVE_COMPRESSION, row_from, tag  # noqa: E402
 from max_qps import CARDS, load_cells  # noqa: E402
 from table2 import fmt_compression  # noqa: E402
@@ -57,9 +55,6 @@ FIG = join(HERE, "figures")
 BATCHES = (1, 2, 4, 8, 16, 32)
 # short card names, keyed by results folder
 SHORT = {"ladder": "RTX PRO 6000", "ladder_a100": "A100", "ladder_3090": "RTX 3090", "ladder_h100": "H100"}
-# one colour per card, smallest to largest
-CARD_PAL = ["#222222", "#1f78b4", "#2ca25f", "#e6550d"]
-HELRM_C, IVE_C = "#2a78d6", "#eb6834"
 MISS_Y = 0.35  # where a configuration that does not fit at batch 1 is marked
 # HE-LRM against IVE at the closest compressions the two parameter sets share
 PAIRS = [("~700x", ("HE-LRM", 50000), ("IVE", 1024)),
@@ -88,11 +83,11 @@ def climb(root):
     return out
 
 
-def miss_marker(ax, x, y, design, color, ms=5):
-    """Batch 1 does not fit: IVE a cross, HE-LRM a cross in a circle."""
-    ax.plot([x], [y], "x", color=color, ms=ms, mew=1.2)
+def miss_marker(ax, x, y, design, i, ms=5):
+    """Batch 1 does not fit: IVE a cross, HE-LRM a cross in a circle, in the card's line colour."""
+    ax.plot([x], [y], "x", color=LINE[i], ms=ms, mew=1.3, mec=LINE[i], zorder=3)
     if design == "HE-LRM":
-        ax.plot([x], [y], "o", mfc="none", mec=color, ms=ms + 4, mew=0.9)
+        ax.plot([x], [y], "o", mfc="none", mec=LINE[i], ms=ms + 4, mew=0.9, zorder=3)
 
 
 def main():
@@ -132,73 +127,56 @@ def main():
         fit = [r for (d, c, b), r in cells[folder].items() if d == design and c == cfg]
         return max(fit, key=lambda r: r["batch"]) if fit else None
 
-    os.makedirs(FIG, exist_ok=True)
+    apply()
 
-    # ---- memory_vs_batch: working set against batch, one panel per design
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), dpi=400, sharey=True)
-    for ax, design in zip(axes, ("HE-LRM", "IVE")):
-        for d, cfg in CONFIGS:
-            if d != design:
-                continue
+    def mem_lines(ax, design, ls="-", marker="o"):
+        for i, (d, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
             rows, paged = results[(d, cfg)]
             xs, ys = [r["batch"] for r in rows], [mem(r) for r in rows]
             if paged:
                 xs.append(paged["batch"])
                 ys.append(mem(paged))
-            ax.plot(xs, ys, "o-", ms=4, label=label(d, cfg))
+            series(ax, xs, ys, i, label=label(d, cfg), marker=marker, ls=ls)
+
+    def cap_lines(ax):
         for name, gib in caps:
-            ax.axhline(gib, color="black", lw=0.7, ls=":")
-            if ax is axes[1]:
-                cap_label(ax, name, gib, 1.5)
+            ref_line(ax, gib, name, left=gib >= 60, dy=2.5)
+
+    # ---- memory_vs_batch: working set against batch, one panel per design, stacked
+    fig, axes = plt.subplots(2, 1, figsize=(COL_W, 4.6), sharex=True)
+    for ax, design in zip(axes, ("HE-LRM", "IVE")):
+        mem_lines(ax, design)
+        cap_lines(ax)
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("Batch size")
-        ax.set_title(design, fontsize=9)
-        ax.grid(alpha=0.3, which="both")
-        ax.legend(fontsize=5.5, frameon=False, loc="lower right" if design == "HE-LRM" else "upper left")
-    axes[0].set_ylabel("Working set (GiB)")
-    axes[0].set_ylim(0, 175)
-    fig.tight_layout()
-    fig.savefig(join(FIG, "memory_vs_batch.png"))
+        ax.set_ylim(0, 200)
+        ax.set_ylabel("Working set (GiB)")
+        ax.legend(loc="upper left", ncol=2, title=design, fontsize=6.5)
+    axes[1].set_xlabel("Batch size")
+    fig.tight_layout(h_pad=0.5)
+    save(fig, "memory_vs_batch")
     plt.close(fig)
 
-    # ---- memory_vs_batch_one_panel: the same on one panel, blues against oranges
-    fig, ax = plt.subplots(figsize=(4.8, 3.4), dpi=400)
-    blues, oranges = plt.colormaps["Blues"], plt.colormaps["Oranges"]
-    hl = [c for c in CONFIGS if c[0] == "HE-LRM"]
-    iv = [c for c in CONFIGS if c[0] == "IVE"]
-    for (d, cfg), i in [(c, i) for i, c in enumerate(hl)] + [(c, i) for i, c in enumerate(iv)]:
-        rows, paged = results[(d, cfg)]
-        xs, ys = [r["batch"] for r in rows], [mem(r) for r in rows]
-        if paged:
-            xs.append(paged["batch"])
-            ys.append(mem(paged))
-        if d == "HE-LRM":
-            ax.plot(xs, ys, "-", marker="o", ms=3.5, lw=1.2, color=blues(0.45 + 0.55 * i / (len(hl) - 1)),
-                    label=label(d, cfg))
-        else:
-            ax.plot(xs, ys, "--", marker="s", ms=3.2, lw=1.0, color=oranges(0.4 + 0.6 * i / (len(iv) - 1)),
-                    label=label(d, cfg))
-    for name, gib in caps:
-        ax.axhline(gib, color="black", lw=0.7, ls=":")
-        cap_label(ax, name, gib, 1.2)
+    # ---- memory_vs_batch_one_panel: both designs on one panel, HE-LRM solid circles, IVE dashed squares
+    fig, ax = plt.subplots(figsize=(COL_W, 3.2))
+    mem_lines(ax, "HE-LRM")
+    mem_lines(ax, "IVE", ls="--", marker="s")
+    cap_lines(ax)
     ax.set_xscale("log", base=2)
+    ax.set_ylim(0, 275)
     ax.set_xlabel("Batch size")
     ax.set_ylabel("Working set (GiB)")
-    ax.set_ylim(0, 180)
-    ax.grid(alpha=0.3, which="both")
     h, l = ax.get_legend_handles_labels()
-    leg1 = ax.legend(h[:len(hl)], l[:len(hl)], title="HE-LRM", fontsize=5.5, title_fontsize=6.5, frameon=False,
-                     loc="upper left")
+    n = len([c for c in CONFIGS if c[0] == "HE-LRM"])
+    leg1 = ax.legend(h[:n], l[:n], title="HE-LRM", loc="upper left", fontsize=6, title_fontsize=6.5)
     ax.add_artist(leg1)
-    ax.legend(h[len(hl):], l[len(hl):], title="IVE", fontsize=5.5, title_fontsize=6.5, frameon=False,
-              loc="upper left", bbox_to_anchor=(0.27, 1.0))
+    ax.legend(h[n:], l[n:], title="IVE", loc="upper right", fontsize=6, title_fontsize=6.5)
     fig.tight_layout()
-    fig.savefig(join(FIG, "memory_vs_batch_one_panel.png"))
+    save(fig, "memory_vs_batch_one_panel")
     plt.close(fig)
 
     # ---- peak_qps_vs_compression: one line per card and design, from the card's own cells
-    fig, ax = plt.subplots(figsize=(4.6, 3.2), dpi=400)
-    for (folder, _, cap), color in zip(cards, CARD_PAL):
+    fig, ax = plt.subplots(figsize=(COL_W, 3.0))
+    for i, (folder, _, cap) in enumerate(cards):
         for design, ls, marker in (("HE-LRM", "-", "o"), ("IVE", "--", "s")):
             xs, ys = [], []
             for d, cfg in CONFIGS:
@@ -210,60 +188,59 @@ def main():
                     xs.append(x)
                     ys.append(r["qps"])
                 else:
-                    miss_marker(ax, x, MISS_Y, design, color)
-            ax.plot(xs, ys, ls, marker=marker, ms=3.5, color=color, lw=1)
+                    miss_marker(ax, x, MISS_Y, design, i)
+            series(ax, xs, ys, i, marker=marker, ls=ls)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_ylim(0.3, 120)
+    ax.set_ylim(0.2, 1000)  # the top decade holds the legend
     ax.set_xlabel("Embedding compression ratio")
     ax.set_ylabel("Peak QPS (largest batch that fits)")
-    ax.spines[["top", "right"]].set_visible(False)
-    handles = [Line2D([], [], color=c, lw=2, label=n) for (n, _), c in zip(caps, CARD_PAL)]
-    handles += [Line2D([], [], color="gray", ls="-", marker="o", ms=3.5, label="HE-LRM"),
-                Line2D([], [], color="gray", ls="--", marker="s", ms=3.5, label="IVE"),
-                Line2D([], [], color="gray", ls="", marker="x", ms=5, mew=1.2, label="IVE: batch 1 does not fit"),
-                (Line2D([], [], color="gray", ls="", marker="x", ms=5, mew=1.2),
-                 Line2D([], [], mec="gray", mfc="none", ls="", marker="o", ms=9, mew=0.9))]
+    handles = [Line2D([], [], color=LINE[i], lw=2, label=n) for i, (n, _) in enumerate(caps)]
+    handles += [Line2D([], [], color=GREY, ls="-", marker="o", mfc="white", mec="black", label="HE-LRM"),
+                Line2D([], [], color=GREY, ls="--", marker="s", mfc="white", mec="black", label="IVE"),
+                Line2D([], [], color=GREY, ls="", marker="x", ms=5, mew=1.3, mec=GREY, label="IVE: batch 1 does not fit"),
+                (Line2D([], [], color=GREY, ls="", marker="x", ms=5, mew=1.3, mec=GREY),
+                 Line2D([], [], mec=GREY, mfc="none", ls="", marker="o", ms=9, mew=0.9))]
     labels = [h.get_label() if not isinstance(h, tuple) else "HE-LRM: batch 1 does not fit" for h in handles]
-    ax.legend(handles, labels, handler_map={tuple: HandlerTuple(ndivide=1, pad=0)}, fontsize=5.5, frameon=False,
-              loc="upper left", ncol=2)
+    ax.legend(handles, labels, handler_map={tuple: HandlerTuple(ndivide=1, pad=0)}, loc="upper left", ncol=2,
+              fontsize=6)
     fig.tight_layout()
-    fig.savefig(join(FIG, "peak_qps_vs_compression.png"))
+    save(fig, "peak_qps_vs_compression")
     plt.close(fig)
 
-    # ---- peak_qps_bars: cards on x, HE-LRM against IVE at matched compression
+    # ---- peak_qps_bars: cards on x, HE-LRM against IVE at matched compression, one row (two-column width)
     import numpy as np
-    fig, axes = plt.subplots(1, len(PAIRS), figsize=(2.6 * len(PAIRS), 2.5), dpi=400, sharey=True)
-    ticks = [f"{round(cap)}\n{SHORT[folder]}" for folder, _, cap in cards]
+    fig, axes = plt.subplots(1, len(PAIRS), figsize=(7.0, 2.4), sharey=True)
+    ticks = [f"{round(cap)}\n{SHORT[folder].replace('RTX PRO 6000', 'PRO 6000')}" for folder, _, cap in cards]
     xs = np.arange(len(cards))
     w = 0.38
     top = 0
     for ax, (title, a, b) in zip(axes, PAIRS):
-        for off, key, color in ((-w / 2, a, HELRM_C), (w / 2, b, IVE_C)):
+        for off, key, i in ((-w / 2, a, 0), (w / 2, b, 1)):
             vals, bs = [], []
             for folder, _, _ in cards:
                 r = best(folder, *key)
                 vals.append(r["qps"] if r else 0)
                 bs.append(r["batch"] if r else None)
             top = max(top, max(vals))
-            ax.bar(xs + off, vals, w, color=color, label=f"{key[0]} ({label(*key)})")
+            ax.bar(xs + off, vals, w, color=FILL[i], edgecolor="black", linewidth=0.7,
+                   label=f"{key[0]} ({label(*key)})", zorder=2)
             for x, v, bb in zip(xs + off, vals, bs):
                 if bb:
-                    ax.text(x, v + 1, f"b{bb}", fontsize=5, ha="center", va="bottom", color=color)
+                    ax.text(x, v + 1, f"b{bb}", fontsize=6, ha="center", va="bottom", color=LINE[i])
                 else:
-                    miss_marker(ax, x, 1.2, key[0], color, ms=4)
+                    miss_marker(ax, x, 1.5, key[0], i, ms=4)
         ax.set_xticks(xs)
-        ax.set_xticklabels(ticks, fontsize=6)
-        ax.set_title(f"compression {title}", fontsize=8)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=5, frameon=False, loc="upper left")
-        ax.tick_params(axis="y", labelsize=6)
-    axes[0].set_ylabel("Peak QPS (largest batch that fits)", fontsize=7)
-    axes[0].set_ylim(0, top * 1.2)
-    fig.supxlabel("GPU memory (GiB)", fontsize=7, y=0.02)
+        ax.set_xticklabels(ticks, fontsize=7)
+        ax.set_title(f"compression {title}")
+        ax.grid(axis="x", visible=False)
+        ax.legend(loc="upper left", fontsize=6)
+    axes[0].set_ylabel("Peak QPS (largest batch that fits)")
+    axes[0].set_ylim(0, top * 1.22)
+    fig.supxlabel("GPU memory (GiB)", fontsize=8.5, y=0.02)
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.26)
-    fig.savefig(join(FIG, "peak_qps_bars.png"))
+    fig.subplots_adjust(bottom=0.27)
+    save(fig, "peak_qps_bars")
     plt.close(fig)
     print("wrote " + ", ".join(join(FIG, f) for f in (
         "memory_vs_batch.png", "memory_vs_batch_one_panel.png", "peak_qps_vs_compression.png", "peak_qps_bars.png")))
