@@ -233,7 +233,7 @@ def main():
     ax.yaxis.set_minor_locator(LogLocator(base=10, subs=range(2, 10), numticks=20))
     ax.yaxis.set_minor_formatter(NullFormatter())
     ax.axhline(MISS_Y, color="0.5", lw=0.8, ls=":", zorder=1)
-    ax.text(0.99, MISS_Y * 1.12, "batch 1 does not fit", fontsize=6.5, color="0.3", va="bottom", ha="right",
+    ax.text(0.99, MISS_Y, "batch 1 does not fit", fontsize=5.2, color="0.35", va="bottom", ha="right",
             transform=ax.get_yaxis_transform())
     ax.set_xlabel("Embedding compression ratio")
     ax.set_ylabel("Peak QPS")
