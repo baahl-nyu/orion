@@ -21,7 +21,8 @@ off, 1 warmup + 3 timed forwards:
                                      the largest batch that ran there without
                                      OOM, divided by its forward on that card.
                                      A cross marks a configuration whose batch
-                                     1 does not fit.
+                                     1 does not fit (IVE); HE-LRM's would be a
+                                     cross in a circle.
 
 The numbers behind the third figure are tabulated in max_qps.md; behind the
 first two, in PAPER_NUMBERS.md (batch ladder).
@@ -190,8 +191,10 @@ def main():
                 else:
                     miss.append(x)
             ax.plot(xs, ys, "-", marker=marker, ms=3, color=color, lw=1, label=design)
-            if miss:
+            if miss:  # batch 1 does not fit: IVE a cross, HE-LRM a cross in a circle
                 ax.plot(miss, [0.45] * len(miss), "x", color=color, ms=4, mew=1.1)
+                if design == "HE-LRM":
+                    ax.plot(miss, [0.45] * len(miss), "o", mfc="none", mec=color, ms=7, mew=0.9)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_ylim(0.35, 100)
@@ -200,7 +203,7 @@ def main():
         ax.tick_params(labelsize=6)
     axes[0].set_ylabel("Peak QPS", fontsize=7)
     axes[0].legend(fontsize=6, frameon=False, loc="upper left")
-    axes[0].text(12, 0.6, "x: batch 1 does not fit", fontsize=4.5, va="bottom", color="gray")
+    axes[0].text(12, 0.6, "batch 1 does not fit:  x IVE,  ⊗ HE-LRM", fontsize=4.5, va="bottom", color="gray")
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.24)
     fig.supxlabel("Embedding compression ratio", fontsize=7, y=0.04)
