@@ -40,6 +40,8 @@ OUT_MD = join(HERE, "max_qps.md")
 CARDS = [
     ("ladder", "RTX PRO 6000 (96 GiB)", 97887 / 1024),
     ("ladder_a100", "A100-SXM4 (40 GiB)", 40960 / 1024),
+    ("ladder_3090", "RTX 3090 (24 GiB)", 24576 / 1024),
+    ("ladder_h100", "H100 (80 GiB)", 81559 / 1024),
 ]
 
 
