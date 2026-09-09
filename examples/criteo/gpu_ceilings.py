@@ -20,8 +20,8 @@ CARDS, each with a folder of cells run on that card.
                                  per GPU and design, from that GPU's own cells:
                                  the largest batch that ran there without OOM,
                                  divided by its forward on that card. A
-                                 configuration whose batch 1 does not fit is a
-                                 cross (IVE) or a circled cross (HE-LRM).
+                                 configuration whose batch 1 does not fit is
+                                 its own marker on the 0 line.
   peak_qps_bars.png              the same peak throughput as bars, GPUs on the
                                  x axis, HE-LRM against IVE at three matched
                                  compressions.
@@ -32,6 +32,7 @@ the memory figures, in PAPER_NUMBERS.md (batch ladder).
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 from os.path import abspath, dirname, exists, expanduser, join
@@ -43,7 +44,6 @@ for _p in (REPO, HERE):
         sys.path.insert(0, _p)
 
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.legend_handler import HandlerTuple  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
 from figstyle import COL_W, FILL, GREY, LINE, RED, apply, ref_line, save, series  # noqa: E402
@@ -174,8 +174,11 @@ def main():
     save(fig, "memory_vs_batch_one_panel")
     plt.close(fig)
 
-    # ---- peak_qps_vs_compression: one line per card and design, from the card's own cells
-    fig, ax = plt.subplots(figsize=(COL_W, 3.0))
+    # ---- peak_qps_vs_compression: one line per card and design, from the card's own cells.
+    # A configuration whose batch 1 does not fit on the card is its own marker on a "0" line
+    # (drawn at MISS_Y on the log axis, tick relabelled 0).
+    from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullFormatter
+    fig, ax = plt.subplots(figsize=(COL_W, 2.3))
     for i, (folder, _, cap) in enumerate(cards):
         for design, ls, marker in (("HE-LRM", "-", "o"), ("IVE", "--", "s")):
             xs, ys = [], []
@@ -188,22 +191,27 @@ def main():
                     xs.append(x)
                     ys.append(r["qps"])
                 else:
-                    miss_marker(ax, x, MISS_Y, design, i)
-            series(ax, xs, ys, i, marker=marker, ls=ls)
+                    ax.plot([x], [MISS_Y], marker, mfc=FILL[i], mec="black", ls="none", ms=4.5, zorder=3)
+            series(ax, xs, ys, i, marker=marker, ls=ls, ms=4.5)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_ylim(0.2, 1000)  # the top decade holds the legend
+    ax.set_ylim(0.2, 700)  # the top band holds the legend
+    ax.yaxis.set_major_locator(FixedLocator([MISS_Y, 1, 10, 100]))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "0" if v == MISS_Y else f"$10^{{{round(math.log10(v))}}}$"))
+    ax.yaxis.set_minor_locator(LogLocator(base=10, subs=range(2, 10), numticks=20))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.axhline(MISS_Y, color="0.5", lw=0.8, ls=":", zorder=1)
+    ax.text(0.99, MISS_Y, "batch 1 does not fit", fontsize=5.2, color="0.35", va="bottom", ha="right",
+            transform=ax.get_yaxis_transform())
     ax.set_xlabel("Embedding compression ratio")
-    ax.set_ylabel("Peak QPS (largest batch that fits)")
-    handles = [Line2D([], [], color=LINE[i], lw=2, label=n) for i, (n, _) in enumerate(caps)]
-    handles += [Line2D([], [], color=GREY, ls="-", marker="o", mfc="white", mec="black", label="HE-LRM"),
-                Line2D([], [], color=GREY, ls="--", marker="s", mfc="white", mec="black", label="IVE"),
-                Line2D([], [], color=GREY, ls="", marker="x", ms=5, mew=1.3, mec=GREY, label="IVE: batch 1 does not fit"),
-                (Line2D([], [], color=GREY, ls="", marker="x", ms=5, mew=1.3, mec=GREY),
-                 Line2D([], [], mec=GREY, mfc="none", ls="", marker="o", ms=9, mew=0.9))]
-    labels = [h.get_label() if not isinstance(h, tuple) else "HE-LRM: batch 1 does not fit" for h in handles]
-    ax.legend(handles, labels, handler_map={tuple: HandlerTuple(ndivide=1, pad=0)}, loc="upper left", ncol=2,
-              fontsize=6)
+    ax.set_ylabel("Peak QPS")
+    card_h = [Line2D([], [], color=LINE[i], lw=2, label=n) for i, (n, _) in enumerate(caps)]
+    helrm_h = Line2D([], [], color=GREY, ls="-", marker="o", mfc="white", mec="black", ms=4.5, label="HE-LRM")
+    ive_h = Line2D([], [], color=GREY, ls="--", marker="s", mfc="white", mec="black", ms=4.5, label="IVE")
+    # two columns of three, filled column-wise: the two smaller cards then HE-LRM, the two larger then IVE
+    handles = card_h[:2] + [helrm_h] + card_h[2:] + [ive_h]
+    ax.legend(handles=handles, loc="upper left", ncol=2, fontsize=5.5, borderpad=0.3, labelspacing=0.25,
+              handletextpad=0.4, handlelength=1.4, columnspacing=0.8)
     fig.tight_layout()
     save(fig, "peak_qps_vs_compression")
     plt.close(fig)
