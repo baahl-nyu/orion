@@ -120,33 +120,31 @@ def main():
     # figure
     fig_path = join(HERE, "figures", "selector_cost_vs_compression.png")
     try:
-        import matplotlib
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        os.makedirs(dirname(fig_path), exist_ok=True)
-        fig, ax = plt.subplots(figsize=(4.2, 2.9), dpi=400)
-        xs = [ours[t]["compression"] for t in THRESHOLDS if t in ours]
-        ys = [ours[t]["selector"] for t in THRESHOLDS if t in ours]
-        ax.plot(xs, ys, "o-", color="#2a78d6", label="HE-LRM (this work)")
-        for t, x, y in zip([t for t in THRESHOLDS if t in ours], xs, ys):
+        from figstyle import COL_W, apply, save, series
+        apply()
+        fig, ax = plt.subplots(figsize=(COL_W, 2.7))
+        ts = [t for t in THRESHOLDS if t in ours]
+        xs, ys = [ours[t]["compression"] for t in ts], [ours[t]["selector"] for t in ts]
+        series(ax, xs, ys, 0, label="HE-LRM (this work)", marker="o")
+        for t, x, y in zip(ts, xs, ys):
             ax.annotate(f"t={t:,}", (x, y), textcoords="offset points",
-                        xytext=(6, 4) if x < 100 else (0, -12), fontsize=6, ha="center" if x >= 100 else "left")
-        xs = [ive[p]["compression"] for p in IVE_P if p in ive]
-        ys = [ive[p]["selector"] for p in IVE_P if p in ive]
-        ax.plot(xs, ys, "s-", color="#eb6834", label="IVE")
-        for p, x, y in zip([p for p in IVE_P if p in ive], xs, ys):
+                        xytext=(7, 4) if x < 100 else (0, -12), fontsize=6, ha="center" if x >= 100 else "left")
+        ps = [p for p in IVE_P if p in ive]
+        xs, ys = [ive[p]["compression"] for p in ps], [ive[p]["selector"] for p in ps]
+        series(ax, xs, ys, 1, label="IVE", marker="s")
+        for p, x, y in zip(ps, xs, ys):
             ax.annotate(f"p={p}", (x, y), textcoords="offset points",
-                        xytext=(0, -12) if p == 32 else (6, 4), fontsize=6,
-                        ha="center" if p == 32 else "left")
+                        xytext=(0, -12) if p == 32 else (7, 4), fontsize=6, ha="center" if p == 32 else "left")
         ax.set_xscale("log")
-        ax.set_ylim(-18, 180)
+        ax.set_ylim(-18, 185)
         ax.set_yticks(range(0, 176, 25))
         ax.set_xlabel("Embedding compression ratio")
-        ax.set_ylabel("Selector time per inference (ms)")
-        ax.legend(loc="upper left", fontsize=7, frameon=False)
-        ax.grid(alpha=0.3)
+        ax.set_ylabel("Selector time (ms)")
+        ax.legend(loc="upper left")
         fig.tight_layout()
-        fig.savefig(fig_path)
+        save(fig, "selector_cost_vs_compression")
+        plt.close(fig)
         lines += ["", f"Figure: `figures/selector_cost_vs_compression.png` (selector total against "
                   "compression, both designs, batch 1)."]
     except Exception as exc:  # the table is the deliverable; the figure is best effort

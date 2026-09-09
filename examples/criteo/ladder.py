@@ -207,51 +207,30 @@ def main():
 
     # ---- figures
     try:
-        import matplotlib
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        os.makedirs(join(HERE, "figures"), exist_ok=True)
-        FIGS = {
-            "latency_vs_batch": ("fwd", "Forward latency (s)", True,
-                                 "Hollow marker: first batch past the memory ceiling, run with paging"),
-        }
-
-        def panel(ax, design, key, logy, ylabel):
-            for design_, cfg in CONFIGS:
-                if design_ != design:
-                    continue
+        from figstyle import COL_W, GREY, LINE, apply, save, series
+        apply()
+        # Figure B (latency): one panel per design, stacked at column width.
+        fig, axes = plt.subplots(2, 1, figsize=(COL_W, 4.4), sharex=True)
+        for ax, design in zip(axes, ("HE-LRM", "IVE")):
+            for i, (design_, cfg) in enumerate([c for c in CONFIGS if c[0] == design]):
                 r = results[(design, cfg)]
                 xs = [row["batch"] for row in r["rows"]]
-                ys = [row[key] for row in r["rows"]]  # peak = footprint: the only metric every row has
-                line, = ax.plot(xs, ys, "o-", ms=4, label=label(design, cfg))
-                if r["paged"]:
-                    pv = r["paged"][key]
-                    ax.plot([xs[-1], r["paged"]["batch"]], [ys[-1], pv], "--",
-                            color=line.get_color(), lw=0.8)
-                    ax.plot([r["paged"]["batch"]], [pv], "o", ms=5, mfc="white",
-                            color=line.get_color())
-            if key == "peak":
-                ax.axhline(CARD_GIB, color="black", lw=0.8, ls=":")  # drawn at the real 95.6, labeled 96
-                ax.text(BATCHES[0], CARD_GIB + 1.5, "GPU memory, 96 GiB", fontsize=6,
-                        va="bottom", ha="left")
+                ys = [row["fwd"] for row in r["rows"]]
+                series(ax, xs, ys, i, label=label(design, cfg))
+                if r["paged"]:  # first batch past the ceiling, paged: dashed segment, open marker
+                    pb, pv = r["paged"]["batch"], r["paged"]["fwd"]
+                    ax.plot([xs[-1], pb], [ys[-1], pv], "--", color=LINE[i], lw=1.0, zorder=2)
+                    ax.plot([pb], [pv], "o", mfc="white", mec=LINE[i], mew=1.2, ls="none", zorder=3)
             ax.set_xscale("log", base=2)
-            if logy:
-                ax.set_yscale("log")
-            ax.set_xlabel("Batch size")
-            if ylabel:
-                ax.set_ylabel(ylabel)
-            ax.grid(alpha=0.3, which="both")
-            ax.legend(fontsize=6, frameon=False, loc="lower right" if key == "peak" else "upper left")
-
-        # Figure B (latency): the two-panel PNG.
-        for name, (key, ylabel, logy, note) in FIGS.items():
-            fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.9), dpi=400, sharey=True)
-            for ax, design in zip(axes, ("HE-LRM", "IVE")):
-                panel(ax, design, key, logy, ylabel if ax is axes[0] else None)
-                ax.set_title(design, fontsize=9)
-            fig.tight_layout()  # the hollow-marker meaning goes in the caption, not on the plot
-            fig.savefig(join(HERE, "figures", f"{name}.png"))
-            plt.close(fig)
+            ax.set_yscale("log")
+            ax.set_ylim(0.1, 600)  # the top decade holds the legend, above the paged points
+            ax.set_ylabel("Forward latency (s)")
+            ax.legend(loc="upper left", ncol=2, title=design, fontsize=6.5)
+        axes[1].set_xlabel("Batch size")
+        fig.tight_layout(h_pad=0.5)
+        save(fig, "latency_vs_batch")
+        plt.close(fig)
         lines += ["", "Figure: `figures/latency_vs_batch.png` (B). The memory-against-batch figure with the "
                   "cards' capacities and the peak-throughput figures are drawn by `gpu_ceilings.py` from these "
                   "cells and the other cards' folders (see `max_qps.md`)."]

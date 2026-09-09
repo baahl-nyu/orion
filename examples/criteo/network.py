@@ -114,36 +114,36 @@ def main():
     def up(b, bw):
         return b * 8 / bw
 
-    # ---- figure
-    import matplotlib
-    matplotlib.use("Agg")
+    # ---- figure: one panel per bandwidth, stacked at column width
     import matplotlib.pyplot as plt
+    from figstyle import COL_W, FILL, apply, save
+    apply()
     rows = [(t, helrm[t]) for t in THRESHOLDS if t in helrm]
-    c_fwd, c_dense, c_sel = "#4a4a4a", "#9ecae1", "#d7301f"
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.0))
+    c_fwd, c_dense, c_sel = "#bdbdbd", FILL[1], FILL[2]
+    fig, axes = plt.subplots(len(BANDWIDTHS), 1, figsize=(COL_W, 2.1 * len(BANDWIDTHS)))
     for ax, (bw, name) in zip(axes, BANDWIDTHS):
         xs = list(range(len(rows)))
         dn = [up(dense_bytes, bw) for _ in rows]
         sel = [up(r["bytes"], bw) for _, r in rows]
         fwd = [r["fwd"] for _, r in rows]
-        ax.bar(xs, dn, color=c_dense, width=0.6, hatch="//", edgecolor="white",
-               label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)")
-        ax.bar(xs, sel, bottom=dn, color=c_sel, width=0.6, label="selector upload")
-        ax.bar(xs, fwd, bottom=[a + b for a, b in zip(dn, sel)], color=c_fwd, width=0.6, label="server forward")
+        bar = dict(width=0.62, edgecolor="black", linewidth=0.7, zorder=2)
+        ax.bar(xs, dn, color=c_dense, hatch="///", label=f"dense upload ({dense_bytes / 1e6:.1f} MB, fixed)", **bar)
+        ax.bar(xs, sel, bottom=dn, color=c_sel, label="selector upload", **bar)
+        ax.bar(xs, fwd, bottom=[a + b for a, b in zip(dn, sel)], color=c_fwd, label="server forward", **bar)
         tot = [a + b + c for a, b, c in zip(dn, sel, fwd)]
         for x, v in zip(xs, tot):
-            ax.text(x, v, f"{v:.2f} s", ha="center", va="bottom", fontsize=7.5)
+            ax.text(x, v, f"{v:.2f} s", ha="center", va="bottom", fontsize=6.5)
         ax.set_xticks(xs)
-        ax.set_xticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}x" for t, r in rows], fontsize=7)
-        ax.set_title(name, fontsize=9)
-        ax.set_ylim(0, max(tot) * 1.15)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.tick_params(axis="y", labelsize=7.5)
-    axes[0].set_ylabel("live-query latency (s)", fontsize=8.5)
-    axes[0].legend(fontsize=7, frameon=False, loc="upper left")
-    fig.tight_layout()
+        ax.set_xticklabels([f"t={t:,}\n{fmt_compression(r['comp'])}$\\times$" for t, r in rows], fontsize=5.8)
+        ax.set_title(name)
+        ax.set_ylim(0, max(tot) * 1.18)
+        ax.set_ylabel("Live-query latency (s)")
+        ax.grid(axis="x", visible=False)
+    axes[0].legend(loc="upper left", fontsize=6.5)
+    fig.tight_layout(h_pad=0.6)
     os.makedirs(dirname(OUT_FIG), exist_ok=True)
-    fig.savefig(OUT_FIG, dpi=400)
+    save(fig, "network_latency")
+    plt.close(fig)
 
     # ---- markdown
     git = os.popen(f"git -C {REPO} rev-parse --short HEAD").read().strip()
