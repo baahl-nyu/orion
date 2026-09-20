@@ -4,7 +4,7 @@
     python gpu_ceilings.py [--results DIR]
 
 Three figures under figures/, from the cells under --results (default
-~/cheddar-orion-results/final), all Cheddar word32, bins off, managed memory
+examples/criteo/results), all Cheddar word32, bins off, managed memory
 off, 1 warmup + 3 timed forwards. The cards are the ones in max_qps.py's
 CARDS, each with a folder of cells run on that card.
 
@@ -94,7 +94,7 @@ def miss_marker(ax, x, y, design, i, ms=5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/final"))
+    ap.add_argument("--results", default=join(HERE, "results"))
     args = ap.parse_args()
     from bench_sweep import SPARSE_SIZES
     from dlrm import expanded_width

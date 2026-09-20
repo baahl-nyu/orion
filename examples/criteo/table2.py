@@ -7,7 +7,7 @@ compiler (sliced diagonal packing), batch 1.
 
 Runs every missing cell, then writes the "table2" section of
 examples/criteo/PAPER_NUMBERS.md (replaced in place on every run). Raw JSON
-and logs go to --results (default ~/cheddar-orion-results/table2, outside
+and logs go to --results (default examples/criteo/results/table2, outside
 the repo). A cell whose JSON exists is not re-run; delete it to redo.
 
 GPU: bench_sweep.py, word32 chain, seeded upload at the level the sparse
@@ -169,7 +169,7 @@ PAPER_HEADER = """# Paper numbers
 
 Every section below is written by the script it names, from runs on this
 branch; re-running a script replaces its section in place. Raw JSON and logs
-live outside the repo under ~/cheddar-orion-results/<section>/.
+live outside the repo under examples/criteo/results/<section>/.
 """
 
 
@@ -189,7 +189,7 @@ def write_section(name, lines):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/table2"))
+    ap.add_argument("--results", default=join(HERE, "results", "table2"))
     ap.add_argument("--cpu-cell", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--trials", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--out", help=argparse.SUPPRESS)

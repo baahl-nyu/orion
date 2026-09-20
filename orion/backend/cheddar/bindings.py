@@ -775,7 +775,7 @@ class CheddarLibrary:
         A POW2_ROTATE mode used to live here (decompose k into a chain of
         rotations over a fixed universal power-of-two key set, trading up
         to log2(slots) HRots per logical rotation for a tiny key set).
-        Removed after the 2026-07-29 runtime ablation: it had no runtime
+        Removed after a runtime ablation: it had no runtime
         benefit in any combination (28.9-29.7s, same band as exact-key),
         and its memory advantage is moot since MANAGED_MEMORY is required
         on this 24GB card either way -- exact-key + SHARED_BS=64 +

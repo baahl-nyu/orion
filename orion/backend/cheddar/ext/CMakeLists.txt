@@ -26,7 +26,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # baahl1: dual RTX 3090 (sm_86). Override -D for H100 (90), A100 (80).
+    # Default sm_86 (RTX 3090). Override with -D CMAKE_CUDA_ARCHITECTURES for your card.
     set(CMAKE_CUDA_ARCHITECTURES 86)
 endif()
 

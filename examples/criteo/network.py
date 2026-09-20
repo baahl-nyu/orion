@@ -6,7 +6,7 @@
 A live query is one client's dense features plus its one-hot selector, both
 encrypted and uploaded; the server forward then runs on the GPU. This script
 reads the measured batch-1 GPU cells under --results (default
-~/cheddar-orion-results/final): `batch1/gpu/` for HE-LRM (batch1.py) and
+examples/criteo/results): `batch1/gpu/` for HE-LRM (batch1.py) and
 `tableA/` for IVE (tableA.py), whose JSONs carry the wire size of the
 selector upload measured from the ciphertexts' own buffers (seeded: b plus
 the seed). The dense-feature ciphertext is common to both designs; its size
@@ -79,7 +79,7 @@ def dense_ct(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/final"))
+    ap.add_argument("--results", default=join(HERE, "results"))
     args = ap.parse_args()
     from bench_sweep import SPARSE_SIZES
     from dlrm import expanded_width
@@ -176,7 +176,7 @@ def main():
 
     # ---- markdown
     git = os.popen(f"git -C {REPO} rev-parse --short HEAD").read().strip()
-    res = args.results.replace(expanduser("~"), "~")
+    res = os.path.relpath(args.results, REPO)
     L = ["# Network cost of a live query (batch 1)", "",
          f"Regenerated {date.today().isoformat()} at commit {git} by `network.py` from `{res}/`. A live query is one "
          "client's 13 dense features and its one-hot selector, encrypted and uploaded; upload sizes are measured from the "

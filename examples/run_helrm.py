@@ -20,7 +20,7 @@ inp = inp[None, :]
 
 print("running in the clear")
 net.eval()
-net.load_state_dict(torch.load("./model/helrm.pth"))
+net.load_state_dict(torch.load("./model_state/helrm.pth"))
 out_clear = net(inp)
 print("out_clear", out_clear)
 

@@ -4,7 +4,7 @@
     python max_qps.py [--results DIR]
 
 Reads the measured ladder cells of every card under --results (default
-~/cheddar-orion-results/final): `ladder/` is the RTX PRO 6000 climb
+examples/criteo/results): `ladder/` is the RTX PRO 6000 climb
 (ladder.py), `ladder_<card>/` the cells run on another card with the same
 benches, command lines and environment (bins off, managed memory off,
 1 warmup + 3 timed forwards). Writes examples/criteo/max_qps.md (whole file).
@@ -65,7 +65,7 @@ def load_cells(root):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/final"))
+    ap.add_argument("--results", default=join(HERE, "results"))
     args = ap.parse_args()
     from bench_sweep import SPARSE_SIZES
     from dlrm import expanded_width
@@ -127,7 +127,7 @@ def main():
     lines = [
         "# Largest batch that fits, and peak throughput, per GPU", "",
         f"Regenerated {date.today().isoformat()} at commit {git} by `max_qps.py` from "
-        f"`{args.results.replace(expanduser('~'), '~')}/`. Every cell is a measured forward on the card named: "
+        f"`{os.path.relpath(args.results, REPO)}/`. Every cell is a measured forward on the card named: "
         "Cheddar word32, bins off (`ORION_CHEDDAR_BIN_CHUNK=0`), managed memory off, 1 warmup + 3 timed "
         "forwards, the same command lines as `ladder.py` (HE-LRM: seeded upload at the sparse layer's level; "
         "IVE: one-pass PC-MM, Algorithm 1 VecGen). The query is resident, so QPS = batch / forward. "
