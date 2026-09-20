@@ -34,8 +34,8 @@ MS = 1e3
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/tableA"))
-    ap.add_argument("--batch1", default=expanduser("~/cheddar-orion-results/batch1"))
+    ap.add_argument("--results", default=join(HERE, "results", "tableA"))
+    ap.add_argument("--batch1", default=join(HERE, "results", "batch1"))
     args = ap.parse_args()
     os.makedirs(args.results, exist_ok=True)
     from bench_sweep import SPARSE_SIZES

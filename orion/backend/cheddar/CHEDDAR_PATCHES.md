@@ -1,11 +1,13 @@
 # Cheddar patches
 
 This backend builds against plain upstream
-[Cheddar](https://github.com/scale-snu/cheddar-fhe) plus a small set of
-patches, kept here (not in a separate fork/repo) so building this branch
-doesn't depend on anything beyond this checkout and upstream Cheddar. Each
-patch below touches disjoint files, so they're independent: apply only the
-ones you need, in any order.
+[Cheddar](https://github.com/scale-snu/cheddar-fhe) at commit `8df8b26`
+plus a small set of patches, kept here (not in a separate fork) so building
+this repository depends on nothing beyond this checkout and upstream Cheddar.
+The five patches in the "Required" section apply cleanly, in the order listed,
+to a fresh clone of that commit and are exactly what the paper's GPU numbers
+were measured with. Each patch touches disjoint files, so they are independent
+of one another.
 
 To apply one: copy its diff block into a file and run, from the root of
 your upstream Cheddar checkout (`matmul-encoding-material/cheddar`):
@@ -15,7 +17,7 @@ git apply path/to/the.patch
 # or: patch -p1 < path/to/the.patch
 ```
 
-## Required on `cheddar-backend`
+## Required
 
 ### 1. `managed-memory`
 
@@ -775,7 +777,7 @@ The extension exposes the new counters as `GetPeakLiveMemoryMB` and
  
 ```
 
-## Not used on `cheddar-backend`
+## Not used
 
 ### 4. `fused-dispatch-beta1`
 
@@ -861,11 +863,9 @@ Makes `HoistHandler::BSFusedKeyMult` public and static (plus adds
 — KeyMult + MAC + Automorphism in one kernel launch — without constructing
 a `HoistHandler`. Powers `hoist_mode="fused"` in `bindings.py`.
 
-**This branch's `bindings.py` only implements `hoist_mode` `none`/`single`
-— `"fused"` isn't wired in here, so this patch isn't needed to build or run
-`cheddar-backend`.** It's required on `feat/cheddar-32bit`, which does wire
-up `hoist_mode="fused"`. Included here for completeness / in case this
-branch picks up fused-rotate support later.
+**`bindings.py` only implements `hoist_mode` `none`/`single`; `"fused"` is
+not wired in, so this patch is not needed to build or run this repository.**
+Included for completeness.
 
 ```diff
 diff --git a/include/extension/Hoist.h b/include/extension/Hoist.h

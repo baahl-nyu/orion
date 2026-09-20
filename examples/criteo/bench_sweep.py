@@ -15,7 +15,7 @@ threshold, the GPU-memory mitigation env vars set below -- without
 ORION_CHEDDAR_MANAGED_MEMORY it OOMs on the very first layer's
 compile() regardless of the other two flags.
 
-Usage (run one threshold at a time, sequentially -- see BENCH_SWEEP.md):
+Usage (run one threshold at a time, sequentially):
     python bench_sweep.py --compress-threshold 500
     python bench_sweep.py --compress-threshold 5000000 --out-dir bench_results
 """
@@ -31,19 +31,10 @@ from os.path import abspath, dirname, join
 
 import yaml
 
-# Default knob set, re-tuned on the 24GB RTX 3090 AFTER fold-retag
-# narrowing (full MIN_KS x SHARED_BS grid, every threshold, both word
-# sizes -- see HELRM_ABLATION.md's knob re-sweep): MIN_KS=0 + no
-# SHARED_BS wins or ties every cell. The old MIN_KS=1 + SHARED_BS=64
-# defaults were tuned pre-fold-retag, when the inflated working set
-# (wide top path + 32768-wide boot circuit) made key memory the binding
-# constraint; fold-retag removed that, so both memory knobs' compute tax
-# (chained boot rotations / ~30-55% extra LT rotations) became pure
-# loss. MANAGED_MEMORY=1 remains mandatory on 24GB (thr500 alone peaks
-# 23.9GB w32 / 32.5GB w64 at keygen). The memory knobs still exist for
-# tighter-memory cards: export ORION_CHEDDAR_BOOT_MIN_KS=1 and/or
-# ORION_CHEDDAR_SHARED_BS=64 -- setdefault means any exported env var
-# wins over these defaults.
+# Default knobs. MANAGED_MEMORY=1 lets a 24GB card page rather than OOM at
+# keygen; the paper's cells override it to 0 on cards that fit. BOOT_MIN_KS=1
+# and SHARED_BS=64 trade compute for key memory and are off by default;
+# setdefault means any exported env var wins over these defaults.
 os.environ.setdefault("ORION_CHEDDAR_MANAGED_MEMORY", "1")
 os.environ.setdefault("ORION_CHEDDAR_BOOT_MIN_KS", "0")
 
@@ -442,9 +433,9 @@ def main():
     # Profiling only: ORION_BENCH_FORWARDS=2 runs warmup + one timed
     # forward so nsys can capture a single steady-state pass instead of
     # four (at threshold 5,000,000 a full four-pass UVM trace is
-    # unusably large). Unset means 4 -- the protocol every recorded
-    # result in HELRM_ABLATION.md was measured under. Anything below 2
-    # would leave no warm trial at all.
+    # unusably large). Unset means 4 (1 warmup + 3 timed), the protocol
+    # every recorded result was measured under. Anything below 2 would
+    # leave no warm trial at all.
     n_forwards = max(2, int(os.environ.get("ORION_BENCH_FORWARDS", "4")))
 
     trial_times = []

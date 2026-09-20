@@ -6,7 +6,7 @@ forward runtime per threshold, current compiler (sliced diagonal packing).
 
 Runs every missing cell, then writes the "batch1" section of
 examples/criteo/PAPER_NUMBERS.md (replaced in place). Raw JSON
-and logs go to --results (default ~/cheddar-orion-results/batch1). A cell
+and logs go to --results (default examples/criteo/results/batch1). A cell
 whose JSON exists is not re-run; delete it to redo.
 
 CPU: table2.py --cpu-cell, Lattigo, 64-bit chain (params.yaml), single
@@ -39,7 +39,7 @@ GPU_LEVEL = {500: 4, 5000: 4, 50000: 4, 500000: 5, 5000000: 5}
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/batch1"))
+    ap.add_argument("--results", default=join(HERE, "results", "batch1"))
     args = ap.parse_args()
     from bench_sweep import SPARSE_SIZES
     from dlrm import dense_features, expanded_width

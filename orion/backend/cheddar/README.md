@@ -14,30 +14,14 @@ bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
 - `run_resnet.py configs/resnet_cheddar.yml` (ResNet20/CIFAR-10) runs end
   to end: MAE 0.0003, 21.1 +/- 1.6s (3 trials) on a 24GB card, with
   `ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_SHARED_BS=64
-  ORION_CHEDDAR_BOOT_MIN_KS=1` (~41GB peak working set, paged via managed
-  memory -- see "Memory" below for the env-knob ablation; that table's
-  runtimes predate the LT input-alignment fix, which took this headline
-  from 25.6 +/- 0.8s to 21.1s). Benchmarks MUST run `debug: false`:
+  ORION_CHEDDAR_BOOT_MIN_KS=1` (~41GB peak working set, paged via managed memory). Benchmarks MUST run `debug: false`:
   debug decrypts + CPU-decodes every layer's input/output (~2x
   end-to-end, 51.5s measured; both cheddar configs now ship false).
-- `examples/criteo/run_orion.py examples/criteo/params_cheddar.yaml`
-  (Criteo HE-LRM) is verified against a synthetic (untrained) instance of
-  the real architecture at `batch_size=16` (MAE 0.0004; 16 is a floor, not
-  a tuning choice -- HELRM's narrowest bootstrapped layer is 16 wide, and
-  Cheddar's `EvalSpecialFFT` hard-asserts `num_slots >= 256`). Was
-  validated with the since-removed `POW2_ROTATE` knob (see "Memory &
-  runtime" below); needs re-validation under exact-key mode
-  (`ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_BOOT_MIN_KS=1`; its
-  exact-key working set is unmeasured, and `SHARED_BS=64` was tuned on
-  ResNet20's diagonal profile, not HELRM's). Not yet
-  runnable through `run_orion.py`'s real entrypoint, which reads a trained
-  checkpoint (`model/model.pt`) that requires the actual Criteo dataset
-  and training run, neither of which has happened yet.
 
 ## Build
 
-1. Build Cheddar itself (once). Clone plain upstream, then apply this
-   branch's 5 required patches from
+1. Build Cheddar itself (once). Clone plain upstream at commit `8df8b26`,
+   then apply the 5 required patches from
    [CHEDDAR_PATCHES.md](CHEDDAR_PATCHES.md) (`managed-memory`,
    `evalpoly-argswap`, `boot-circuit-eviction`, `seeded-ciphertext`,
    `working-set-counter-no-bins` -- copy each diff block into a file and
@@ -45,10 +29,13 @@ bootstrap tests pass (`pytest -m slow -k cheddar tests/oracle/`).
    two more patches, `fused-dispatch-beta1` and `fused-rotate`, are
    documented there but are not applied in this checkout):
 
+Run the following build commands from the repository root.
+
 ```bash
 git clone https://github.com/scale-snu/cheddar-fhe.git \
     matmul-encoding-material/cheddar
 cd matmul-encoding-material/cheddar
+git checkout 8df8b26
 git apply /path/to/managed-memory.patch
 git apply /path/to/evalpoly-argswap.patch
 git apply /path/to/boot-circuit-eviction.patch
@@ -59,6 +46,7 @@ CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 cmake -S . -B build \
     -DCMAKE_CUDA_ARCHITECTURES=86 \
     -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11
 cmake --build build -j
+cd ../..  # return to the repository root
 ```
 
 Without these patches: native `EvalPoly` (polynomial degree >= 2, used for
@@ -67,10 +55,12 @@ access, and `RemoveEvalSpecialFFT`/`GetPeakDeviceMemoryMB` won't exist for
 the extension to link against -- see [CHEDDAR_PATCHES.md](CHEDDAR_PATCHES.md)
 for why each one is needed and what it does.
 
-Requires CMake >= 3.24 (`pip install cmake` if the system one is older)
-and network access on first configure (rmm via FetchContent). The
+Requires CMake >= 3.24 (`pip install cmake` if the system one is older),
+`pip install pybind11`, a spdlog header tree (`-D SPDLOG_INCLUDE_DIR=...`;
+the default is `$HOME/miniconda3/include`), `CMAKE_CUDA_ARCHITECTURES` set
+for your card, and network access on first configure (rmm via FetchContent). The
 explicit gcc-11 pins work around CMake's CUDA compiler probe grabbing
-mixed gcc-9/gcc-11 headers on this box (same fix as HEonGPU).
+mixed gcc-9/gcc-11 headers on machines that have both installed.
 
 2. Build the pybind11 extension:
 
@@ -82,7 +72,9 @@ CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 cmake -S . -B build \
     -D CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 \
     -D Python3_EXECUTABLE=$(which python)
 cmake --build build -j 8
-# Output: orion/backend/cheddar/_cheddar_native.cpython-310-x86_64-linux-gnu.so
+# Output: orion/backend/cheddar/_cheddar_native.cpython-<py>-x86_64-linux-gnu.so
+# and _cheddar_native32.* (the 32-bit word twin used for every paper number)
+cd ../../../..  # return to the repository root
 ```
 
 The extension links `libcheddar.so` from `CHEDDAR_BUILD_DIR` (defaults
@@ -110,8 +102,11 @@ ORION_CHEDDAR_MANAGED_MEMORY=1 ORION_CHEDDAR_SHARED_BS=64 \
 Oracle tests:
 
 ```bash
-pytest tests/oracle/ --backend=cheddar
+uv run --with pytest pytest tests/oracle/ --backend=cheddar
 ```
+
+For a pip-managed environment, install pytest with `python -m pip install pytest`
+and run `python -m pytest tests/oracle/ --backend=cheddar` instead.
 
 Env knobs:
 
@@ -160,9 +155,8 @@ Env knobs:
   for 64-bit -- an 18% latency win from halved per-limb bandwidth plus
   the deeper chain (16 usable levels vs 10 -> fewer bootstraps).
   (Pre-alignment-fix these were 21.4 vs 25.6s; the fix helps both word
-  sizes and slightly widens word32's edge. On HELRM word32 now wins
-  every compression threshold too -- see
-  `examples/criteo/HELRM_ABLATION.md` on the helrm branches.) Peak memory does NOT halve:
+  sizes and slightly widens word32's edge. On HE-LRM word32 wins at
+  every compression threshold too.) Peak memory does NOT halve:
   the chain carries more primes per level. Double-hoist at word32 is
   still transfer-bound on this card (32.7s at bs=64, ~75GB peak). The
   MAE 0.0006 (vs 0.0003) is the cost of the word32-only sign-composite
@@ -180,69 +174,10 @@ Env knobs:
   0.0003) but **off by default: slower on a 24GB/64-bit setup** — the
   hoist-map plaintext cache lives in the extended (q+p) basis, ~40GB for
   ResNet20, and streaming it through UVM costs more than the fused
-  kernels save (measured 32.1s vs 25.6s at `SHARED_BS=64`,
-  pre-alignment-fix numbers; see the nsys attribution in the ablation
-  section). Expected to become profitable
+  kernels save (measured 32.1s vs 25.6s at `SHARED_BS=64`). Expected to become profitable
   with the 32-bit word build and/or cards the pt cache fits in. The
   hoist baby-step count follows `ORION_CHEDDAR_SHARED_BS` when set,
   else each LT's natural `ceil(sqrt(num_diags))`.
-
-## Memory & runtime (env-knob ablation)
-
-**All figures below are measured WITH narrow per-layer slot packing**
-(`orion/core/packing.py`'s `propagate_physical_slots`) and the
-`dnum=4` config (`LogP` x7 in `configs/resnet_cheddar.yml`). The
-runtime column predates the LT input-alignment fix (which moved the
-best row's 25.8s to the 21.1s headline above); the memory columns and
-the knob ranking are unaffected. Full
-ResNet20/CIFAR-10 runs (`debug: false`), solo sequential (never
-concurrent -- concurrent managed-memory runs contaminate each other's
-measurements), 2026-07-29. Peak/key mem via
-`GetPeakDeviceMemoryMB`/`GetKeyMemoryMB`, all figures GiB, MAE 0.0003
-in every row.
-
-Without `MANAGED_MEMORY=1`: **every configuration OOMs** on this 24GB
-card -- there's no VRAM-only configuration that fits. With
-`MANAGED_MEMORY=1`:
-
-| SHARED_BS | BOOT_MIN_KS | runtime | key mem | peak logical |
-|---|---|---|---|---|
-| unset | 0 | 29.7s | 44.2 | 71.0 |
-| unset | 1 | 29.2s | 43.3 | 69.2 |
-| 64 | 0 | 28.9s | 16.5 | 44.7 |
-| 64 | 1 | **25.8s** | **16.2** | **41.1** |
-
-Notes on reading this table:
-
-- Neither knob moves runtime alone; only the combination does. The win
-  is likely paging-mediated (total working set small enough to ease UVM
-  pressure), so it's a property of this 24GB card -- re-ablate
-  `BOOT_MIN_KS` on a card that fits the working set in VRAM before
-  assuming it still helps there (its boot path trades chained rotations
-  for fewer keys, a pure loss once paging is free).
-- **`BOOT_EVICT` is omitted: it has no effect for this network** (its
-  column was byte-identical in an earlier 16-combo sweep). It only
-  evicts a *previously* prepared boot circuit before building a
-  *different* one, and narrow packing pins all of ResNet20's bootstraps
-  at one slot count (16384, `conv1`'s width) -- nothing else is ever
-  prepared, so there's nothing to evict. It still matters for networks
-  genuinely needing multiple boot slot counts (e.g. the
-  pre-narrow-packing baseline needed 3: 16384/8192/4096).
-- Narrow packing's memory contribution is small (~6% at exact-key,
-  measured 99.9GB -> 95.8GB pre-`dnum=4`); its real win is runtime
-  (49.44s -> 29.88s). The big memory levers are `dnum=4` (~96GB -> ~70GB)
-  and `SHARED_BS` (44GB -> 16GB of keys).
-
-**Killed after this ablation: `ORION_CHEDDAR_POW2_ROTATE`** (compose
-every rotation from a fixed universal power-of-two key set, ~log2(slots)
-keys total). It was the original "fit on 24GB" lever (~24-28GB total),
-but the ablation showed it buys no runtime in any combination (28.9-29.7s,
-same band as exact-key vanilla; its up-to-log2(slots)-HRots-per-rotation
-chain offsets the smaller key set), and its memory advantage is moot
-since `MANAGED_MEMORY=1` is mandatory on this card either way. Exact-key
-`SHARED_BS=64 + BOOT_MIN_KS=1` is both faster and small enough. Removed
-from `bindings.py` (`git log -S POW2_ROTATE` for the history); exact-key
-is now the only rotation-key mode.
 
 ## Quirks discovered
 

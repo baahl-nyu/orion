@@ -45,17 +45,17 @@ To run with the [Cheddar](https://github.com/scale-snu/cheddar-fhe) backend (GPU
 #### Running oracle tests
 
 ```
-uv run pytest tests/oracle/ -v -s
+uv run --with pytest pytest tests/oracle/ -v -s
 ```
 
 To run with Cheddar:
 ```
-uv run pytest tests/oracle/ -v -s --backend=cheddar
+uv run --with pytest pytest tests/oracle/ -v -s --backend=cheddar
 ```
 
 Bootstrap tests are skipped by default. To include them:
 ```
-uv run pytest tests/oracle/ -v -s -m ""
+uv run --with pytest pytest tests/oracle/ -v -s -m ""
 ```
 
 The Criteo HELRM example lives in `examples/criteo/`.

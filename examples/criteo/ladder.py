@@ -93,7 +93,7 @@ def row_from(design, batch, mm, d):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=expanduser("~/cheddar-orion-results/ladder"))
+    ap.add_argument("--results", default=join(HERE, "results", "ladder"))
     args = ap.parse_args()
     os.makedirs(args.results, exist_ok=True)
     from bench_sweep import SPARSE_SIZES
