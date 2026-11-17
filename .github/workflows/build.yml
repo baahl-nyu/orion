@@ -2,7 +2,7 @@ name: Build and Publish
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -135,7 +135,7 @@ jobs:
           # Install test deps and runtime deps from PyPI (PyTorch from CPU index), then our wheel only from artifacts
           pip install pytest pytest-cov
           pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-            PyYAML torch torchvision tqdm numpy scipy matplotlib h5py certifi
+            PyYAML torch torchvision tqdm numpy scipy matplotlib h5py certifi rich opt-einsum
           pip install --no-index --find-links=merged-wheels --no-deps orion-fhe
 
       - name: run pytest

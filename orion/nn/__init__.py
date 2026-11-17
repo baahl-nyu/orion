@@ -7,3 +7,4 @@ from .pooling import *
 from .reshape import *
 from .embedding import *
 from .extract import *
+from .einsum import *

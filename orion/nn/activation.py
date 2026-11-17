@@ -21,11 +21,17 @@ class Activation(Module):
     
     def set_depth(self):
         self.depth = int(math.ceil(math.log2(len(self.coeffs))))
+        # DeSiLo poly evaluation consumes 1 extra level for degree > 2
+        if (self.scheme is not None
+                and self.scheme.params.get_backend() == "desilo"
+                and len(self.coeffs) > 3):
+            self.depth += 1
 
     def set_output_scale(self, output_scale):
         self.output_scale = output_scale
 
     def compile(self):
+        self.set_depth()  # recompute now that backend info is available
         self.poly = self.scheme.poly_evaluator.generate_monomial(self.coeffs)
 
     @timer
@@ -73,8 +79,8 @@ class Chebyshev(Module):
         if not self.within_composite:
             center = (self.input_min + self.input_max) / 2 
             half_range = (self.input_max - self.input_min) / 2
-            self.low = (center - (self.margin * half_range)).item()
-            self.high = (center + (self.margin * half_range)).item()
+            self.low = (center - (self.margin * half_range))
+            self.high = (center + (self.margin * half_range))
 
             nodes = np.polynomial.chebyshev.chebpts1(self.degree + 1)
             if self.low < -1 or self.high > 1:
@@ -95,6 +101,11 @@ class Chebyshev(Module):
     def set_depth(self):
         self.depth = int(math.ceil(math.log2(self.degree+1)))
         if self.prescale != 1: # additional level needed
+            self.depth += 1
+        # DeSiLo poly evaluation consumes 1 extra level for degree > 2
+        if (self.scheme is not None
+                and self.scheme.params.get_backend() == "desilo"
+                and self.degree > 2):
             self.depth += 1
 
     def set_output_scale(self, output_scale):
@@ -287,6 +298,7 @@ class ReLU(Module):
         x *= self.postscale # integer mult, no level consumed
         return x
 
+
 class Cleanse(Module):
     def __init__(self, iter=3):
         super().__init__()
@@ -297,6 +309,7 @@ class Cleanse(Module):
             x = poly(x)
         return x
 
+
 class SqMethod1(Module):
     def __init__(self, p):
         super().__init__()
@@ -305,6 +318,7 @@ class SqMethod1(Module):
 
     def forward(self, x):
         return self.poly(x)
+
 
 class SqMethod2(Module):
     def __init__(self, r):
@@ -316,6 +330,7 @@ class SqMethod2(Module):
         for quad in self.quad:
             x = quad(x)
         return x
+
 
 class SqMethod(Module):
     def __init__(self, p, r):
@@ -329,6 +344,7 @@ class SqMethod(Module):
         x = self.sq1(x)
         x = self.sq2(x)
         return x
+
 
 class EIF(Module):
     def __init__(self, p, r, iter):

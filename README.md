@@ -34,4 +34,63 @@ pip install -e .
 ```
 uv sync
 uv run examples/run_lola.py
+uv run examples/run_mlp.py
+uv run examples/run_resnet.py
 ```
+
+#### Running with the DeSiLo backend
+
+To run with the [DeSiLo FHE](https://fhe.desilo.dev/latest/) backend instead of Lattigo:
+
+```
+uv pip install desilofhe
+```
+
+```
+uv run examples/run_lola.py configs/lola_desilo.yml
+uv run examples/run_mlp.py configs/mlp_desilo.yml
+uv run examples/run_resnet.py configs/resnet_desilo.yml
+```
+
+> **Note:** ResNet uses bootstrapping and requires ~32 GB RAM. LoLA and MLP run on a standard laptop.
+
+##### CPU vs GPU
+
+The DeSiLo backend runs on CPU by default. To select the device, add a `device` field under the `orion:` block of the config:
+
+```yaml
+orion:
+  backend: desilo
+  device: cpu   # "cpu" (default) or "gpu"
+```
+
+GPU mode requires a CUDA-capable NVIDIA GPU and a CUDA-enabled install of `desilofhe` (see the [DeSiLo docs](https://fhe.desilo.dev/latest/) for installation details). To run any of the examples on GPU, set `device: gpu` in the corresponding `*_desilo.yml` config and re-run the same command — no other changes needed.
+
+The Lattigo backend is CPU-only; the `device` field has no effect when `backend: lattigo`.
+
+#### Running with the Cheddar backend
+
+To run with the [Cheddar](https://github.com/scale-snu/cheddar-fhe) backend (GPU-only, C++/CUDA CKKS) -- build steps, required patches, supported examples, and env knobs -- see [`orion/backend/cheddar/README.md`](orion/backend/cheddar/README.md).
+
+#### Running oracle tests
+
+```
+uv run --with pytest pytest tests/oracle/ -v -s
+```
+
+To run with DeSiLo:
+```
+uv run --with pytest pytest tests/oracle/ -v -s --backend=desilo
+```
+
+To run with Cheddar:
+```
+uv run --with pytest pytest tests/oracle/ -v -s --backend=cheddar
+```
+
+Bootstrap tests are skipped by default. To include them:
+```
+uv run --with pytest pytest tests/oracle/ -v -s --backend=desilo -m ""
+```
+
+The Criteo HELRM example lives in `examples/criteo/`.

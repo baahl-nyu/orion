@@ -1,3 +1,4 @@
+import sys
 import time
 import math
 import torch
@@ -5,7 +6,7 @@ import orion
 import orion.models as models
 from orion.core.utils import (
     get_mnist_datasets,
-    mae, 
+    mae,
     train_on_mnist
 )
 
@@ -13,8 +14,9 @@ from orion.core.utils import (
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
-scheme = orion.init_scheme("../configs/mlp.yml")
-trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
+config = sys.argv[1] if len(sys.argv) > 1 else "./configs/mlp.yml"
+scheme = orion.init_scheme(config)
+trainloader, testloader = get_mnist_datasets(data_dir="./data", batch_size=1)
 net = models.MLP()
 
 # Train model (optional)

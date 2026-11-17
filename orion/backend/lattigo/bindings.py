@@ -187,6 +187,15 @@ class LattigoLibrary:
         self.NewScheme(logn, logq, logp, logscale, h, ringtype, keys_path, io_mode)
 
     def setup_tensor_binds(self):
+        # Working-set counters (memstats.go): live heap after a forced
+        # collection, and a sampler that records its peak over a run.
+        self.LiveHeapBytes = LattigoFunction(
+            self.lib.LiveHeapBytes, argtypes=[], restype=ctypes.c_ulonglong)
+        self.StartLiveHeapSampler = LattigoFunction(
+            self.lib.StartLiveHeapSampler, argtypes=[ctypes.c_int], restype=None)
+        self.StopLiveHeapSampler = LattigoFunction(
+            self.lib.StopLiveHeapSampler, argtypes=[], restype=ctypes.c_ulonglong)
+
         self.DeletePlaintext = LattigoFunction(
             self.lib.DeletePlaintext,
             argtypes=[ctypes.c_int],

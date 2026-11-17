@@ -6,6 +6,7 @@ import yaml
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, RandomSampler
+import logging
 
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
@@ -21,10 +22,12 @@ from orion.backend.python import (
     bootstrapper
 )
 
-from .tracer import StatsTracker, OrionTracer 
+from .tracer import OrionTracer, StatsTracker
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
+from .logger import logger as ORION_LOGGER
+from . import packing
 
 
 class Scheme:
@@ -50,7 +53,14 @@ class Scheme:
     
     def __init__(self):
         self.backend = None
-        self.traced = None
+        self.trace = None
+        # Sorted list of physical slot widths the network's inputs must
+        # be encoded at (one entry per distinct input-source
+        # requirement), set by compile()'s physical-width propagation
+        # pass (cheddar only needs this be non-default; see
+        # packing.propagate_physical_slots). encode() targets the
+        # smallest listed width that fits the tensor.
+        self.compiled_input_slots = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
         """Initializes the scheme."""
@@ -92,6 +102,22 @@ class Scheme:
             py_lattigo = lgo.LattigoLibrary()
             py_lattigo.setup_bindings(params)
             return py_lattigo
+        elif backend == "desilo":
+            # Imported here so orion imports without desilofhe installed.
+            from orion.backend.desilo import bindings as dsl
+            py_desilo = dsl.DeSiLoLibrary()
+            py_desilo.setup_bindings(params)
+            return py_desilo
+        elif backend == "cheddar":
+            import os
+            from orion.backend.cheddar import CheddarLibrary
+            # Default "single" = shared ModUp across a batch of rotations.
+            # Builds against plain upstream Cheddar. Override via env for
+            # A/B runs against "none" (per-shift rotation loop).
+            hoist_mode = os.environ.get("ORION_CHEDDAR_HOIST_MODE", "single")
+            py_cheddar = CheddarLibrary(hoist_mode=hoist_mode)
+            py_cheddar.setup_bindings(params)
+            return py_cheddar
         elif backend in ("heaan", "openfhe"):
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
@@ -100,9 +126,26 @@ class Scheme:
                 f"further notice."
             )
 
-    def encode(self, tensor, level=None, scale=None):
+    def encode(self, tensor, level=None, scale=None, target_slots=None):
         self._check_initialization()
-        return self.encoder.encode(tensor, level, scale)
+        # The network's own input must land at whatever physical width
+        # the first compiled layer's packing expects (see
+        # packing.propagate_physical_slots) -- a no-op default
+        # (compiled_input_slots stays None) until compile() has run, and
+        # for non-cheddar backends it's just the scheme's global max.
+        # An explicit target_slots (e.g. a test encoding some other
+        # narrow plaintext post-compile) always takes precedence.
+        # compiled_input_slots is a per-input-source width list (a
+        # multi-input network's inputs can feed differently-narrow
+        # paths); target the smallest compiled width that fits this
+        # tensor. No fit -> None -> encoder's legacy full-width path.
+        if target_slots is None and self.compiled_input_slots:
+            n = tensor.numel() if hasattr(tensor, "numel") else len(tensor)
+            for w in self.compiled_input_slots:  # sorted ascending
+                if n <= w:
+                    target_slots = w
+                    break
+        return self.encoder.encode(tensor, level, scale, target_slots=target_slots)
 
     def decode(self, ptxt):
         self._check_initialization() 
@@ -118,80 +161,55 @@ class Scheme:
     
     def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
-
+        
         net.set_scheme(self)
         net.set_margin(self.params.get_margin())
-        
+
+        # First we'll generate an FX symbolic trace of the network. This lets
+        # us mimic a forward pass through the network while tracking useful
+        # statistics below (shapes, ranges, etc) using the StatsTracker.
         tracer = OrionTracer()
-        traced = tracer.trace_model(net)
-        self.traced = traced 
+        trace = tracer.trace_model(net)
+        self.trace = trace
 
-        stats_tracker = StatsTracker(traced)
+        # An additional batch size parameter can be passed here to speed up
+        # the process of fitting data. Any tracked batch dimensions are reset 
+        # to what the user specified in the YAML file immediately afterwards.
+        temp_batch_size = batch_size
+        user_batch_size = self.params.get_batch_size()
 
-        #-----------------------------------------#
-        #   Populate layers with useful metadata  #
-        #-----------------------------------------# 
-
-        # Send input_data to the same device as the model.
+        stats_tracker = StatsTracker(trace, temp_batch_size, user_batch_size)
+        
+        # Get the location of the model (cpu, gpu, etc.) so that the data 
+        # propagated below is sent to the correct device.
         param = next(iter(net.parameters()), None)
         device = param.device if param is not None else torch.device("cpu")
+        
+        print("\n{1} Finding per-layer input/output ranges and shapes...", flush=True)
 
-        print("\n{1} Finding per-layer input/output ranges and shapes...", 
-              flush=True)
-        start = time.time()
-        if isinstance(input_data, DataLoader):
-            # Users often specify small batch sizes for FHE operations.
-            # However, fitting statistics with large datasets would take 
-            # unnecessarily long with small batches. To speed this up, we'll 
-            # temporarily increase the batch size during the statistics-fitting 
-            # step, and then restore the original batch size afterward.
-            user_batch_size = input_data.batch_size
-            if batch_size > user_batch_size:
-                dataset = input_data.dataset
-                shuffle = input_data.sampler is None or isinstance(input_data.sampler, RandomSampler)
-                
-                input_data = DataLoader(
-                    dataset=dataset,
-                    batch_size=batch_size,
-                    shuffle=shuffle,
-                    num_workers=input_data.num_workers,
-                    pin_memory=input_data.pin_memory,
-                    drop_last=input_data.drop_last
-                )
-
-            # Use this (potentially new) dataloader
-            for batch in tqdm(input_data, desc="Processing input data",
-                    unit="batch", leave=True):
-                stats_tracker.propagate(batch[0].to(device))
-
-            # Now we'll reset the batch size back to what the user specified.
-            stats_tracker.update_batch_size(user_batch_size)
-
-        elif isinstance(input_data, torch.Tensor):
-            stats_tracker.propagate(input_data.to(device)) 
-        else:
-            raise ValueError(
-                "Input data must be a torch.Tensor or DataLoader, but "
-                f"received {type(input_data)}."
-            )
+        #-------------------------------------#
+        #     Generate input/output ranges    #
+        #-------------------------------------#
+        
+        # Now pass the input data (tensor, list of tensors, dataloader, 
+        # list of dataloaders) to through the model while tracking stats.
+        stats_tracker.propagate_all(input_data, device, show_progress=True)
 
         #-------------------------------------#
         #      Fit polynomial activations     #
         #-------------------------------------#
 
-        # Now we can use the statistics we just obtained above to fit
-        # all polynomial activation functions.
-        print("\n{2} Fitting polynomials... ", end="", flush=True)
-        start = time.time()
+        # Now we can use the ranges we just obtained above to fit all
+        # Chebyshev polynomial activation functions.
+        print("\n{2} Fitting polynomials... ", flush=True)
         for module in net.modules():
             if hasattr(module, "fit") and callable(module.fit):
                 module.fit()
-        print(f"done! [{time.time()-start:.3f} secs.]")
-
+        
     def compile(self, net):
         self._check_initialization()
 
-        if self.traced is None:
+        if self.trace is None:
             raise ValueError(
                 "Network has not been fit yet! Before running orion.compile(net) "
                 "you must run orion.fit(net, input_data)."
@@ -201,7 +219,7 @@ class Scheme:
         #   Build DAG representation of neural network   #
         #------------------------------------------------#
 
-        network_dag = NetworkDAG(self.traced)
+        network_dag = NetworkDAG(self.trace)
         network_dag.build_dag()
 
         # Before fusing, we'll instantiate our own Orion parameters (e.g. 
@@ -254,12 +272,21 @@ class Scheme:
                 last_linear = node
                 break
 
-        # Now we can generate the diagonals 
-        print("\n{3} Generating matrix diagonals...", flush=True)
+        # Determine each layer's true *physical* ciphertext slot width
+        # before packing, rather than letting every layer assume the
+        # scheme's fixed global max. See packing.propagate_physical_slots
+        # for why this matters (cheddar-only concern; no-op elsewhere).
+        self.compiled_input_slots = packing.propagate_physical_slots(
+            network_dag, topo_sort)
+
+        # Now we can generate the diagonals
+        if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+            print("\n{3} Generating matrix diagonals...", flush=True)
         for node in topo_sort:
             module = network_dag.nodes[node]["module"]
             if isinstance(module, LinearTransform):
-                print(f"\nPacking {node}:")
+                if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+                    print(f"\nPacking {node}:")
                 module.generate_diagonals(last=(node == last_linear))
 
         #------------------------------#
@@ -267,7 +294,7 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
-        #(save_path="network.png", figsize=(8,30)) # optional plot
+        #network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
 
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()

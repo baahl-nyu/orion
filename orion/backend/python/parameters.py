@@ -1,51 +1,75 @@
 import os
-from typing import Literal, List
-from dataclasses import dataclass, field
+import logging
+from typing import Literal, List, Optional
+from dataclasses import dataclass, field, asdict
+from pprint import pformat
+
+logger = logging.getLogger("orion")
 
 
 @dataclass
 class CKKSParameters:
+    """Parameters for the CKKS encryption scheme."""
+    
     logn: int
     logq: List[int]
     logp: List[int]
-    logscale: int = field(default=None)
+    logscale: Optional[int] = field(default=None)
     h: int = 192
     ringtype: str = "standard"
-    boot_logp: List[int] = field(default=None)
+    boot_logp: Optional[List[int]] = field(default=None)
+    # Cheddar-specific bootstrap circuit knobs (ignored by lattigo/desilo,
+    # which manage their own bootstrap parameterization internally). See
+    # cheddar's BootParameter: num_cts_levels/num_stc_levels size the
+    # CoeffToSlot/SlotToCoeff stages, log_message_ratio approximates
+    # log2(q0 / scale) at the lowest level.
+    boot_num_cts_levels: int = field(default=None)
+    boot_num_stc_levels: int = field(default=None)
+    boot_log_message_ratio: int = 5
 
     def __post_init__(self):
+        # Validate logp and logq lengths
         if self.logq and self.logp and len(self.logp) > len(self.logq):
-            raise ValueError(
+            error_msg = (
                 f"Invalid parameters: The length of logp ({len(self.logp)}) "
                 f"cannot exceed the length of logq ({len(self.logq)})."
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
+        # Validate ring type
         valid_ringtypes = {"standard", "conjugateinvariant"}
         ring = self.ringtype.lower()
         if ring not in valid_ringtypes:
-            raise ValueError(
+            error_msg = (
                 f"Invalid ringtype: {self.ringtype}. Only 'Standard' or "
                 f"'ConjugateInvariant' ring types are supported."
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
+        # Set defaults
         self.logscale = self.logscale or self.logq[-1]
         self.boot_logp = self.boot_logp or self.logp
         self.logslots = (
-            self.logn-1 if self.ringtype.lower() == "standard" 
+            self.logn - 1 if self.ringtype.lower() == "standard" 
             else self.logn
         )
+        
+        logger.debug(f"Initialized CKKS parameters: N=2^{self.logn}, slots=2^{self.logslots}, "
+                    f"L_eff={len(self.logq)-1}, scale=2^{self.logscale}")
 
     def __str__(self):
-        if self.ringtype.lower() == "standard":
-            ring_type_display = "Standard"
-        else:
-            ring_type_display = "Conjugate invariant"
+        ring_type_display = (
+            "Standard" if self.ringtype.lower() == "standard" 
+            else "Conjugate invariant"
+        )
         
         output = [
             "CKKS Parameters:",
             f"  Ring degree (N): {1 << self.logn} (LogN = {self.logn})",
             f"  Number of slots (n): {1 << self.logslots}",
-            f"  Effective levels (L_eff): {len(self.logq) - 1}"
+            f"  Effective levels (L_eff): {len(self.logq) - 1}",
             f"  Ring type: {ring_type_display}",
             f"  Scale: 2^{self.logscale}",
             f"  Hamming weight: {self.h}"
@@ -69,23 +93,66 @@ class CKKSParameters:
 
 @dataclass
 class OrionParameters:
+    """Orion-specific configuration parameters."""
+    
+    batch_size: int = 1
     margin: int = 2
     fuse_modules: bool = True
     debug: bool = True
     embedding_method: Literal["hybrid", "square"] = "hybrid"
-    backend: Literal["lattigo", "openfhe", "heaan"] = "lattigo"
+    backend: Literal["lattigo", "openfhe", "heaan", "desilo", "cheddar"] = "lattigo"
+    device: Literal["cpu", "gpu"] = "cpu"
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""
+
+    def __post_init__(self):
+        # Validate batch size
+        if self.batch_size < 1:
+            error_msg = f"Batch size must be >= 1, got {self.batch_size}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Validate margin
+        if self.margin < 1:
+            error_msg = f"Margin must be >= 1, got {self.margin}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Validate backend
+        valid_backends = {"lattigo", "openfhe", "heaan", "desilo", "cheddar"}
+        if self.backend.lower() not in valid_backends:
+            error_msg = f"Invalid backend: {self.backend}. Must be one of {valid_backends}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Validate embedding method
+        valid_methods = {"hybrid", "square"}
+        if self.embedding_method.lower() not in valid_methods:
+            error_msg = f"Invalid embedding method: {self.embedding_method}. Must be one of {valid_methods}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Validate IO mode
+        valid_modes = {"none", "save", "load"}
+        if self.io_mode.lower() not in valid_modes:
+            error_msg = f"Invalid IO mode: {self.io_mode}. Must be one of {valid_modes}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # pretty-print the dataclass as a dict
+        logger.debug("Initialized Orion parameters:\n%s", pformat(asdict(self), sort_dicts=False))
 
     def __str__(self) -> str:
         output = [
             "Orion Parameters:",
             f"  Backend: {self.backend}",
+            f"  Batch Size: {self.batch_size}",
             f"  Margin: {self.margin}",
             f"  Embedding Method: {self.embedding_method}",
             f"  Fuse Modules: {self.fuse_modules}",
-            f"  Debug Mode: {self.debug}"
+            f"  Debug Mode: {self.debug}",
+            f"  Device: {self.device}"
         ]
         
         output.append(f"  I/O Mode: {self.io_mode}")
@@ -99,105 +166,194 @@ class OrionParameters:
 
 @dataclass
 class NewParameters:
+    """Main parameters container for Orion."""
+    
     params_json: dict
     ckks_params: CKKSParameters = field(init=False)
     orion_params: OrionParameters = field(init=False)
 
     def __post_init__(self):
+        logger.info("Initializing Orion parameters from configuration")
+        
         params = self.params_json
-        ckks_params = {
-            k.lower(): v for k, v in params.get("ckks_params", {}).items()}
-        boot_params = {
-            k.lower(): v for k, v in params.get("boot_params", {}).items()}
-        orion_params = {
-            k.lower(): v for k, v in params.get("orion", {}).items()}
+        
+        # Extract and normalize parameter sections
+        ckks_params = self._normalize_params(params.get("ckks_params", {}))
+        boot_params = self._normalize_params(params.get("boot_params", {}))
+        orion_params = self._normalize_params(params.get("orion", {}))
+        
+        # Log the configuration being loaded (pretty-printed)
+        logger.debug("CKKS params:\n%s", pformat(ckks_params, sort_dicts=False))
+        logger.debug("Boot params:\n%s", pformat(boot_params, sort_dicts=False))
+        logger.debug("Orion params:\n%s", pformat(orion_params, sort_dicts=False))
 
-        self.ckks_params = CKKSParameters(
-            **ckks_params, boot_logp=boot_params.get("logp")
-        )
-        self.orion_params = OrionParameters(**orion_params)
+        # Initialize sub-parameters
+        try:
+            self.ckks_params = CKKSParameters(
+                **ckks_params,
+                boot_logp=boot_params.get("logp"),
+                boot_num_cts_levels=boot_params.get("num_cts_levels"),
+                boot_num_stc_levels=boot_params.get("num_stc_levels"),
+                boot_log_message_ratio=boot_params.get("log_message_ratio", 5),
+            )
+        except (TypeError, ValueError) as e:
+            logger.error(f"Failed to initialize CKKS parameters: {e}")
+            raise
 
-        # Finally, we'll delete existing keys/diagonals if the user  
-        # specifies to overwrite them.
+        try:
+            self.orion_params = OrionParameters(**orion_params)
+        except (TypeError, ValueError) as e:
+            logger.error(f"Failed to initialize Orion parameters: {e}")
+            raise
+
+        # Handle IO mode and file cleanup
         if self.get_io_mode() == "save" and self.io_paths_exist():
+            logger.info("IO mode is 'save' - cleaning up existing files")
             self.reset_stored_keys()
             self.reset_stored_diags()
+        elif self.get_io_mode() == "load":
+            self._validate_load_paths()
+        
+        logger.info("Parameters initialized successfully")
+
+    @staticmethod
+    def _normalize_params(params_dict: dict) -> dict:
+        """Convert all keys to lowercase for consistent access."""
+        return {k.lower(): v for k, v in params_dict.items()}
+    
+    def _validate_load_paths(self):
+        """Validate that required files exist when loading."""
+        if self.get_io_mode() == "load":
+            if self.get_diags_path() and not os.path.exists(self.get_diags_path()):
+                logger.warning(f"Diagonals file not found at {self.get_diags_path()}")
+            if self.get_keys_path() and not os.path.exists(self.get_keys_path()):
+                logger.warning(f"Keys file not found at {self.get_keys_path()}")
 
     def __str__(self) -> str:
         border = "=" * 50
         return f"\n{border}\n{self.ckks_params}\n\n{self.orion_params}\n{border}\n"
-        
-    def get_logn(self):
+    
+    # CKKS parameter getters
+    def get_logn(self) -> int:
         return self.ckks_params.logn
 
-    def get_margin(self):
-        return self.orion_params.margin
-    
-    def get_fuse_modules(self):
-        return self.orion_params.fuse_modules
-    
-    def get_debug_status(self):
-        return self.orion_params.debug
-
-    def get_backend(self):
-        return self.orion_params.backend.lower()
-    
-    def get_logq(self):
+    def get_logq(self) -> List[int]:
         return self.ckks_params.logq
     
-    def get_logp(self):
+    def get_logp(self) -> List[int]:
         return self.ckks_params.logp
     
-    def get_logscale(self):
+    def get_logscale(self) -> int:
         return self.ckks_params.logscale
     
-    def get_default_scale(self):
+    def get_default_scale(self) -> int:
         return 1 << self.ckks_params.logscale
     
-    def get_hamming_weight(self):
+    def get_hamming_weight(self) -> int:
         return self.ckks_params.h
     
-    def get_ringtype(self):
+    def get_ringtype(self) -> str:
         return self.ckks_params.ringtype.lower()
 
-    def get_max_level(self):
+    def get_max_level(self) -> int:
         return len(self.ckks_params.logq) - 1
 
-    def get_slots(self):
-        return int(1 << self.ckks_params.logslots)
+    def get_slots(self) -> int:
+        return 1 << self.ckks_params.logslots
 
-    def get_ring_degree(self):
-        return int(1 << self.ckks_params.logn)
+    def get_ring_degree(self) -> int:
+        return 1 << self.ckks_params.logn
 
-    def get_embedding_method(self):
-        return self.orion_params.embedding_method.lower()
-
-    def get_diags_path(self):
-        path = self.orion_params.diags_path
-        return os.path.abspath(os.path.join(os.getcwd(), path))
-
-    def get_keys_path(self):
-        path = self.orion_params.keys_path
-        return os.path.abspath(os.path.join(os.getcwd(), path))
-
-    def get_io_mode(self):
-        return self.orion_params.io_mode.lower()
-
-    def get_boot_logp(self):
+    def get_boot_logp(self) -> List[int]:
         return self.ckks_params.boot_logp
 
-    def io_paths_exist(self):
+    def get_boot_num_cts_levels(self):
+        return self.ckks_params.boot_num_cts_levels
+
+    def get_boot_num_stc_levels(self):
+        return self.ckks_params.boot_num_stc_levels
+
+    def get_boot_log_message_ratio(self):
+        return self.ckks_params.boot_log_message_ratio
+
+    # Orion parameter getters
+    def get_batch_size(self) -> int:
+        return self.orion_params.batch_size
+
+    def get_margin(self) -> int:
+        return self.orion_params.margin
+
+    def get_fuse_modules(self) -> bool:
+        return self.orion_params.fuse_modules
+
+    def get_debug_status(self) -> bool:
+        return self.orion_params.debug
+
+    def get_backend(self) -> str:
+        return self.orion_params.backend.lower()
+
+    def get_device(self) -> str:
+        return self.orion_params.device.lower()
+
+    def get_embedding_method(self) -> str:
+        return self.orion_params.embedding_method.lower()
+
+    def get_io_mode(self) -> str:
+        return self.orion_params.io_mode.lower()
+
+    def get_diags_path(self) -> str:
+        if not self.orion_params.diags_path:
+            return ""
+        return os.path.abspath(os.path.join(os.getcwd(), self.orion_params.diags_path))
+
+    def get_keys_path(self) -> str:
+        if not self.orion_params.keys_path:
+            return ""
+        return os.path.abspath(os.path.join(os.getcwd(), self.orion_params.keys_path))
+
+    def io_paths_exist(self) -> bool:
         return bool(self.get_diags_path()) and bool(self.get_keys_path())
 
     def reset_stored_file(self, path: str, file_type: str):
+        """Remove a stored file if in save mode."""
         if self.get_io_mode() == "save" and path:
-            print(f"Deleting existing {file_type} at {path}")
             abs_path = os.path.abspath(os.path.join(os.getcwd(), path))
             if os.path.exists(abs_path):
-                os.remove(abs_path)
+                logger.info(f"Deleting existing {file_type} at {abs_path}")
+                try:
+                    os.remove(abs_path)
+                    logger.debug(f"Successfully deleted {file_type}")
+                except OSError as e:
+                    logger.error(f"Failed to delete {file_type}: {e}")
+                    raise
+            else:
+                logger.debug(f"No existing {file_type} to delete at {abs_path}")
 
     def reset_stored_diags(self):
+        """Remove stored diagonals file."""
         self.reset_stored_file(self.get_diags_path(), "diagonals")
 
     def reset_stored_keys(self):
+        """Remove stored keys file."""
         self.reset_stored_file(self.get_keys_path(), "keys")
+    
+    def summary(self) -> dict:
+        """Get a summary of all parameters as a dictionary."""
+        return {
+            "ckks": {
+                "ring_degree": self.get_ring_degree(),
+                "slots": self.get_slots(),
+                "max_level": self.get_max_level(),
+                "scale": self.get_default_scale(),
+                "ring_type": self.get_ringtype()
+            },
+            "orion": {
+                "batch_size": self.get_batch_size(),
+                "margin": self.get_margin(),
+                "backend": self.get_backend(),
+                "embedding": self.get_embedding_method(),
+                "fuse_modules": self.get_fuse_modules(),
+                "debug": self.get_debug_status(),
+                "io_mode": self.get_io_mode()
+            }
+        }

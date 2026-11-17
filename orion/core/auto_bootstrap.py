@@ -110,7 +110,7 @@ class BootstrapSolver:
                     next_level_dag = LevelDAG(
                         l_eff=self.l_eff, network_dag=self.network_dag, path=node_dag
                     )
-                    visited.update(node)
+                    visited.add(node)
    
                 self.full_level_dag.append(next_level_dag)
 
@@ -225,15 +225,24 @@ class BootstrapSolver:
         return total_bootstraps , bootstrapper_slots
     
     def get_bootstrap_slots(self, node):
-        # If we're here, then our auto-bootstrapper has determined that the 
+        # If we're here, then our auto-bootstrapper has determined that the
         # output of this node will be bootstrapped. Therefore it must be an
         # Orion module, and so a module attribute exists.
         module = self.network_dag.nodes[node]["module"]
         max_slots = module.scheme.params.get_slots()
-        
-        elements = module.fhe_output_shape.numel()
-        curr_slots = 2 ** math.ceil(math.log2(elements))
-        slots = int(min(max_slots, curr_slots)) # sparse bootstrapping
+
+        # Prefer the authoritative physical width propagate_physical_slots
+        # already computed for this node -- deriving it fresh from
+        # fhe_output_shape.numel() alone can underestimate it (e.g. after
+        # a hybrid-fold layer, whose physical width can exceed its own
+        # logical output size; see packing.propagate_physical_slots).
+        physical_slots = getattr(module, "physical_slots", None)
+        if physical_slots is not None:
+            slots = int(min(max_slots, physical_slots))
+        else:
+            elements = module.fhe_output_shape.numel()
+            curr_slots = 2 ** math.ceil(math.log2(elements))
+            slots = int(min(max_slots, curr_slots)) # sparse bootstrapping
         
         return slots
     
@@ -309,6 +318,13 @@ class BootstrapPlacer:
         bootstrapper.scheme = self.net.scheme
         bootstrapper.margin = self.net.margin
         bootstrapper.fhe_input_shape = module.fhe_output_shape
+        # The ciphertext this bootstrapper actually receives has whatever
+        # physical width propagate_physical_slots already determined for
+        # `module` (its producer) -- which can be wider than
+        # fhe_output_shape.numel() alone would suggest (e.g. after a
+        # hybrid-fold layer). Reuse that authoritative value rather than
+        # re-deriving a possibly-too-narrow one from shape alone.
+        bootstrapper.physical_slots = getattr(module, "physical_slots", None)
         bootstrapper.fit()
         bootstrapper.compile()
         
