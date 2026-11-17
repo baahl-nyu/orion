@@ -11,7 +11,6 @@ import logging
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 from orion.backend.lattigo import bindings as lgo
-from orion.backend.desilo import bindings as dsl
 from orion.backend.python import (
     parameters, 
     key_generator,
@@ -104,6 +103,8 @@ class Scheme:
             py_lattigo.setup_bindings(params)
             return py_lattigo
         elif backend == "desilo":
+            # Imported here so orion imports without desilofhe installed.
+            from orion.backend.desilo import bindings as dsl
             py_desilo = dsl.DeSiLoLibrary()
             py_desilo.setup_bindings(params)
             return py_desilo

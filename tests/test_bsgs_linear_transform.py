@@ -9,6 +9,9 @@ import os
 import torch
 import pytest
 
+# These tests run on the DeSiLo backend only.
+pytest.importorskip("desilofhe")
+
 from orion.core.orion import Scheme
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "oracle"))
