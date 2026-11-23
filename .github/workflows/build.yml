@@ -85,7 +85,10 @@ jobs:
   # all wheels that were added as artifacts in the previous build jobs.
   test:
     needs: [build-manylinux, build-other]
-    runs-on: ${{ matrix.config.os }}
+    runs-on: >-
+      ${{ matrix.config.os == 'ubuntu-latest' &&
+          (matrix.python-version == '3.9' || matrix.python-version == '3.10') &&
+          'ubuntu-24.04' || matrix.config.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -144,7 +147,7 @@ jobs:
           # Create temp directory
           cd $RUNNER_TEMP
           echo "Testing from directory: $RUNNER_TEMP"
-          python -m pytest $GITHUB_WORKSPACE/tests/
+          python -m pytest --import-mode=append "$GITHUB_WORKSPACE/tests/"
 
   publish:
     needs: [test]
