@@ -21,7 +21,13 @@ dependencies = [
     "matplotlib>=3.1.0",
     "h5py>=3.5.0",
     "certifi>=2024.2.2",
+    "rich>=13.0.0",
+    "opt-einsum>=3.3.0",
 ]
+
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (bootstrap, large params)"]
+addopts = "-m 'not slow'"
 
 [tool.poetry]
 packages = [{include = "orion"}]

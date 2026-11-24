@@ -66,6 +66,11 @@ func NewScheme(
 		panic(err)
 	}
 
+	// Rotation keys and bootstrappers from a previous scheme were made
+	// for its keys. Drop them so this scheme generates its own.
+	DeleteRotationKeys()
+	DeleteBootstrappers()
+
 	keyGen := rlwe.NewKeyGenerator(params)
 
 	scheme = Scheme{

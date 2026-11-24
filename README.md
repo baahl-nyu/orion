@@ -34,4 +34,28 @@ pip install -e .
 ```
 uv sync
 uv run examples/run_lola.py
+uv run examples/run_mlp.py
+uv run examples/run_resnet.py
 ```
+
+#### Running with the Cheddar backend
+
+To run with the [Cheddar](https://github.com/scale-snu/cheddar-fhe) backend (GPU-only, C++/CUDA CKKS) -- build steps, required patches, supported examples, and env knobs -- see [`orion/backend/cheddar/README.md`](orion/backend/cheddar/README.md).
+
+#### Running oracle tests
+
+```
+uv run --with pytest pytest tests/oracle/ -v -s
+```
+
+To run with Cheddar:
+```
+uv run --with pytest pytest tests/oracle/ -v -s --backend=cheddar
+```
+
+Bootstrap tests are skipped by default. To include them:
+```
+uv run --with pytest pytest tests/oracle/ -v -s -m ""
+```
+
+The Criteo HELRM example lives in `examples/criteo/`.

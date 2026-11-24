@@ -19,6 +19,24 @@ class LinearTransform(Module):
         self.diagonals = {} # diags[(row, col)] = {0: [...], 1: [...], ...}
         self.transform_ids = {} # ids[(row, col)] = int
         self.output_rotations = 0
+        # {block_col: (row_offset, height, out_rotations)} when
+        # ORION_SLICE_HEIGHT shrank any block; empty/None keeps the
+        # uniform single-height path.
+        self.slice_meta = None
+
+        # Physical ciphertext slot width this layer was packed against.
+        # Set by packing.propagate_physical_slots() during compile(),
+        # before generate_diagonals() runs. Falls back to the scheme's
+        # global slots (the old, always-full-width behavior) if the
+        # propagation pass hasn't run -- e.g. lattigo/desilo, where
+        # packing width has always been the global constant.
+        self.slots = None
+        self.physical_slots = None
+        # Post-fold physical width this layer's OUTPUT retags down to
+        # (None = no narrowing). Set by packing.propagate_physical_slots
+        # for plain hybrid Linear layers whose fold leaves the output
+        # slots/2^r-periodic; consumed at the end of evaluate_transforms.
+        self.folded_slots = None
 
     def __del__(self):
         if 'sys' in globals() and sys.modules and self.scheme:
@@ -62,14 +80,61 @@ class LinearTransform(Module):
     def compile(self):
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
+    def _apply_slice_depth(self):
+        """Per-block heights cost one extra multiplicative level.
+
+        A shrunk block's output repeats every `height` slots, so each
+        window has to be masked before the windows are summed, and a
+        ct-pt multiply consumes a level. A transform that shrank nothing
+        keeps depth 1 and is unaffected.
+
+        This has to run here, in generate_diagonals: slice_meta is only
+        known after packing, and bootstrap placement (which reads depth)
+        happens afterwards -- see core/orion.py, where diagonals are
+        generated before find_residuals/bootstrap placement.
+        """
+        if getattr(self, "slice_meta", None):
+            self.set_depth(2)
+
     @timer
     def evaluate_transforms(self, x):
         out = self.scheme.lt_evaluator.evaluate_transforms(self, x)
 
-        # Hybrid method's output rotations
-        slots = self.scheme.params.get_slots()
-        for i in range(1, self.output_rotations+1):
-            out += out.roll(slots // (2**i))
+        # Hybrid method's output rotations. Must use the exact same slot
+        # width diagonalize() used when computing self.output_rotations
+        # at pack time (see packing.py::diagonalize) -- these roll
+        # amounts are only correct relative to that width, not the
+        # scheme's global max.
+        slots = self.slots or self.scheme.params.get_slots()
+        # With per-block heights the fold already ran inside
+        # lt_evaluator._evaluate_sliced -- once per (offset, height)
+        # window, since blocks read at different heights replicate by
+        # different factors and cannot share one fold. output_rotations
+        # stays at its uniform value so the fold-retag period check below
+        # still describes the layer's output correctly.
+        if not getattr(self, "slice_meta", None):
+            for i in range(1, self.output_rotations+1):
+                out += out.roll(slots // (2**i))
+
+        # Fold-retag narrowing (cheddar): the fold above left the output
+        # (slots >> output_rotations)-periodic, which is bit-for-bit a
+        # valid sparse ciphertext at any multiple of that period -- so
+        # narrowing to folded_slots is pure metadata. Downstream layers
+        # were packed against folded_slots by propagate_physical_slots;
+        # a mismatch here means the compile-time fold prediction was
+        # wrong and retagging would corrupt rotation wraparound, so
+        # refuse loudly instead.
+        if self.folded_slots and self.folded_slots < slots:
+            period = slots >> self.output_rotations
+            if self.output_rotations == 0 or self.folded_slots % period != 0:
+                raise RuntimeError(
+                    f"fold-retag mismatch in {type(self).__name__}: packed "
+                    f"width {slots} with {self.output_rotations} output "
+                    f"rotations gives period {period}, which does not "
+                    f"divide the predicted folded width {self.folded_slots}")
+            for ct_id in out.ids:
+                self.scheme.backend.SetCiphertextSlots(
+                    int(ct_id), int(self.folded_slots))
 
         out += self.on_bias_ptxt
         return out
@@ -117,7 +182,9 @@ class Linear(LinearTransform):
         # Here, we'll apply our packing strategies to return the diagonals
         # of our linear layer. When using the "hybrid" method of packing, this
         # may also require several output rotations and summations.
-        self.diagonals, self.output_rotations = packing.pack_linear(self, last)
+        (self.diagonals, self.output_rotations,
+         self.slice_meta) = packing.pack_linear(self, last)
+        self._apply_slice_depth()
         if self.get_io_mode() == "save":
             self.save_transforms()
 
@@ -131,7 +198,14 @@ class Linear(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_linear_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        # The bias is added AFTER the output fold (and after the
+        # fold-retag narrowing, when active) -- encode it at the width
+        # the output actually has at that point, else a wide bias
+        # plaintext would re-widen the narrowed ciphertext via the
+        # native Max(operand widths) rule.
+        self.on_bias_ptxt = self.scheme.encoder.encode(
+            bias, self.level-self.depth,
+            target_slots=self.folded_slots or self.slots)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
     
     def forward(self, x):
@@ -143,7 +217,6 @@ class Linear(LinearTransform):
                     f"2 dimensions (N, in_features), but got {x.dim()} " 
                     f"dimension(s): {x.shape}." + extra
         )
-            
             # If we're not in FHE inference mode, then we'll just return
             # the default PyTorch result.
             return torch.nn.functional.linear(x, self.weight, self.bias)
@@ -227,7 +300,9 @@ class Conv2d(LinearTransform):
     def generate_diagonals(self, last):
         # Generate Toeplitz diagonals and determine the number of output
         # rotations if the `hybrid` packing method is used.
-        self.diagonals, self.output_rotations = packing.pack_conv2d(self, last)
+        (self.diagonals, self.output_rotations,
+         self.slice_meta) = packing.pack_conv2d(self, last)
+        self._apply_slice_depth()
         if self.get_io_mode() == "save":
             self.save_transforms()
 
@@ -241,7 +316,8 @@ class Conv2d(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_conv2d_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        self.on_bias_ptxt = self.scheme.encoder.encode(
+            bias, self.level-self.depth, target_slots=self.slots)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
     def forward(self, x):
